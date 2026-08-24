@@ -1,0 +1,22 @@
+[package]
+name = "verinoo-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+verinoo-types = { path = "../types" }
+verinoo-state = { path = "../state" }
+verinoo-exec = { path = "../exec" }
+libp2p = { version = "0.53", features = ["gossipsub", "identify", "tokio", "macros", "tcp", "yamux", "noise", "dns", "mdns"] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
