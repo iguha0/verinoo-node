@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 verinoo-types = { path = "../types" }
+verinoo-state = { path = "../state" }
+verinoo-exec = { path = "../exec" }
 sha2 = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }

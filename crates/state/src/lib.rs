@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct StateStore {
@@ -35,12 +36,10 @@ impl StateStore {
     }
 
     pub fn open_temp() -> Result<Self, rocksdb::Error> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
-            std::env::temp_dir().join(format!("verinoo-state-test-{}-{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("verinoo-state-test-{}-{n}", std::process::id()));
         Self::open(&dir)
     }
 

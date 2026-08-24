@@ -49,13 +49,9 @@ impl EngineError {
     }
 }
 
-use base64::Engine as _;
-
-fn verify_ed25519(message: &str, sig_b64: &str, pk_hex: &str) -> bool {
-    let (Ok(pk), Ok(sig)) = (
-        hex::decode(pk_hex),
-        base64::engine::general_purpose::STANDARD.decode(sig_b64),
-    ) else {
+// ED scheme transports signatures as HEX (spec: src/core/canonical.ts).
+fn verify_ed25519(message: &str, sig_hex: &str, pk_hex: &str) -> bool {
+    let (Ok(pk), Ok(sig)) = (hex::decode(pk_hex), hex::decode(sig_hex)) else {
         return false;
     };
     let (Ok(pk_arr), Ok(sig_arr)) = (<[u8; 32]>::try_from(pk), <[u8; 64]>::try_from(sig)) else {
@@ -238,12 +234,26 @@ pub fn validate_block(
     if recomputed != block.header.hash {
         return Err(EngineError::Validation("header hash mismatch".into()));
     }
-    // Producer signature (Ed25519 over header hash string).
-    if !verify_ed25519(
-        &block.header.hash,
-        &block.header.validator_signature,
-        &block.header.validator_pub_key,
-    ) {
+    // Producer signature (Ed25519 over header hash string; hex transport).
+    let vkey_bytes = hex::decode(&block.header.validator_pub_key)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
+    let sig_bytes = hex::decode(&block.header.validator_signature)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b).ok());
+    let producer_ok = match (vkey_bytes, sig_bytes) {
+        (Some(vk_bytes), Some(sig_bytes)) => {
+            match (
+                VerifyingKey::from_bytes(&vk_bytes),
+                Signature::from_slice(&sig_bytes),
+            ) {
+                (Ok(vk), Ok(sig)) => vk.verify(block.header.hash.as_bytes(), &sig).is_ok(),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if !producer_ok {
         return Err(EngineError::Validation(
             "invalid validator signature".into(),
         ));
@@ -373,7 +383,7 @@ pub fn execute_transaction(
         verinoo_types::tx::TxKind::RegisterModel => {
             let model_id = sha256_hex(&format!(
                 "{}{}",
-                serde_json::to_string(data).unwrap(),
+                verinoo_types::canonical::canonical_json(data).map_err(EngineError::Canonical)?,
                 tx.tx_id
             ))[..32]
                 .to_string();
@@ -436,7 +446,7 @@ pub fn execute_transaction(
         verinoo_types::tx::TxKind::SubmitInference => {
             let task_id = sha256_hex(&format!(
                 "{}{}",
-                serde_json::to_string(data).unwrap(),
+                verinoo_types::canonical::canonical_json(data).map_err(EngineError::Canonical)?,
                 tx.tx_id
             ))[..32]
                 .to_string();
@@ -641,6 +651,9 @@ pub fn execute_transaction(
                     low = layer_index;
                 } else {
                     high = layer_index;
+                    // Reference engine marks the disputed layer immediately
+                    // upon disagreement (engine.ts bisect case).
+                    game["disputedLayer"] = json!(layer_index);
                 }
                 step += 1;
             }
@@ -920,10 +933,9 @@ pub fn produce_block(
         compute_root: comp_root,
     };
     header.hash = hash_header(&header);
-    use base64::Engine as _;
     use ed25519_dalek::Signer;
     let sig = producer.signing.sign(header.hash.as_bytes());
-    header.validator_signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    header.validator_signature = hex::encode(sig.to_bytes());
 
     let next_base_fee = crate::gas::compute_base_fee(
         base_fee,

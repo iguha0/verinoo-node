@@ -27,7 +27,6 @@ fn make_tx(
     data: serde_json::Value,
     nonce: u64,
 ) -> TxEnvelope {
-    use base64::Engine as _;
     let data = TxData { r#type: kind, data };
     let payload = UnsignedPayload {
         data: serde_json::to_value(&data).unwrap(),
@@ -50,7 +49,7 @@ fn make_tx(
         gas_limit: None,
         gas_price: None,
         public_key: hex::encode(signer.verifying_key().to_bytes()),
-        signature: base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
+        signature: hex::encode(sig.to_bytes()),
     }
 }
 

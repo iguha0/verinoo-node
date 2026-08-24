@@ -1,0 +1,571 @@
+{
+  "chainId": "verinoo-test-1",
+  "validatorAddress": "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28",
+  "baseFee": 1,
+  "addresses": {
+    "treasury": "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343",
+    "user": "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db",
+    "node": "ai_a368a81a4e33552c787081587b9aa39125739d4e",
+    "challenger": "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d",
+    "validator": "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28"
+  },
+  "modelId": "3bfa10fd1e42999c9990a259d9fa1b79",
+  "taskId": "4afe2a5ecf283dc9f7d13ccbe116ec07",
+  "gameId": "5be62c27eafd9c2d926ff6fd55f36ade",
+  "initialAccounts": {
+    "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+      "balance": 10000,
+      "nonce": 0
+    },
+    "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+      "balance": 5000,
+      "nonce": 0
+    },
+    "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+      "balance": 5000,
+      "nonce": 0
+    },
+    "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+      "balance": 2000,
+      "nonce": 0
+    },
+    "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+      "balance": 0,
+      "nonce": 0
+    }
+  },
+  "blocks": [
+    {
+      "name": "register_model",
+      "height": 1,
+      "executedTxIds": [
+        "71ed41c906fbb7283dea99cdad6a05c6f0e31c883c0afec901e921fa9104137d"
+      ],
+      "transactions": [
+        {
+          "from": "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343",
+          "to": "",
+          "value": 0,
+          "nonce": 1,
+          "data": {
+            "type": "registerModel",
+            "data": {
+              "architecture": "Tiny-Test-Net",
+              "parameterCount": 256000,
+              "weightsHash": "w_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "runtimeHash": "r_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "stakingRequirement": 50,
+              "description": "golden vector model"
+            }
+          },
+          "publicKey": "f2ecc03d679d18af4f4947bb9238b90180fbd5d26fc2f132bdc9b636e27ac001",
+          "txId": "71ed41c906fbb7283dea99cdad6a05c6f0e31c883c0afec901e921fa9104137d",
+          "signature": "588b4729178d14f4694fb748417b9b4724246766de085bfaa741e2f4770ad6f7d63e1414afd2c261e02ff8feae52425e026d32ab0a6159cb5490bbd538994d0a"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 5000,
+            "nonce": 0
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 5000,
+            "nonce": 0
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 2000,
+            "nonce": 0
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 60,
+            "nonce": 0
+          }
+        },
+        "task": null,
+        "game": null
+      }
+    },
+    {
+      "name": "register_node",
+      "height": 2,
+      "executedTxIds": [
+        "cc2f38bd997ae8e579f9249151ead077ad45957027fc9c2c3e56923be0f99868"
+      ],
+      "transactions": [
+        {
+          "from": "ai_a368a81a4e33552c787081587b9aa39125739d4e",
+          "to": "",
+          "value": 0,
+          "nonce": 1,
+          "data": {
+            "type": "registerNode",
+            "data": {
+              "stakedAmount": 800,
+              "availableCapacity": 4,
+              "maxCapacity": 4,
+              "activeTasks": 0,
+              "reputation": 75,
+              "successfulInferences": 0,
+              "failedInferences": 0,
+              "supportedModels": [
+                "3bfa10fd1e42999c9990a259d9fa1b79"
+              ]
+            }
+          },
+          "publicKey": "6a74535c0ef72f7cdcaa9b136dde8e61d68171ddbe6acbed2af8b85c51eeeb0b",
+          "txId": "cc2f38bd997ae8e579f9249151ead077ad45957027fc9c2c3e56923be0f99868",
+          "signature": "f3ad4282c3c23fc22eadd99b7bd8afcfaeb00a04cf6f544b86eceafb92c1469fa481bea2631813ce37d2c45aa8e725d4f557b6c3b96cfb5893bceafc2463f104"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 5000,
+            "nonce": 0
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4950,
+            "nonce": 1
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 2000,
+            "nonce": 0
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 97,
+            "nonce": 0
+          }
+        },
+        "task": null,
+        "game": null
+      }
+    },
+    {
+      "name": "submit_inference",
+      "height": 3,
+      "executedTxIds": [
+        "2d1501e8f6d8395d397c7b6159690fdfa17bceca3876f4ffa728752294896fe0"
+      ],
+      "transactions": [
+        {
+          "from": "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db",
+          "to": "",
+          "value": 100,
+          "nonce": 1,
+          "data": {
+            "type": "submitInference",
+            "data": {
+              "requester": "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db",
+              "targetModel": "3bfa10fd1e42999c9990a259d9fa1b79",
+              "inputCommitment": "inp_c",
+              "maxFee": 100,
+              "deadline": 1000,
+              "verificationType": "optimistic"
+            }
+          },
+          "publicKey": "6ba0d1c9666e39301325435da122607331addd0f45407c5c8ec74b3d3dcbef6a",
+          "txId": "2d1501e8f6d8395d397c7b6159690fdfa17bceca3876f4ffa728752294896fe0",
+          "signature": "c1535c1c0bf6e9b7744d34c671a82c03b135347b6bd4a3be70452ffa861788504fcc75c59ed09661f3e51505d8ab11270d873faebdae0bd3dfeeca97168c2d0c"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4950,
+            "nonce": 1
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 2000,
+            "nonce": 0
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 142,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "assigned",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": null
+      }
+    },
+    {
+      "name": "submit_result",
+      "height": 4,
+      "executedTxIds": [
+        "a3d43b03cc7082ad1a7ef5e74d1044b70f23ea4d379fc56fe0ceb863cd1d70fd"
+      ],
+      "transactions": [
+        {
+          "from": "ai_a368a81a4e33552c787081587b9aa39125739d4e",
+          "to": "",
+          "value": 0,
+          "nonce": 2,
+          "data": {
+            "type": "submitResult",
+            "data": {
+              "taskId": "4afe2a5ecf283dc9f7d13ccbe116ec07",
+              "resultHash": "res_h",
+              "resultOutput": "out",
+              "proofData": ""
+            }
+          },
+          "publicKey": "6a74535c0ef72f7cdcaa9b136dde8e61d68171ddbe6acbed2af8b85c51eeeb0b",
+          "txId": "a3d43b03cc7082ad1a7ef5e74d1044b70f23ea4d379fc56fe0ceb863cd1d70fd",
+          "signature": "17373545e77a82eac235718a3faed0f6ff45dd34bd6cb7d3e519a0e18354c3bdca85ee98f04ce10593aae40f01b9d136c20a528e3ee8a56b9efa211b7375df0a"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4990,
+            "nonce": 2
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 2000,
+            "nonce": 0
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 172,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "completed",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": null
+      }
+    },
+    {
+      "name": "challenge_result",
+      "height": 5,
+      "executedTxIds": [
+        "470b8de2c35302c144183d137eb29c44335e6199049ef20a2687d5b3ee545818"
+      ],
+      "transactions": [
+        {
+          "from": "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d",
+          "to": "",
+          "value": 0,
+          "nonce": 1,
+          "data": {
+            "type": "challengeResult",
+            "data": {
+              "taskId": "4afe2a5ecf283dc9f7d13ccbe116ec07",
+              "reason": "golden vector dispute"
+            }
+          },
+          "publicKey": "63e087c0848b7b029ee8302330fc74784f765b611dc5ff1d359130950450c0d1",
+          "txId": "470b8de2c35302c144183d137eb29c44335e6199049ef20a2687d5b3ee545818",
+          "signature": "32fcf9fbfe2914d44c8cbca547c49ef2c45cd947a1ab3202548a90d6fd49fa9300786cbe614fcae082b06c1b200194720ff9fe7322fd1507c2b930176c27ea00"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4990,
+            "nonce": 2
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 1780,
+            "nonce": 1
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 262,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "challenged",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": {
+          "status": "open",
+          "low": 0,
+          "high": 3,
+          "currentStep": 0,
+          "disputedLayer": -1
+        }
+      }
+    },
+    {
+      "name": "bisect_ch_l2",
+      "height": 6,
+      "executedTxIds": [
+        "fe395b4a1ad229f717fe71e86ec6c4b71df0367c6e992d453a8b683d68cf7b24"
+      ],
+      "transactions": [
+        {
+          "from": "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d",
+          "to": "",
+          "value": 0,
+          "nonce": 2,
+          "data": {
+            "type": "bisect",
+            "data": {
+              "gameId": "5be62c27eafd9c2d926ff6fd55f36ade",
+              "layerIndex": 2,
+              "traceRoot": "trace_ch_2"
+            }
+          },
+          "publicKey": "63e087c0848b7b029ee8302330fc74784f765b611dc5ff1d359130950450c0d1",
+          "txId": "fe395b4a1ad229f717fe71e86ec6c4b71df0367c6e992d453a8b683d68cf7b24",
+          "signature": "f10134cc122e7289ff228fadbccf2103eb034b91258ab5fe02594c1b4e0bd834300a1489d497c028e1ab57e3f46059741eab469eb2ea8a4d1515ddadade3420e"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4990,
+            "nonce": 2
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 1680,
+            "nonce": 2
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 337,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "challenged",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": {
+          "status": "bisecting",
+          "low": 0,
+          "high": 3,
+          "currentStep": 0,
+          "disputedLayer": -1
+        }
+      }
+    },
+    {
+      "name": "bisect_df_l2",
+      "height": 7,
+      "executedTxIds": [
+        "3f2a4fca9416ca17f805cea61a3a49090d2257b55856b8e92f535997a4b68345"
+      ],
+      "transactions": [
+        {
+          "from": "ai_a368a81a4e33552c787081587b9aa39125739d4e",
+          "to": "",
+          "value": 0,
+          "nonce": 3,
+          "data": {
+            "type": "bisect",
+            "data": {
+              "gameId": "5be62c27eafd9c2d926ff6fd55f36ade",
+              "layerIndex": 2,
+              "traceRoot": "trace_df_2_X"
+            }
+          },
+          "publicKey": "6a74535c0ef72f7cdcaa9b136dde8e61d68171ddbe6acbed2af8b85c51eeeb0b",
+          "txId": "3f2a4fca9416ca17f805cea61a3a49090d2257b55856b8e92f535997a4b68345",
+          "signature": "73545e97042b685429c88b4be4231404e77da5ba2d5c714c45243d2bc2110c62720d41a3d0937b9a05fedd5a4dc2458aa62866bd157acf44fa1b57ac74000c02"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4890,
+            "nonce": 3
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 1680,
+            "nonce": 2
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 412,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "challenged",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": {
+          "status": "bisecting",
+          "low": 0,
+          "high": 2,
+          "currentStep": 1,
+          "disputedLayer": 2
+        }
+      }
+    },
+    {
+      "name": "bisect_ch_l1",
+      "height": 8,
+      "executedTxIds": [
+        "4552db3cac6a820d879f329f281c957b101f640aa623e4e8fd210ab03ff02efa"
+      ],
+      "transactions": [
+        {
+          "from": "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d",
+          "to": "",
+          "value": 0,
+          "nonce": 3,
+          "data": {
+            "type": "bisect",
+            "data": {
+              "gameId": "5be62c27eafd9c2d926ff6fd55f36ade",
+              "layerIndex": 1,
+              "traceRoot": "trace_ch_1"
+            }
+          },
+          "publicKey": "63e087c0848b7b029ee8302330fc74784f765b611dc5ff1d359130950450c0d1",
+          "txId": "4552db3cac6a820d879f329f281c957b101f640aa623e4e8fd210ab03ff02efa",
+          "signature": "d695dc49beea838bb89e600477f4eac3b1a613832a9af25f39c93d1860fd67272fdb36ddc19397542ca76a73b52c8e4e2e1dd77dc01440720b9327e66c523c0e"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4890,
+            "nonce": 3
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 1580,
+            "nonce": 3
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 487,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "challenged",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": {
+          "status": "bisecting",
+          "low": 0,
+          "high": 2,
+          "currentStep": 1,
+          "disputedLayer": 2
+        }
+      }
+    },
+    {
+      "name": "bisect_df_l1",
+      "height": 9,
+      "executedTxIds": [
+        "3658ffc307773c0fc58ac584ccbfae05d5e0139e90081e9dbc5927fd22a4b6bd"
+      ],
+      "transactions": [
+        {
+          "from": "ai_a368a81a4e33552c787081587b9aa39125739d4e",
+          "to": "",
+          "value": 0,
+          "nonce": 4,
+          "data": {
+            "type": "bisect",
+            "data": {
+              "gameId": "5be62c27eafd9c2d926ff6fd55f36ade",
+              "layerIndex": 1,
+              "traceRoot": "trace_ch_1"
+            }
+          },
+          "publicKey": "6a74535c0ef72f7cdcaa9b136dde8e61d68171ddbe6acbed2af8b85c51eeeb0b",
+          "txId": "3658ffc307773c0fc58ac584ccbfae05d5e0139e90081e9dbc5927fd22a4b6bd",
+          "signature": "34d4e94b79fb5c6fb13107bdc371a135b8aa33da8cec14f6a296d646d6be3c3f659428b836b7caf53b87553d53a38e56cca51cb218679a79970ffd90c5196604"
+        }
+      ],
+      "expect": {
+        "accounts": {
+          "ai_bd0425f2beae3df24e3d38a2f69333a1cd2d4343": {
+            "balance": 9920,
+            "nonce": 1
+          },
+          "ai_f9e40ba424f3d664adb5ee2ca407499f17ce55db": {
+            "balance": 4740,
+            "nonce": 1
+          },
+          "ai_a368a81a4e33552c787081587b9aa39125739d4e": {
+            "balance": 4790,
+            "nonce": 4
+          },
+          "ai_e49a9ec67421e208bde2cc5acf5f4b4ca2b5dd5d": {
+            "balance": 1580,
+            "nonce": 3
+          },
+          "ai_b4bf87aaa1f58a9a59671481147ae0f93ac7fe28": {
+            "balance": 562,
+            "nonce": 0
+          }
+        },
+        "task": {
+          "status": "challenged",
+          "assignedTo": "ai_a368a81a4e33552c787081587b9aa39125739d4e"
+        },
+        "game": {
+          "status": "proving",
+          "low": 1,
+          "high": 2,
+          "currentStep": 2,
+          "disputedLayer": 1
+        }
+      }
+    }
+  ]
+}
