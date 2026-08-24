@@ -1,0 +1,26 @@
+[package]
+name = "verinoo-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "verinoo-node"
+path = "src/main.rs"
+
+[dependencies]
+verinoo-types = { path = "../types" }
+verinoo-state = { path = "../state" }
+verinoo-exec = { path = "../exec" }
+verinoo-network = { path = "../network" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+base64 = "0.22"
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }

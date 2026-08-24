@@ -128,6 +128,14 @@ impl StateStore {
         self.get_typed(&prefixed("game", game_id))
     }
 
+    // ---- blocks (hash-addressed JSON; schema owned by exec crate) ----
+    pub fn put_block_by_hash(&self, hash: &str, value: &Value) {
+        self.put_typed(&format!("hash:{hash}"), value);
+    }
+    pub fn get_block_by_hash(&self, hash: &str) -> Option<Value> {
+        self.get_typed(&format!("hash:{hash}"))
+    }
+
     // ---- meta ----
     pub fn set_meta(&self, key: &str, value: &Value) {
         self.put_typed(&prefixed("meta", key), value);

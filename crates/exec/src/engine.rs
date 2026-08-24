@@ -853,6 +853,15 @@ pub struct ProducerKey {
 }
 
 impl ProducerKey {
+    pub fn from_parts(address: String, signing: ed25519_dalek::SigningKey) -> Self {
+        let public_key_hex = hex::encode(signing.verifying_key().to_bytes());
+        Self {
+            address,
+            public_key_hex,
+            signing,
+        }
+    }
+
     /// seed = sha256(name) — deterministic test identities.
     pub fn deterministic(name: &str, index: u32) -> Self {
         let mut h = Sha256::new();
@@ -893,9 +902,15 @@ pub fn produce_block(
             continue;
         }
         let v = Validator { store, base_fee };
-        if v.validate_transaction(tx).is_ok() && execute_transaction(store, tx, &ctx).is_ok() {
-            executed.push(tx.clone());
-            gas_left -= cost;
+        match v.validate_transaction(tx) {
+            Err(e) => tracing::warn!("tx {} rejected at produce: {e}", tx.tx_id),
+            Ok(()) => match execute_transaction(store, tx, &ctx) {
+                Ok(()) => {
+                    executed.push(tx.clone());
+                    gas_left -= cost;
+                }
+                Err(e) => tracing::warn!("tx {} reverted: {e}", tx.tx_id),
+            },
         }
     }
 
@@ -936,6 +951,15 @@ pub fn produce_block(
     use ed25519_dalek::Signer;
     let sig = producer.signing.sign(header.hash.as_bytes());
     header.validator_signature = hex::encode(sig.to_bytes());
+
+    store.put_block_by_hash(
+        &header.hash,
+        &serde_json::to_value(&Block {
+            header: header.clone(),
+            transactions: executed.clone(),
+        })
+        .expect("block serialize"),
+    );
 
     let next_base_fee = crate::gas::compute_base_fee(
         base_fee,

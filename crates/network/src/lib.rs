@@ -12,14 +12,11 @@
 
 use futures::StreamExt;
 use libp2p::{gossipsub, identity, mdns, noise, swarm::NetworkBehaviour, tcp, yamux, Multiaddr};
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const BLOCKS_TOPIC: &str = "verinoo/blocks/1";
 pub const TXS_TOPIC: &str = "verinoo/txs/1";
-const MAX_SEEN: usize = 50_000;
-const DEFAULT_BAN: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
 pub enum NetworkEvent {
@@ -37,32 +34,32 @@ pub struct Behaviour {
     mdns: mdns::tokio::Behaviour,
 }
 
-pub struct NetworkNode {
-    /// The libp2p Swarm lives inside a dedicated tokio task; this handle
-    /// communicates with it over channels.
-    _peer_id: String,
-    pub event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
-    command_tx: mpsc::UnboundedSender<Command>,
-    seen: HashSet<[u8; 32]>,
-    seen_order: Vec<[u8; 32]>,
-    bans: HashMap<String, Instant>,
-}
-
+/// Publish-only handle (cloneable). Event stream comes back separately;
+/// dedup + ban policy live with the node's shared state.
 enum Command {
     PublishBlock(String),
     PublishTx(String),
+}
+
+/// Publish-only handle (cloneable). Event stream comes back separately;
+/// dedup + ban policy live with the node's shared state.
+#[derive(Clone)]
+pub struct NetworkNode {
+    _peer_id: String,
+    command_tx: mpsc::UnboundedSender<Command>,
 }
 
 impl NetworkNode {
     /// Spin up a node listening on `listen_port`, optionally dialing seeds.
     /// `key_seed` must be UNIQUE per node — identical seeds mean identical
     /// PeerIds and libp2p aborts self-connections.
+    #[allow(clippy::type_complexity)]
     pub async fn new(
         listen_port: u16,
         key_seed: [u8; 32],
         seed_peers: &[String],
         chain_id: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<NetworkEvent>), Box<dyn std::error::Error>> {
         let key = identity::Keypair::ed25519_from_bytes(key_seed)?;
         let peer_id = identity::PeerId::from(key.public());
 
@@ -169,17 +166,16 @@ impl NetworkNode {
             }
         });
 
-        Ok(Self {
+        let node = Self {
             _peer_id: peer_id.to_string(),
-            event_rx,
             command_tx: _cmd_tx,
-            seen: HashSet::new(),
-            seen_order: Vec::new(),
-            bans: HashMap::new(),
-        })
+        };
+        Ok((node, event_rx))
     }
+}
 
-    /// Broadcast a block payload (hex JSON string).
+impl NetworkNode {
+    /// Broadcast a block payload (JSON string).
     pub fn publish_block(&self, payload: &str) {
         let _ = self.command_tx.send(Command::PublishBlock(payload.into()));
     }
@@ -187,44 +183,5 @@ impl NetworkNode {
     /// Broadcast a transaction payload.
     pub fn publish_tx(&self, payload: &str) {
         let _ = self.command_tx.send(Command::PublishTx(payload.into()));
-    }
-
-    /// Dedup helper: returns false if this exact payload was already seen.
-    pub fn mark_seen(&mut self, payload: &str) -> bool {
-        use sha2::Digest;
-        let mut h = sha2::Sha256::new();
-        h.update(payload.as_bytes());
-        let digest: [u8; 32] = h.finalize().into();
-        if self.seen.contains(&digest) {
-            return false;
-        }
-        self.seen.insert(digest);
-        self.seen_order.push(digest);
-        if self.seen_order.len() > MAX_SEEN {
-            let old = self.seen_order.remove(0);
-            self.seen.remove(&old);
-        }
-        true
-    }
-
-    pub fn is_banned(&self, peer: &str) -> bool {
-        self.bans
-            .get(peer)
-            .map(|until| *until > Instant::now())
-            .unwrap_or(false)
-    }
-
-    pub fn ban(&mut self, peer: &str, reason: &str) {
-        self.bans.insert(peer.into(), Instant::now() + DEFAULT_BAN);
-        tracing::warn!("banned {peer}: {reason}");
-    }
-
-    /// Drain pending network events (non-blocking).
-    pub fn drain_events(&mut self) -> Vec<NetworkEvent> {
-        let mut out = Vec::new();
-        while let Ok(ev) = self.event_rx.try_recv() {
-            out.push(ev);
-        }
-        out
     }
 }
