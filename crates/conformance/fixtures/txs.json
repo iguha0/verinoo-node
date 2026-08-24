@@ -1,0 +1,116 @@
+{
+  "scheme": "ed25519-detached-over-sha256-canonical-string",
+  "signerAlice": {
+    "address": "ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491",
+    "publicKey": "afa43a1870c31309415f093f2cd9bc8316cb2da6e09b98aa10b74ab6113c1ab2"
+  },
+  "signerBob": {
+    "address": "ai_ee2148303116d61f51c01429d0d927f93a7beb67",
+    "publicKey": "a781a0ba0bca33a00b3e5450ddf99a758fa98750b4607d067bd64c133295b139"
+  },
+  "vectors": [
+    {
+      "name": "transfer",
+      "payloadCanonical": "{\"data\":{\"data\":{},\"type\":\"transfer\"},\"from\":\"ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491\",\"nonce\":1,\"to\":\"ai_ee2148303116d61f51c01429d0d927f93a7beb67\",\"value\":250}",
+      "txId": "3e6842a2a2411652b52fb81ef4005fec7a766d1cdc5e231a2c5fd145ad2e83e9",
+      "signatureOverHex": "3e6842a2a2411652b52fb81ef4005fec7a766d1cdc5e231a2c5fd145ad2e83e9",
+      "tx": {
+        "from": "ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491",
+        "to": "ai_ee2148303116d61f51c01429d0d927f93a7beb67",
+        "value": 250,
+        "nonce": 1,
+        "data": {
+          "type": "transfer",
+          "data": {}
+        },
+        "publicKey": "afa43a1870c31309415f093f2cd9bc8316cb2da6e09b98aa10b74ab6113c1ab2",
+        "txId": "3e6842a2a2411652b52fb81ef4005fec7a766d1cdc5e231a2c5fd145ad2e83e9",
+        "signature": "301bdc3a5ad2cacaeef0eaae0be2dd82fe939df306bed143d4ccf1cc40c59c26358edc37f037dbb1c9dd2301c78504b66fd37c079372037d17d773047358f604"
+      }
+    },
+    {
+      "name": "register_model",
+      "payloadCanonical": "{\"data\":{\"data\":{\"architecture\":\"TinyNet\",\"description\":\"fixture model\",\"parameterCount\":256000,\"runtimeHash\":\"r_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"stakingRequirement\":50,\"weightsHash\":\"w_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"type\":\"registerModel\"},\"from\":\"ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491\",\"nonce\":2,\"to\":\"\",\"value\":0}",
+      "txId": "640b31c7a74cbab21ca431ba831b0e887db903b81088ec1f7298954a89873213",
+      "signatureOverHex": "640b31c7a74cbab21ca431ba831b0e887db903b81088ec1f7298954a89873213",
+      "tx": {
+        "from": "ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491",
+        "to": "",
+        "value": 0,
+        "nonce": 2,
+        "data": {
+          "type": "registerModel",
+          "data": {
+            "architecture": "TinyNet",
+            "parameterCount": 256000,
+            "weightsHash": "w_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "runtimeHash": "r_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stakingRequirement": 50,
+            "description": "fixture model"
+          }
+        },
+        "publicKey": "afa43a1870c31309415f093f2cd9bc8316cb2da6e09b98aa10b74ab6113c1ab2",
+        "txId": "640b31c7a74cbab21ca431ba831b0e887db903b81088ec1f7298954a89873213",
+        "signature": "c9743155dc8e2c3b5d23a6e9868d0c4b029fa73ab50e1eb0172a85d4bd108330f95dff4be5a28f3eebf0e1e22d0359f23f55727b0728413d2917f098c3222e01"
+      }
+    },
+    {
+      "name": "register_node",
+      "payloadCanonical": "{\"data\":{\"data\":{\"activeTasks\":0,\"availableCapacity\":4,\"failedInferences\":0,\"maxCapacity\":4,\"reputation\":50,\"stakedAmount\":800,\"successfulInferences\":0,\"supportedModels\":[\"model_x\"]},\"type\":\"registerNode\"},\"from\":\"ai_ee2148303116d61f51c01429d0d927f93a7beb67\",\"nonce\":1,\"to\":\"\",\"value\":0}",
+      "txId": "90b501aef0adf08162c05b285d0d81757f088ec6c62a7998c439ff654d783819",
+      "signatureOverHex": "90b501aef0adf08162c05b285d0d81757f088ec6c62a7998c439ff654d783819",
+      "tx": {
+        "from": "ai_ee2148303116d61f51c01429d0d927f93a7beb67",
+        "to": "",
+        "value": 0,
+        "nonce": 1,
+        "data": {
+          "type": "registerNode",
+          "data": {
+            "stakedAmount": 800,
+            "availableCapacity": 4,
+            "maxCapacity": 4,
+            "activeTasks": 0,
+            "reputation": 50,
+            "successfulInferences": 0,
+            "failedInferences": 0,
+            "supportedModels": [
+              "model_x"
+            ]
+          }
+        },
+        "publicKey": "a781a0ba0bca33a00b3e5450ddf99a758fa98750b4607d067bd64c133295b139",
+        "txId": "90b501aef0adf08162c05b285d0d81757f088ec6c62a7998c439ff654d783819",
+        "signature": "29b804f78769f763a470db5618072351b836850cc201483a6a83e19f6269d7fe6864f7acf523fb9f3cc67e19e839404d1e34f3bca24aedbc0cab83e7308a5200"
+      }
+    },
+    {
+      "name": "submit_inference_sampled",
+      "payloadCanonical": "{\"data\":{\"data\":{\"deadline\":99999,\"inputCommitment\":\"inp_c\",\"maxFee\":100,\"requester\":\"ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491\",\"targetModel\":\"model_x\",\"verificationType\":\"sampled\"},\"type\":\"submitInference\"},\"from\":\"ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491\",\"gasLimit\":500,\"gasPrice\":2,\"nonce\":3,\"to\":\"\",\"value\":0}",
+      "txId": "d4d67aa45f82ea546ba156843c29ba5f052cd7d1c4f1a00256514c043f8498ab",
+      "signatureOverHex": "d4d67aa45f82ea546ba156843c29ba5f052cd7d1c4f1a00256514c043f8498ab",
+      "tx": {
+        "from": "ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491",
+        "to": "",
+        "value": 0,
+        "nonce": 3,
+        "gasLimit": 500,
+        "gasPrice": 2,
+        "data": {
+          "type": "submitInference",
+          "data": {
+            "requester": "ai_b3d850befd5087ca2fb4d4766c53d7477fbfd491",
+            "targetModel": "model_x",
+            "inputCommitment": "inp_c",
+            "maxFee": 100,
+            "deadline": 99999,
+            "verificationType": "sampled"
+          }
+        },
+        "publicKey": "afa43a1870c31309415f093f2cd9bc8316cb2da6e09b98aa10b74ab6113c1ab2",
+        "txId": "d4d67aa45f82ea546ba156843c29ba5f052cd7d1c4f1a00256514c043f8498ab",
+        "signature": "2b66f83c881686d549a44ffa7609b03062b99b97804c2acaec9b911c7321db389fb61d595ecf0ee9795f967534853a9112f966493ffb1a56ee0eb88ae7feb50d"
+      }
+    }
+  ]
+}

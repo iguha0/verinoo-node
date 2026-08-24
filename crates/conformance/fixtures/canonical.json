@@ -1,0 +1,67 @@
+[
+  {
+    "name": "nested_key_order",
+    "input": {
+      "z": 1,
+      "a": {
+        "y": 2,
+        "x": [
+          3,
+          {
+            "c": 4,
+            "b": 5
+          }
+        ]
+      }
+    },
+    "expected": "{\"a\":{\"x\":[3,{\"b\":5,\"c\":4}],\"y\":2},\"z\":1}"
+  },
+  {
+    "name": "flat_ops_payload",
+    "input": {
+      "data": {
+        "type": "transfer",
+        "data": {}
+      },
+      "from": "ai_a",
+      "nonce": 7,
+      "to": "ai_b",
+      "value": 10
+    },
+    "expected": "{\"data\":{\"data\":{},\"type\":\"transfer\"},\"from\":\"ai_a\",\"nonce\":7,\"to\":\"ai_b\",\"value\":10}"
+  },
+  {
+    "name": "unicode_and_escapes",
+    "input": {
+      "k": "quote\" back\\slash\nnewline ünïcode ✓"
+    },
+    "expected": "{\"k\":\"quote\\\" back\\\\slash\\nnewline ünïcode ✓\"}"
+  },
+  {
+    "name": "empty_containers",
+    "input": {
+      "arr": [],
+      "obj": {},
+      "s": ""
+    },
+    "expected": "{\"arr\":[],\"obj\":{},\"s\":\"\"}"
+  },
+  {
+    "name": "big_integers",
+    "input": {
+      "u": 9007199254740991,
+      "i": -9007199254740991,
+      "mid": 4294967296
+    },
+    "expected": "{\"i\":-9007199254740991,\"mid\":4294967296,\"u\":9007199254740991}"
+  },
+  {
+    "name": "booleans_null",
+    "input": {
+      "t": true,
+      "f": false,
+      "n": null
+    },
+    "expected": "{\"f\":false,\"n\":null,\"t\":true}"
+  }
+]
