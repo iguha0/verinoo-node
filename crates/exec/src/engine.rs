@@ -145,6 +145,8 @@ fn as_kind_str(tx_data: &verinoo_types::tx::TxData) -> String {
         verinoo_types::tx::TxKind::Bisect => "bisect",
         verinoo_types::tx::TxKind::ProveStep => "proveStep",
         verinoo_types::tx::TxKind::AgentPayment => "agentPayment",
+        verinoo_types::tx::TxKind::RegisterValidator => "registerValidator",
+        verinoo_types::tx::TxKind::UnregisterValidator => "unregisterValidator",
     }
     .to_string()
 }
@@ -223,6 +225,23 @@ pub fn validate_block(
     allowed_validators: &[String],
     now_ms: u64,
 ) -> Result<(), EngineError> {
+    validate_block_with_policy(
+        block,
+        prev_head,
+        allowed_validators,
+        now_ms,
+        &crate::leader::RoundRobin,
+    )
+}
+
+/// Same gate with an injectable leader policy (Malachite adapter point).
+pub fn validate_block_with_policy(
+    block: &Block,
+    prev_head: &BlockHeader,
+    allowed_validators: &[String],
+    now_ms: u64,
+    policy: &dyn crate::leader::LeaderPolicy,
+) -> Result<(), EngineError> {
     if block.header.version != HEADER_VERSION {
         return Err(EngineError::Validation(format!(
             "unknown block version {}",
@@ -258,12 +277,31 @@ pub fn validate_block(
             "invalid validator signature".into(),
         ));
     }
-    // Producer authorization.
+    // Producer authorization: must be in the active set...
     if !allowed_validators.contains(&block.header.validator) {
         return Err(EngineError::Validation(format!(
             "unauthorized producer {}",
             block.header.validator
         )));
+    }
+    // ...and the pubkey must derive to that validator's address.
+    let derived = public_key_to_address(&block.header.validator_pub_key)
+        .map_err(|_| EngineError::Validation("bad validatorPubKey".into()))?;
+    if derived != block.header.validator {
+        return Err(EngineError::Validation(
+            "validatorPubKey does not derive to validator".into(),
+        ));
+    }
+    // ...and this height is the producer's scheduled slot.
+    match policy.leader_at(block.header.index, allowed_validators) {
+        Some(leader) if leader == block.header.validator => {}
+        Some(leader) => {
+            return Err(EngineError::Validation(format!(
+                "wrong producer for height {}: expected {leader}, got {}",
+                block.header.index, block.header.validator
+            )));
+        }
+        None => return Err(EngineError::Validation("empty validator set".into())),
     }
     // Chain linkage.
     if block.header.index != prev_head.index + 1 || block.header.previous_hash != prev_head.hash {
@@ -679,6 +717,53 @@ pub fn execute_transaction(
             game_stub(store, data)?;
         }
 
+        verinoo_types::tx::TxKind::RegisterValidator => {
+            use verinoo_state::validators::{ValidatorEntry, MIN_VALIDATOR_STAKE};
+            let stake = data["stakedAmount"].as_u64().unwrap_or(0);
+            if store.get_validator(&tx.from).is_some() {
+                return Err(EngineError::Reverted("already a validator".into()));
+            }
+            if stake < MIN_VALIDATOR_STAKE {
+                return Err(EngineError::Reverted(format!(
+                    "stake below minimum ({stake} < {MIN_VALIDATOR_STAKE})"
+                )));
+            }
+            // Bond: debit sender.
+            let mut acc = store.account_or_default(&tx.from);
+            acc.balance -= stake as i64;
+            if acc.balance < 0 {
+                return Err(EngineError::Reverted(
+                    "insufficient balance for stake".into(),
+                ));
+            }
+            acc.updated_at = ctx.height;
+            store.set_account(&acc);
+            store.set_validator(&ValidatorEntry {
+                address: tx.from.clone(),
+                public_key: tx.public_key.clone(),
+                staked_amount: stake,
+                registered_at_height: ctx.height,
+                genesis: false,
+            });
+        }
+
+        verinoo_types::tx::TxKind::UnregisterValidator => {
+            let entry = store
+                .get_validator(&tx.from)
+                .ok_or_else(|| EngineError::Reverted("not a validator".into()))?;
+            // Guard: never leave the set empty.
+            let active = store.active_validators();
+            if active.len() <= 1 {
+                return Err(EngineError::Reverted("cannot remove last validator".into()));
+            }
+            // Refund bond.
+            let mut acc = store.account_or_default(&tx.from);
+            acc.balance += entry.staked_amount as i64;
+            acc.updated_at = ctx.height;
+            store.set_account(&acc);
+            store.remove_validator(&tx.from);
+        }
+
         verinoo_types::tx::TxKind::AgentPayment => {
             let agent_addr = tx.from.clone();
             let mut agent = store
@@ -903,13 +988,13 @@ pub fn produce_block(
         }
         let v = Validator { store, base_fee };
         match v.validate_transaction(tx) {
-            Err(e) => tracing::warn!("tx {} rejected at produce: {e}", tx.tx_id),
+            Err(e) => eprintln!("[produce] VALIDATE FAIL tx={} err={e}", tx.tx_id),
             Ok(()) => match execute_transaction(store, tx, &ctx) {
                 Ok(()) => {
                     executed.push(tx.clone());
                     gas_left -= cost;
                 }
-                Err(e) => tracing::warn!("tx {} reverted: {e}", tx.tx_id),
+                Err(e) => eprintln!("[produce] EXEC REVERT tx={} err={e}", tx.tx_id),
             },
         }
     }

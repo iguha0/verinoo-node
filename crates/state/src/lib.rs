@@ -11,6 +11,7 @@
 
 pub mod genesis;
 pub mod models;
+pub mod validators;
 
 use crate::models::{Account, AgentAccount, ComputeNode, InferenceTask, ModelRegistryEntry};
 use rocksdb::{DBWithThreadMode, SingleThreaded};
@@ -43,6 +44,9 @@ impl StateStore {
         Self::open(&dir)
     }
 
+    fn del_raw(&self, key: &str) {
+        self.db.delete(key.as_bytes()).expect("rocksdb delete");
+    }
     fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
         self.db.get(key.as_bytes()).expect("rocksdb read")
     }
@@ -210,5 +214,53 @@ mod tests {
         store.set_task(&task);
         assert_eq!(store.iter_tasks_by_status("pending").len(), 1);
         assert_eq!(store.iter_tasks_by_status("assigned").len(), 0);
+    }
+}
+
+// ---- validator set (Phase R3) ----
+use crate::validators::ValidatorEntry;
+
+impl StateStore {
+    pub fn set_validator(&self, v: &ValidatorEntry) {
+        self.put_typed(&prefixed("val", &v.address), v);
+    }
+    pub fn get_validator(&self, address: &str) -> Option<ValidatorEntry> {
+        self.get_typed(&prefixed("val", address))
+    }
+    pub fn remove_validator(&self, address: &str) {
+        self.del_raw(&prefixed("val", address));
+    }
+    /// ACTIVE validators sorted by address — the leader-election order.
+    pub fn active_validators(&self) -> Vec<ValidatorEntry> {
+        let mut vals = self.iter_prefix::<ValidatorEntry>("val:");
+        vals.sort_by(|a, b| a.address.cmp(&b.address));
+        vals
+    }
+    /// Active validator ADDRESSES in election order.
+    pub fn validator_addresses(&self) -> Vec<String> {
+        self.active_validators()
+            .into_iter()
+            .map(|v| v.address)
+            .collect()
+    }
+}
+
+// ---- genesis seeding ----
+impl StateStore {
+    /// Seed the initial validator set (genesis-approved addresses).
+    /// Entries carry the `genesis` flag: exempt from stake minimums.
+    pub fn seed_genesis_validators(&self, addresses: &[String], height: u64) {
+        for addr in addresses {
+            if self.get_validator(addr).is_some() {
+                continue;
+            }
+            self.set_validator(&crate::validators::ValidatorEntry {
+                address: addr.clone(),
+                public_key: String::new(),
+                staked_amount: 0,
+                registered_at_height: height,
+                genesis: true,
+            });
+        }
     }
 }

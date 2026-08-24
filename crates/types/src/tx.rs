@@ -18,6 +18,8 @@ pub enum TxKind {
     Bisect,
     ProveStep,
     AgentPayment,
+    RegisterValidator,
+    UnregisterValidator,
 }
 
 /// The `data` field of a transaction: `{ type: TxKind, data: <op-specific> }`.

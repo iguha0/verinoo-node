@@ -18,6 +18,7 @@ pub async fn serve(shared: Arc<Shared>, port: u16) -> Result<(), String> {
         .route("/blocks", get(blocks))
         .route("/mempool", get(mempool))
         .route("/account/:address", get(account))
+        .route("/validators", get(validators))
         .route("/tx", post(submit_tx))
         .with_state(shared);
 
@@ -76,6 +77,18 @@ async fn account(
         Some(a) => Json(serde_json::to_value(&a).unwrap()),
         None => Json(serde_json::json!({ "error": "not found" })),
     }
+}
+
+async fn validators(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
+    let vals = shared.store.active_validators();
+    Json(serde_json::json!(vals
+        .iter()
+        .map(|v| serde_json::json!({
+            "address": v.address,
+            "stakedAmount": v.staked_amount,
+            "genesis": v.genesis,
+        }))
+        .collect::<Vec<_>>()))
 }
 
 async fn mempool(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {

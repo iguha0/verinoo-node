@@ -15,6 +15,8 @@ pub fn gas_cost_for(data: &Value) -> u64 {
         "bisect" => 100,
         "proveStep" => 80,
         "agentPayment" => 50,
+        "registerValidator" => 100,
+        "unregisterValidator" => 50,
         _ => 50, // transfer + unknown default
     }
 }
