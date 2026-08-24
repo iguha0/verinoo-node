@@ -36,7 +36,7 @@ mod conformance {
         let fx = load_fixture("txs.json");
         assert_eq!(
             fx["scheme"].as_str().unwrap(),
-            "ed25519-detached-over-sha256-canonical-string"
+            "ed25519-detached-over-txid-utf8"
         );
 
         for vector in fx["vectors"].as_array().unwrap() {
@@ -79,30 +79,35 @@ mod conformance {
     }
 
     #[test]
-    fn ed25519_signatures_verify_over_the_raw_digest() {
+    fn ed25519_signatures_verify_over_txid_utf8() {
         let fx = load_fixture("txs.json");
+
+        assert_eq!(
+            fx["scheme"].as_str().unwrap(),
+            "ed25519-detached-over-txid-utf8"
+        );
 
         for vector in fx["vectors"].as_array().unwrap() {
             let name = vector["name"].as_str().unwrap();
-            let msg_hex = vector["signatureOverHex"].as_str().unwrap();
+            let tx_id = vector["txId"].as_str().unwrap();
             let sig_hex = vector["tx"]["signature"].as_str().unwrap();
             let pk_hex = vector["tx"]["publicKey"].as_str().unwrap();
 
             let vk = VerifyingKey::from_bytes(&hex::decode(pk_hex).unwrap().try_into().unwrap())
                 .expect("valid verifying key");
-
             let sig = Signature::from_slice(&hex::decode(sig_hex).unwrap())
                 .expect("signature is 64 bytes");
-            let msg: [u8; 32] = hex::decode(msg_hex).unwrap().try_into().unwrap();
-            vk.verify(&msg, &sig)
+
+            // Ed25519 detached over the UTF-8 bytes of the txId string.
+            vk.verify(tx_id.as_bytes(), &sig)
                 .unwrap_or_else(|e| panic!("{name}: signature must verify ({e})"));
 
-            // Tampered message must fail.
-            let mut bad = msg;
+            // Tampered txId must fail.
+            let mut bad = tx_id.as_bytes().to_vec();
             bad[0] ^= 0xff;
             assert!(
                 vk.verify(&bad, &sig).is_err(),
-                "{name}: tampered digest must fail verification"
+                "{name}: tampered txId must fail"
             );
         }
     }
