@@ -1,8 +1,22 @@
 name: CI
 on: push
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "workflow started OK"
+      - run: echo "CI triggered, checking environment..."
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake g++ libclang-dev clang llvm-dev
+          rustup component add clippy rustfmt
+      - name: Build
+        run: cargo build --workspace 2>&1 | tail -20
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked -- --nocapture
