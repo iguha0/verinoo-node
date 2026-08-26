@@ -731,7 +731,7 @@ pub fn execute_transaction(
             let disputed_layer = game["disputedLayer"].as_i64().unwrap_or(0) as usize;
             let spec = &game["layerSpec"][disputed_layer];
             let op_type = spec["opType"].as_str().unwrap_or("");
-            let input_shape = &spec["inputShape"];
+            let _input_shape = &spec["inputShape"];
 
             let layer_weights = data["layerWeights"]
                 .as_array()
@@ -909,10 +909,6 @@ pub fn execute_transaction(
             store.set_agent(&agent);
         }
     }
-    Ok(())
-}
-
-fn game_stub(_store: &StateStore, _data: &serde_json::Value) -> Result<(), EngineError> {
     Ok(())
 }
 
