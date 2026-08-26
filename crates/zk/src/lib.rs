@@ -11,6 +11,13 @@
 
 pub const FIXED_ONE: i32 = 65536; // 1.0 in Q16.16
 
+/// Q16.16 fixed-point multiply: `(a * b) >> 16`.
+/// Uses i64 intermediate to avoid overflow.
+#[inline]
+pub fn fmul(a: i32, b: i32) -> i32 {
+    (((a as i64) * (b as i64)) >> 16) as i32
+}
+
 /// Convert float to Q16.16 raw integer.
 pub fn f2i(v: f64) -> i32 {
     (v * FIXED_ONE as f64).round() as i32
@@ -33,7 +40,7 @@ pub fn matmul(inp: &[i32], weights: &[i32], bias: &[i32], n_out: usize) -> Vec<i
     for i in 0..n_out {
         let mut acc = bias.get(i).copied().unwrap_or(0);
         for j in 0..n_in {
-            acc = acc.wrapping_add(inp[j].wrapping_mul(weights[i * n_in + j]));
+            acc = acc.wrapping_add(fmul(inp[j], weights[i * n_in + j]));
         }
         out.push(acc);
     }
@@ -74,7 +81,7 @@ pub fn argmax(x: &[i32]) -> usize {
 ///   t      = floor_sqrt(A)
 ///   R      = floor(2^32 / t)
 ///   y_i    = floor((c_i * R) >> 16)
-pub fn layernorm(x: &[i32], n: usize) -> Vec<i32> {
+pub fn layernorm(x: &[i32], _n: usize) -> Vec<i32> {
     let xb: Vec<i64> = x.iter().map(|&v| v as i64).collect();
 
     let sum: i64 = xb.iter().sum();
@@ -100,29 +107,37 @@ pub fn layernorm(x: &[i32], n: usize) -> Vec<i32> {
         .collect()
 }
 
-/// Largest s with s*s <= a (a >= 0). Binary search.
+/// Largest s with s*s <= a (a >= 0). f64 estimate + Newton refinement.
 fn isqrt(a: i64) -> i64 {
-    if a < 0 {
+    if a <= 0 {
         return 0;
     }
-    if a < 2 {
-        return a;
+    if a < 4 {
+        return 1;
     }
-    let mut lo: i64 = 1;
-    let mut hi: i64 = a;
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        let sq = mid * mid;
-        if sq == a {
-            return mid;
+    let mut x: u64 = (a as f64).sqrt() as u64;
+    // Newton-Raphson: x' = (x + a/x) / 2, converges downward
+    loop {
+        if x == 0 {
+            break;
         }
-        if sq < a {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
+        let next = (x + (a as u64) / x) / 2;
+        if next >= x {
+            break;
         }
+        x = next;
     }
-    hi
+    // Floor correction: ensure x*x <= a
+    while x > 0 && x.checked_mul(x).map_or(true, |sq| sq > a as u64) {
+        x -= 1;
+    }
+    while (x + 1)
+        .checked_mul(x + 1)
+        .map_or(false, |sq| sq <= a as u64)
+    {
+        x += 1;
+    }
+    x as i64
 }
 
 /// Floor division by 2^k toward negative infinity.
@@ -139,7 +154,7 @@ fn shr_floor(a: i64, k: u32) -> i64 {
 ///   e_i   = 0 if x_i - max_v < 0, else (x_i - max_v) + 65536
 ///   denom = max(sum(e), 1)
 ///   y_i   = floor(e_i * 65536 / denom)
-pub fn softmax(x: &[i32], n: usize) -> Vec<i32> {
+pub fn softmax(x: &[i32], _n: usize) -> Vec<i32> {
     const F: i64 = FIXED_ONE as i64;
 
     let xi: Vec<i64> = x.iter().map(|&v| v as i64).collect();
@@ -178,18 +193,21 @@ pub fn execute_layer(
         "matmul" | "attention" | "ffn" => {
             // attention/ffn add bias then relu
             let n_in = input.len();
-            let n_out = if n_in > 0 { weights.len() / n_in } else { 0 };
+            let n_out = weights.len().max(1) / n_in.max(1);
             let b = bias.unwrap_or(&[]);
-            let mut out = vec![0i32; n_out];
-            for i in 0..n_out {
-                let mut acc = b.get(i).copied().unwrap_or(0);
-                for j in 0..n_in {
-                    acc = acc.wrapping_add(input[j].wrapping_mul(weights[i * n_in + j]));
-                }
-                out[i] = acc;
-            }
-            // apply relu
-            out.iter().map(|&v| if v > 0 { v } else { 0 }).collect()
+            (0..n_out)
+                .map(|i| {
+                    let mut acc = b.get(i).copied().unwrap_or(0);
+                    for k in 0..n_in {
+                        acc = acc.wrapping_add(fmul(input[k], weights[k * n_out + i]));
+                    }
+                    if acc > 0 {
+                        acc
+                    } else {
+                        0
+                    }
+                })
+                .collect()
         }
         "relu" => relu(input),
         "softmax" => softmax(input, input.len()),
@@ -201,16 +219,17 @@ pub fn execute_layer(
         "head" => {
             // head = matmul + bias + softmax
             let n_in = input.len();
-            let n_out = if n_in > 0 { weights.len() / n_in } else { 0 };
+            let n_out = weights.len().max(1) / n_in.max(1);
             let b = bias.unwrap_or(&[]);
-            let mut logits = vec![0i32; n_out];
-            for i in 0..n_out {
-                let mut acc = b.get(i).copied().unwrap_or(0);
-                for j in 0..n_in {
-                    acc = acc.wrapping_add(input[j].wrapping_mul(weights[i * n_in + j]));
-                }
-                logits[i] = acc;
-            }
+            let logits: Vec<i32> = (0..n_out)
+                .map(|i| {
+                    let mut acc = b.get(i).copied().unwrap_or(0);
+                    for k in 0..n_in {
+                        acc = acc.wrapping_add(fmul(input[k], weights[k * n_out + i]));
+                    }
+                    acc
+                })
+                .collect();
             softmax(&logits, n_out)
         }
         _ => input.to_vec(),

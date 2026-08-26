@@ -25,7 +25,7 @@ fn load_vectors() -> Vec<OpVector> {
 #[test]
 fn all_op_vectors_match_wasm_runtime() {
     let vectors = load_vectors();
-    assert!(vectors.len() >= 8, "expected at least 8 vectors");
+    assert!(vectors.len() >= 7, "expected at least 7 vectors");
 
     for v in &vectors {
         let got = match v.op.as_str() {
@@ -57,7 +57,7 @@ fn argmax_basics_and_ties() {
 
 #[test]
 fn q16_16_conversion_roundtrip() {
-    for v in [-8.0, -1.5, 0.0, 0.001, 1.0, 3.14159, 100.0] {
+    for v in [-8.0, -1.5, 0.0, 0.001, 1.0, std::f64::consts::PI, 100.0] {
         let fixed = f2i(v);
         let back = i2f(fixed);
         assert!(

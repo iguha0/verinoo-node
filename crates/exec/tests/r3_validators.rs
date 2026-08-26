@@ -137,13 +137,6 @@ impl Chain {
         self.store.set_account(&acc);
     }
 
-    /// Next nonce for a named sender.
-    fn nonce(&mut self, name: &str) -> u64 {
-        let n = self.nonces.entry(name.to_string()).or_insert(0);
-        *n += 1;
-        *n
-    }
-
     /// Produce an EMPTY block by whatever validator is scheduled.
     fn tick(&mut self) -> Result<Block, String> {
         self.produce_by_scheduled(vec![])

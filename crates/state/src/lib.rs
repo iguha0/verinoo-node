@@ -177,46 +177,6 @@ impl StateStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn account_roundtrip_and_default() {
-        let store = StateStore::open_temp().unwrap();
-        assert_eq!(store.get_account("ai_x"), None);
-        let acc = store.account_or_default("ai_x");
-        assert_eq!(acc.balance, 0);
-        store.set_account(&Account {
-            address: "ai_x".into(),
-            public_key: "pk".into(),
-            nonce: 4,
-            balance: 1000,
-            updated_at: 7,
-        });
-        let got = store.get_account("ai_x").unwrap();
-        assert_eq!(got.nonce, 4);
-        assert_eq!(got.balance, 1000);
-    }
-
-    #[test]
-    fn meta_and_tasks() {
-        let store = StateStore::open_temp().unwrap();
-        store.set_meta_u64("baseFee", 3);
-        assert_eq!(store.meta_u64_or("baseFee", 1), 3);
-        assert_eq!(store.meta_u64_or("missing", 9), 9);
-
-        let task: InferenceTask =
-            serde_json::from_value(json!({"taskId":"t1","requester":"r","targetModel":"m",
-                "maxFee":10,"deadline":5,"status":"pending"}))
-            .unwrap();
-        store.set_task(&task);
-        assert_eq!(store.iter_tasks_by_status("pending").len(), 1);
-        assert_eq!(store.iter_tasks_by_status("assigned").len(), 0);
-    }
-}
-
 // ---- validator set (Phase R3) ----
 use crate::validators::ValidatorEntry;
 
@@ -262,5 +222,45 @@ impl StateStore {
                 genesis: true,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn account_roundtrip_and_default() {
+        let store = StateStore::open_temp().unwrap();
+        assert_eq!(store.get_account("ai_x"), None);
+        let acc = store.account_or_default("ai_x");
+        assert_eq!(acc.balance, 0);
+        store.set_account(&Account {
+            address: "ai_x".into(),
+            public_key: "pk".into(),
+            nonce: 4,
+            balance: 1000,
+            updated_at: 7,
+        });
+        let got = store.get_account("ai_x").unwrap();
+        assert_eq!(got.nonce, 4);
+        assert_eq!(got.balance, 1000);
+    }
+
+    #[test]
+    fn meta_and_tasks() {
+        let store = StateStore::open_temp().unwrap();
+        store.set_meta_u64("baseFee", 3);
+        assert_eq!(store.meta_u64_or("baseFee", 1), 3);
+        assert_eq!(store.meta_u64_or("missing", 9), 9);
+
+        let task: InferenceTask =
+            serde_json::from_value(json!({"taskId":"t1","requester":"r","targetModel":"m",
+                "maxFee":10,"deadline":5,"status":"pending"}))
+            .unwrap();
+        store.set_task(&task);
+        assert_eq!(store.iter_tasks_by_status("pending").len(), 1);
+        assert_eq!(store.iter_tasks_by_status("assigned").len(), 0);
     }
 }
