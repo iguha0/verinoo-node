@@ -6,6 +6,7 @@
 //! rejection, per-tx canonical + signature checks).
 
 mod rpc;
+mod wallet;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -178,6 +179,13 @@ type NetworkNodeAlias = verinoo_network::NetworkNode;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Wallet subcommands
+    if args.len() > 1 && args[1] == "wallet" {
+        return wallet_cli(&args[2..]).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -365,4 +373,95 @@ fn sha256_hex_str(input: &str) -> String {
     let mut h = sha2::Sha256::new();
     h.update(input.as_bytes());
     hex::encode(h.finalize())
+}
+
+// ============================ wallet CLI ============================
+
+async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        println!("Usage: verinoo-node wallet <command> [options]");
+        println!("  generate --output <file>");
+        println!("  balance  --key-file <file> [--node <url>]");
+        println!("  send     --key-file <file> --to <addr> --amount <n> [--node <url>]");
+        return Ok(());
+    }
+
+    let cmd = args[0].as_str();
+    let mut output = "wallet.json".to_string();
+    let mut key_file = String::new();
+    let mut to_addr = String::new();
+    let mut amount: u64 = 0;
+    let mut rpc_url = "http://localhost:7100".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" | "--key-file" => {
+                if i + 1 < args.len() {
+                    key_file = args[i + 1].clone();
+                    if cmd == "generate" {
+                        output = key_file.clone();
+                    }
+                    i += 1;
+                }
+            }
+            "--to" => {
+                if i + 1 < args.len() {
+                    to_addr = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--amount" => {
+                if i + 1 < args.len() {
+                    amount = args[i + 1].parse().unwrap_or(0);
+                    i += 1;
+                }
+            }
+            "--node" => {
+                if i + 1 < args.len() {
+                    rpc_url = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    match cmd {
+        "generate" => {
+            wallet::generate_key(&output)?;
+        }
+        "balance" => {
+            let (_, _, addr) = wallet::load_key(&key_file)?;
+            let bal = wallet::query_balance(&rpc_url, &addr).await?;
+            println!("Address: {addr}");
+            println!("Balance: {bal}");
+        }
+        "send" => {
+            if to_addr.is_empty() || amount == 0 {
+                eprintln!("Error: --to and --amount are required for send");
+                std::process::exit(1);
+            }
+            let (_, _, from_addr) = wallet::load_key(&key_file)?;
+            let (_, secret_b64, _) = wallet::load_key(&key_file)?;
+
+            // Query current nonce
+            let acct_url = format!("{rpc_url}/account/{from_addr}");
+            let body: serde_json::Value = reqwest::get(&acct_url)
+                .await
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
+            let nonce = body["nonce"].as_u64().unwrap_or(0) + 1;
+
+            let result =
+                wallet::send_transfer(&rpc_url, &from_addr, &secret_b64, &to_addr, amount, nonce)
+                    .await?;
+            println!("✓ Transfer submitted: {result}");
+        }
+        _ => eprintln!("Unknown wallet command: {cmd}"),
+    }
+    Ok(())
 }
