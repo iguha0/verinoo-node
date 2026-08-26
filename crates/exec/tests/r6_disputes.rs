@@ -39,7 +39,7 @@ impl Chain {
             keys.insert(name.to_string(), kp);
         }
         let mut h = BlockHeader {
-            hash: format!("genesis-0"),
+            hash: "genesis-0".to_string(),
             version: 1,
             index: 0,
             timestamp: 0,
@@ -146,28 +146,6 @@ impl Chain {
             }
         }
         void(lname);
-        Ok(block)
-    }
-    fn produce_by(&mut self, name: &str, txs: Vec<TxEnvelope>) -> Result<Block, String> {
-        let kp = self
-            .keys
-            .get(name)
-            .cloned()
-            .ok_or(format!("no key for {name}"))?;
-        let a = addr(&kp);
-        let producer = ProducerKey::from_parts(a, kp);
-        let block =
-            produce_block(&self.store, &txs, &producer, self.now_ms).map_err(|e| e.to_string())?;
-        let prev = current_head(&self.store).unwrap();
-        validate_block(
-            &block,
-            &prev.header,
-            &self.store.validator_addresses(),
-            self.now_ms,
-        )
-        .map_err(|e| e.to_string())?;
-        self.now_ms += 10_000;
-        set_head(&self.store, &block);
         Ok(block)
     }
 }

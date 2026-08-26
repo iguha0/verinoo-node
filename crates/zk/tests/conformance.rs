@@ -25,13 +25,13 @@ fn load_vectors() -> Vec<OpVector> {
 #[test]
 fn all_op_vectors_match_wasm_runtime() {
     let vectors = load_vectors();
-    assert!(vectors.len() >= 7, "expected at least 7 vectors");
+    assert!(vectors.len() >= 10, "expected at least 10 vectors");
 
     for v in &vectors {
         let got = match v.op.as_str() {
-            "relu" => relu(&v.input_fixed),
-            "softmax" => softmax(&v.input_fixed, v.input_fixed.len()),
-            "layernorm" => layernorm(&v.input_fixed, v.input_fixed.len()),
+            "relu8" | "relu64" => relu(&v.input_fixed),
+            "softmax8" | "softmax64" => softmax(&v.input_fixed, v.input_fixed.len()),
+            "layernorm8" | "layernorm64" => layernorm(&v.input_fixed, v.input_fixed.len()),
             "attention" | "matmul" => verinoo_zk::execute_layer(
                 "attention",
                 &v.weights_fixed,
