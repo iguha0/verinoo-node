@@ -710,11 +710,137 @@ pub fn execute_transaction(
         }
 
         verinoo_types::tx::TxKind::ProveStep => {
-            // Full WASM-recompute path arrives with the native op witnesses (R4).
-            // The SNARK fast path resolves here once ark-groth16 lands (R4).
-            // Until then proveStep resolves via the claimed-output equality rule
-            // that matches reference behavior when no snark is attached:
-            game_stub(store, data)?;
+            let game_id = data["gameId"]
+                .as_str()
+                .ok_or_else(|| EngineError::Reverted("missing gameId".into()))?;
+            let mut game = store
+                .get_game(game_id)
+                .ok_or_else(|| EngineError::Reverted("game not found".into()))?;
+            if game["status"].as_str() != Some("proving") {
+                return Err(EngineError::Reverted("not at proving stage".into()));
+            }
+            if tx.from != game["defender"].as_str().unwrap_or("") {
+                return Err(EngineError::Reverted("only defender can prove".into()));
+            }
+            let last_move = game["lastMoveAt"].as_u64().unwrap_or(0);
+            let timeout = game["moveTimeout"].as_u64().unwrap_or(5);
+            if ctx.height > last_move + timeout {
+                return Err(EngineError::Reverted("prove timeout".into()));
+            }
+
+            let disputed_layer = game["disputedLayer"].as_i64().unwrap_or(0) as usize;
+            let spec = &game["layerSpec"][disputed_layer];
+            let op_type = spec["opType"].as_str().unwrap_or("");
+            let input_shape = &spec["inputShape"];
+
+            let layer_weights = data["layerWeights"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_i64().map(|x| x as i32))
+                        .collect::<Vec<i32>>()
+                })
+                .unwrap_or_default();
+            let layer_input = data["layerInput"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_i64().map(|x| x as i32))
+                        .collect::<Vec<i32>>()
+                })
+                .unwrap_or_default();
+            let claimed_output = data["layerOutput"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_i64().map(|x| x as i32))
+                        .collect::<Vec<i32>>()
+                })
+                .unwrap_or_default();
+
+            // Deterministic recompute using native Q16.16 witnesses.
+            let honest_output =
+                verinoo_zk::execute_layer(op_type, &layer_weights, &layer_input, None);
+            let is_valid = claimed_output == honest_output;
+
+            let challenger_addr = game["challenger"].as_str().unwrap_or("").to_string();
+            let defender_addr = tx.from.clone();
+            let ch_bond = game["challengerBond"].as_u64().unwrap_or(0);
+            let df_bond = game["defenderBond"].as_u64().unwrap_or(0);
+
+            if is_valid {
+                // DEFENDER WINS: gets both bonds.
+                game["status"] = json!("resolved_valid");
+                game["winner"] = json!(defender_addr);
+                game["loser"] = json!(challenger_addr);
+
+                let mut df_acc = store.account_or_default(&defender_addr);
+                df_acc.balance += (ch_bond + df_bond) as i64;
+                df_acc.updated_at = ctx.height;
+                store.set_account(&df_acc);
+
+                let mut ch_acc = store.account_or_default(&challenger_addr);
+                ch_acc.balance -= ch_bond as i64;
+                ch_acc.updated_at = ctx.height;
+                store.set_account(&ch_acc);
+
+                if let Some(mut node) = store.get_node(&defender_addr) {
+                    node.reputation = (node.reputation + 15).min(100);
+                    store.set_node(&node);
+                }
+                eprintln!("[verif] DEFENDER WINS — challenger slashed {ch_bond}");
+            } else {
+                // CHALLENGER WINS: defender slashed.
+                game["status"] = json!("resolved_slash");
+                game["winner"] = json!(challenger_addr);
+                game["loser"] = json!(defender_addr);
+
+                let mut df_acc = store.account_or_default(&defender_addr);
+                df_acc.balance -= df_bond as i64;
+                df_acc.updated_at = ctx.height;
+                store.set_account(&df_acc);
+
+                let mut ch_acc = store.account_or_default(&challenger_addr);
+                ch_acc.balance += (df_bond + ch_bond) as i64;
+                ch_acc.updated_at = ctx.height;
+                store.set_account(&ch_acc);
+
+                if let Some(mut node) = store.get_node(&defender_addr) {
+                    node.reputation = (node.reputation - 30).max(0);
+                    node.total_slashed += df_bond;
+                    store.set_node(&node);
+                }
+                // If the defender is also a validator: remove from set + slash stake.
+                if let Some(mut val) = store.get_validator(&defender_addr) {
+                    let slash_amount = val.staked_amount / 2; // 50% slash
+                    val.staked_amount -= slash_amount;
+                    if val.staked_amount < 1000 {
+                        // Below minimum: remove entirely
+                        store.remove_validator(&defender_addr);
+                        tracing::info!(
+                            "validator {defender_addr} removed (insufficient post-slash stake)"
+                        );
+                    }
+                    store.set_validator(&val);
+                }
+                eprintln!("[verif] CHALLENGER WINS — defender slashed {df_bond}");
+            }
+
+            game["resolvedAt"] = json!(ctx.height);
+            game["lastMoveAt"] = json!(ctx.height);
+            store.set_game(game_id, &game);
+
+            // Update task status based on outcome.
+            if let Some(task_id) = game["taskId"].as_str() {
+                if let Some(mut task) = store.get_task(task_id) {
+                    task.status = if is_valid {
+                        "completed".into()
+                    } else {
+                        "failed".into()
+                    };
+                    store.set_task(&task);
+                }
+            }
         }
 
         verinoo_types::tx::TxKind::RegisterValidator => {
@@ -885,6 +1011,12 @@ pub fn apply_block(
     let mut executed: Vec<&TxEnvelope> = Vec::new();
     let mut gas_left = crate::gas::block_gas_limit();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    eprintln!(
+        "[apply_block] height={} txs={} validator={}",
+        height,
+        block.transactions.len(),
+        validator_address
+    );
 
     for tx in &block.transactions {
         let cost = crate::gas::gas_cost_for(&serde_json::to_value(&tx.data).unwrap());
@@ -981,6 +1113,7 @@ pub fn produce_block(
 
     let mut executed: Vec<TxEnvelope> = Vec::new();
     let mut gas_left = crate::gas::block_gas_limit();
+    eprintln!("[produce_block] height={} input_txs={}", height, txs.len());
     for tx in txs {
         let cost = crate::gas::gas_cost_for(&serde_json::to_value(&tx.data).unwrap());
         if cost > gas_left {
