@@ -417,11 +417,9 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     i += 1;
                 }
             }
-            "--node" => {
-                if i + 1 < args.len() {
-                    rpc_url = args[i + 1].clone();
-                    i += 1;
-                }
+            "--node" if i + 1 < args.len() => {
+                rpc_url = args[i + 1].clone();
+                i += 1;
             }
             _ => {}
         }
