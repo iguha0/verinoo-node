@@ -128,13 +128,10 @@ fn isqrt(a: i64) -> i64 {
         x = next;
     }
     // Floor correction: ensure x*x <= a
-    while x > 0 && x.checked_mul(x).map_or(true, |sq| sq > a as u64) {
+    while x > 0 && x.checked_mul(x).is_none_or(|sq| sq > a as u64) {
         x -= 1;
     }
-    while (x + 1)
-        .checked_mul(x + 1)
-        .map_or(false, |sq| sq <= a as u64)
-    {
+    while (x + 1).checked_mul(x + 1).is_some_and(|sq| sq <= a as u64) {
         x += 1;
     }
     x as i64

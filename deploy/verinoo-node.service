@@ -1,0 +1,23 @@
+[Unit]
+Description=Verinoo Rust testnet node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=verinoo
+Group=verinoo
+WorkingDirectory=/opt/verinoo
+EnvironmentFile=/etc/verinoo/node.env
+ExecStart=/usr/local/bin/verinoo-node
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/verinoo
+
+[Install]
+WantedBy=multi-user.target

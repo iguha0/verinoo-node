@@ -19,6 +19,8 @@ pub async fn serve(shared: Arc<Shared>, port: u16) -> Result<(), String> {
         .route("/mempool", get(mempool))
         .route("/account/:address", get(account))
         .route("/validators", get(validators))
+        .route("/faucet", post(faucet))
+        .route("/metrics", get(metrics))
         .route("/tx", post(submit_tx))
         .with_state(shared);
 
@@ -91,9 +93,74 @@ async fn validators(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value
         .collect::<Vec<_>>()))
 }
 
+/// Testnet faucet: drip tokens to any address. Rate-limited per address.
+async fn faucet(
+    State(shared): State<Arc<Shared>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    const DRIP_AMOUNT: i64 = 10_000;
+    const COOLDOWN_MS: u64 = 60_000;
+
+    let addr = body["address"].as_str().unwrap_or("").to_string();
+    if addr.is_empty() || !addr.starts_with("ai_") {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing or invalid address" })),
+        ));
+    }
+
+    // Rate limit: one drip per address per cooldown period.
+    {
+        let key = format!("faucet:{}", addr);
+        let now_ms = shared.now_ms();
+        if let Some(last) = shared.store.get_meta(&key) {
+            if let Some(ts) = last.as_u64() {
+                if now_ms.saturating_sub(ts) < COOLDOWN_MS {
+                    return Err((
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": "cooldown active",
+                            "retryAfterMs": COOLDOWN_MS - (now_ms - ts)
+                        })),
+                    ));
+                }
+            }
+        }
+        shared.store.set_meta(&key, &serde_json::json!(now_ms));
+    }
+
+    let mut acc = shared.store.account_or_default(&addr);
+    acc.balance += DRIP_AMOUNT;
+    acc.updated_at = shared.now_ms();
+    shared.store.set_account(&acc);
+
+    Ok(Json(serde_json::json!({
+        "dripped": DRIP_AMOUNT,
+        "address": addr,
+        "balance": acc.balance
+    })))
+}
+
 async fn mempool(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
     let mp = shared.mempool.lock().await;
     Json(serde_json::json!({ "count": mp.len() }))
+}
+
+async fn metrics(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
+    let head = shared.head();
+    let (height, latest_hash, ts) = match &head {
+        Some(b) => (b.header.index, b.header.hash.clone(), b.header.timestamp),
+        None => (0, String::new(), 0),
+    };
+    Json(serde_json::json!({
+        "height": height,
+        "latestHash": latest_hash,
+        "headAgeMs": shared.now_ms().saturating_sub(ts),
+        "mempoolSize": shared.mempool.lock().await.len(),
+        "validatorCount": shared.store.validator_addresses().len(),
+        "chainId": shared.params.chain_id,
+        "blockTimeMs": shared.params.block_time_ms,
+    }))
 }
 
 async fn submit_tx(
