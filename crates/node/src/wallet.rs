@@ -8,7 +8,7 @@
 //! Key file format (JSON): { publicKey, privateKey(base64), address }
 
 use base64::Engine as _;
-use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
+use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::json;
 use sha2::Digest as _;
 use verinoo_types::canonical::canonical_json;
