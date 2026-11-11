@@ -8,7 +8,7 @@ license.workspace = true
 verinoo-types = { path = "../types" }
 verinoo-state = { path = "../state" }
 verinoo-exec = { path = "../exec" }
-libp2p = { version = "0.53", features = ["gossipsub", "identify", "tokio", "macros", "tcp", "yamux", "noise", "dns", "mdns"] }
+libp2p = { version = "0.53", features = ["gossipsub", "identify", "ping", "tokio", "macros", "tcp", "yamux", "noise", "dns", "mdns"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { workspace = true }

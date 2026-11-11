@@ -1,0 +1,80 @@
+{"text":"I want a refund for my last order","label":"refund"}
+{"text":"please refund the charge from yesterday","label":"refund"}
+{"text":"how do I get my money back","label":"refund"}
+{"text":"the item arrived broken, I need a refund","label":"refund"}
+{"text":"refund my payment, the product never arrived","label":"refund"}
+{"text":"I was charged twice, please return the extra money","label":"refund"}
+{"text":"can I get a refund if I return it","label":"refund"}
+{"text":"I would like my money back for the damaged item","label":"refund"}
+{"text":"the order was cancelled but I was still charged, refund it","label":"refund"}
+{"text":"return and refund please, wrong size","label":"refund"}
+{"text":"I need a refund asap","label":"refund"}
+{"text":"give me my money back for this broken laptop","label":"refund"}
+{"text":"refund request for order 4411","label":"refund"}
+{"text":"I want to return this and get refunded","label":"refund"}
+{"text":"the subscription charged me after I cancelled, refund","label":"refund"}
+{"text":"money back guarantee, please refund","label":"refund"}
+{"text":"I received the wrong item, want a refund","label":"refund"}
+{"text":"please issue a refund to my card","label":"refund"}
+{"text":"can you refund the shipping fee","label":"refund"}
+{"text":"the product is defective, refund my purchase","label":"refund"}
+{"text":"where is my package","label":"shipping"}
+{"text":"when will my order arrive","label":"shipping"}
+{"text":"tracking number is not working","label":"shipping"}
+{"text":"my delivery is late","label":"shipping"}
+{"text":"has my parcel shipped yet","label":"shipping"}
+{"text":"the courier says delivered but nothing arrived","label":"shipping"}
+{"text":"can I change the delivery address","label":"shipping"}
+{"text":"how long does shipping take to Berlin","label":"shipping"}
+{"text":"my package is stuck in transit","label":"shipping"}
+{"text":"ship it faster please, expedited delivery","label":"shipping"}
+{"text":"the box arrived crushed","label":"shipping"}
+{"text":"delivery scheduled for tomorrow","label":"shipping"}
+{"text":"I need to update my shipping address","label":"shipping"}
+{"text":"why is my order still in transit","label":"shipping"}
+{"text":"estimated delivery date for order 8890","label":"shipping"}
+{"text":"the courier left it at the wrong house","label":"shipping"}
+{"text":"package never delivered, tracking shows nothing","label":"shipping"}
+{"text":"do you ship internationally","label":"shipping"}
+{"text":"my parcel is delayed again","label":"shipping"}
+{"text":"where do I find the tracking link","label":"shipping"}
+{"text":"why was I charged this amount","label":"billing"}
+{"text":"I see an unknown charge on my card","label":"billing"}
+{"text":"update my credit card on file","label":"billing"}
+{"text":"send me an invoice for last month","label":"billing"}
+{"text":"my payment failed, what now","label":"billing"}
+{"text":"why did the price increase","label":"billing"}
+{"text":"I need a receipt for accounting","label":"billing"}
+{"text":"the billing address is wrong","label":"billing"}
+{"text":"cancel my subscription and stop billing","label":"billing"}
+{"text":"I was billed for a plan I downgraded from","label":"billing"}
+{"text":"how do I change my payment method","label":"billing"}
+{"text":"explain the line items on my invoice","label":"billing"}
+{"text":"annual billing instead of monthly","label":"billing"}
+{"text":"there is a double charge on my statement","label":"billing"}
+{"text":"VAT number missing on my invoice","label":"billing"}
+{"text":"why is my card declined","label":"billing"}
+{"text":"I want to pay by bank transfer","label":"billing"}
+{"text":"when does my card get charged next","label":"billing"}
+{"text":"my invoice shows the wrong company name","label":"billing"}
+{"text":"the amount on my statement does not match the invoice","label":"billing"}
+{"text":"cancel my order please","label":"cancel"}
+{"text":"I want to cancel the subscription","label":"cancel"}
+{"text":"how do I cancel before it ships","label":"cancel"}
+{"text":"please cancel order 5512","label":"cancel"}
+{"text":"stop my subscription immediately","label":"cancel"}
+{"text":"I changed my mind, cancel the purchase","label":"cancel"}
+{"text":"cancel the plan at the end of the month","label":"cancel"}
+{"text":"remove my account and cancel everything","label":"cancel"}
+{"text":"cancel my appointment","label":"cancel"}
+{"text":"I need to cancel the renewal","label":"cancel"}
+{"text":"cancel order, I ordered by mistake","label":"cancel"}
+{"text":"end my membership","label":"cancel"}
+{"text":"can I cancel after shipping","label":"cancel"}
+{"text":"cancel the duplicate order","label":"cancel"}
+{"text":"terminate my subscription today","label":"cancel"}
+{"text":"do not renew my plan, cancel it","label":"cancel"}
+{"text":"cancel my booking for next week","label":"cancel"}
+{"text":"I want out of the contract","label":"cancel"}
+{"text":"cancel everything associated with my account","label":"cancel"}
+{"text":"stop the recurring payment","label":"cancel"}
