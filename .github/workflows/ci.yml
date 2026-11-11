@@ -7,13 +7,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: System deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y cmake g++ libclang-dev clang llvm-dev
       - name: Build
-        run: cargo build --workspace 2>&1 || true
+        run: cargo build --workspace --locked
       - name: Test
-        run: cargo test --workspace -- --nocapture 2>&1 || true
-      - name: Results
-        run: echo "CI complete — check output above"
+        run: cargo test --workspace --locked
