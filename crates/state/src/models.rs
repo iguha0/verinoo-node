@@ -46,6 +46,10 @@ pub struct InferenceTask {
     pub target_model: String,
     #[serde(rename = "inputCommitment", default)]
     pub input_commitment: String,
+    /// Clear-text input. Committed by hash in `input_commitment`; carried so
+    /// every node can re-execute the task deterministically at block apply.
+    #[serde(default)]
+    pub input: String,
     #[serde(rename = "maxFee")]
     pub max_fee: u64,
     pub deadline: u64,
@@ -66,6 +70,9 @@ pub struct InferenceTask {
     pub challenge_window_end: Option<u64>,
     #[serde(rename = "gameId", default)]
     pub game_id: Option<String>,
+    /// Block height at which a node produced the result.
+    #[serde(rename = "executedAt", default)]
+    pub executed_at: u64,
 }
 
 fn default_verification_type() -> String {

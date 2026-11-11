@@ -493,6 +493,7 @@ pub fn execute_transaction(
                 requester: data["requester"].as_str().unwrap_or(&tx.from).into(),
                 target_model: data["targetModel"].as_str().unwrap_or("").into(),
                 input_commitment: data["inputCommitment"].as_str().unwrap_or("").into(),
+                input: data["input"].as_str().unwrap_or("").into(),
                 max_fee: data["maxFee"].as_u64().unwrap_or(0),
                 deadline: data["deadline"].as_u64().unwrap_or(0),
                 verification_type: data["verificationType"]
@@ -507,6 +508,7 @@ pub fn execute_transaction(
                 proof_data: None,
                 challenge_window_end: None,
                 game_id: None,
+                executed_at: 0,
             });
         }
 
@@ -938,6 +940,16 @@ pub fn compute_state_root(store: &StateStore) -> String {
         .map(|t| t.task_id)
         .collect();
     pending.sort();
+    // Committed outputs are part of the root: a node that derives a different
+    // result than the producer produces a different root, so peers reject the
+    // block instead of silently diverging.
+    let mut results: Vec<String> = store
+        .iter_prefix::<InferenceTask>("task:")
+        .into_iter()
+        .filter(|t| t.status == "completed")
+        .map(|t| format!("{}:{}", t.task_id, t.result_hash.unwrap_or_default()))
+        .collect();
+    results.sort();
     let nodes: Vec<String> = store
         .iter_nodes_by_reputation()
         .into_iter()
@@ -949,6 +961,7 @@ pub fn compute_state_root(store: &StateStore) -> String {
         "accounts": accounts,
         "models": models,
         "pending": pending,
+        "results": results,
         "nodes": {
             "list": { "nodes": nodes },
         },
@@ -990,6 +1003,153 @@ fn match_pending_tasks(store: &StateStore, height: u64) {
     }
 }
 
+/// A model this chain can execute deterministically.
+///
+/// The reference classifier is compiled in; any other model comes from the
+/// node's model set (`verinoo_runtime::global()`), loaded from
+/// `VNN_MODEL_DIR` at startup. Both paths are integer-only, so every node
+/// applying a block derives the same bytes.
+pub enum ExecModel {
+    Builtin,
+    Runtime(std::sync::Arc<verinoo_runtime::Model>),
+}
+
+impl ExecModel {
+    /// `None` means this node cannot execute the model, so the task keeps the
+    /// manual claim/submit lifecycle instead of being executed here.
+    pub fn resolve(model_id: &str) -> Option<Self> {
+        if model_id == verinoo_model::MODEL_ID {
+            return Some(ExecModel::Builtin);
+        }
+        verinoo_runtime::global()
+            .get(model_id)
+            .cloned()
+            .map(ExecModel::Runtime)
+    }
+
+    pub fn model_id(&self) -> &str {
+        match self {
+            ExecModel::Builtin => verinoo_model::MODEL_ID,
+            ExecModel::Runtime(m) => m.model_id(),
+        }
+    }
+
+    /// Identity of the exact parameters, committed in the receipt.
+    pub fn weights_hash(&self) -> String {
+        match self {
+            ExecModel::Builtin => verinoo_model::weights_hash(),
+            ExecModel::Runtime(m) => m.weights_hash().to_string(),
+        }
+    }
+
+    /// Canonical result bytes for an input.
+    pub fn result_json(&self, input: &str) -> String {
+        match self {
+            ExecModel::Builtin => verinoo_model::result_json(input),
+            ExecModel::Runtime(m) => m.result_json(input),
+        }
+    }
+}
+
+/// Every model this node can execute, for `/v1/models`.
+pub fn execute_models() -> Vec<serde_json::Value> {
+    let mut out = vec![verinoo_model::descriptor()];
+    out.extend(verinoo_runtime::global().descriptors());
+    out
+}
+
+/// Run every pending task whose model this node can execute deterministically.
+///
+/// Every node executes the same integer-only forward pass while applying the
+/// block, so the output is consensus state rather than the producer's claim.
+/// Tasks for models this node cannot execute keep the manual lifecycle.
+fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) {
+    let mut tasks: Vec<InferenceTask> = store.iter_prefix("task:");
+    tasks.retain(|t| t.status == "pending" || t.status == "assigned");
+    tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    for mut task in tasks {
+        let Some(model) = ExecModel::resolve(&task.target_model) else {
+            continue;
+        };
+        // A matched task has already paid the requester at assignment time;
+        // an unmatched one is settled here so the executor still gets its fee.
+        let payee = match task.assigned_to.clone() {
+            Some(node_id) => node_id,
+            None => {
+                let mut req = store.account_or_default(&task.requester);
+                if req.balance < task.max_fee as i64 {
+                    continue; // unfunded: leave pending for a later block
+                }
+                req.balance -= task.max_fee as i64;
+                req.updated_at = height;
+                store.set_account(&req);
+                executor.to_string()
+            }
+        };
+        let output = model.result_json(&task.input);
+        let result_hash = sha256_hex(&output);
+        task.status = "completed".into();
+        task.result_output = Some(output);
+        task.result_hash = Some(result_hash);
+        task.proof_data = Some(format!("deterministic-replay:{}", model.model_id()));
+        task.challenge_window_end = Some(height + 100);
+        task.executed_at = height;
+        store.set_task(&task);
+
+        if let Some(mut node) = store.get_node(&payee) {
+            node.available_capacity += 1;
+            node.active_tasks = node.active_tasks.saturating_sub(1);
+            node.successful_inferences += 1;
+            node.reputation = (node.reputation + 1).min(100);
+            store.set_node(&node);
+        }
+        let mut acc = store.account_or_default(&payee);
+        acc.balance += (task.max_fee * 4 / 5) as i64;
+        acc.updated_at = height;
+        store.set_account(&acc);
+    }
+}
+
+/// Anchor every task executed in this block to the block that carries it.
+/// The receipt is the block signature plus the recomputable output hash, so a
+/// third party can verify without trusting the operator's API.
+pub fn stamp_receipts(store: &StateStore, block: &Block) {
+    let height = block.header.index;
+    let mut done: Vec<InferenceTask> = store.iter_prefix("task:");
+    done.retain(|t| t.status == "completed" && t.executed_at == height);
+    done.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+    for task in done {
+        let weights_hash = ExecModel::resolve(&task.target_model)
+            .map(|m| m.weights_hash())
+            .unwrap_or_default();
+        let receipt = json!({
+            "taskId": task.task_id,
+            "modelId": task.target_model,
+            "weightsHash": weights_hash,
+            "inputHash": verinoo_model::sha256_hex(&task.input),
+            "outputHash": task.result_hash,
+            "height": height,
+            "blockHash": block.header.hash,
+            "validator": block.header.validator,
+            "validatorSignature": block.header.validator_signature,
+        });
+        store.set_meta(&format!("receipt:{}", task.task_id), &receipt);
+    }
+}
+
+pub fn receipt_for(store: &StateStore, task_id: &str) -> Option<serde_json::Value> {
+    store.get_meta(&format!("receipt:{task_id}"))
+}
+
+/// Derive the task id a `submitInference` transaction will create.
+pub fn task_id_for(tx: &TxEnvelope) -> Option<String> {
+    if tx.data.r#type != verinoo_types::tx::TxKind::SubmitInference {
+        return None;
+    }
+    let canon = verinoo_types::canonical::canonical_json(&tx.data.data).ok()?;
+    Some(sha256_hex(&format!("{canon}{}", tx.tx_id))[..32].to_string())
+}
+
 /// Execute a validated block body. Caller MUST have run validate_block.
 pub fn apply_block(
     store: &StateStore,
@@ -1007,11 +1167,11 @@ pub fn apply_block(
     let mut executed: Vec<&TxEnvelope> = Vec::new();
     let mut gas_left = crate::gas::block_gas_limit();
     let mut skipped: Vec<(String, String)> = Vec::new();
-    eprintln!(
-        "[apply_block] height={} txs={} validator={}",
+    tracing::debug!(
         height,
-        block.transactions.len(),
-        validator_address
+        txs = block.transactions.len(),
+        validator = validator_address,
+        "applying block"
     );
 
     for tx in &block.transactions {
@@ -1036,6 +1196,8 @@ pub fn apply_block(
     }
 
     match_pending_tasks(store, height);
+    execute_deterministic_tasks(store, height, validator_address);
+    stamp_receipts(store, block);
 
     let gas_used: u64 = executed
         .iter()
@@ -1109,7 +1271,7 @@ pub fn produce_block(
 
     let mut executed: Vec<TxEnvelope> = Vec::new();
     let mut gas_left = crate::gas::block_gas_limit();
-    eprintln!("[produce_block] height={} input_txs={}", height, txs.len());
+    tracing::debug!(height, txs = txs.len(), "producing block");
     for tx in txs {
         let cost = crate::gas::gas_cost_for(&serde_json::to_value(&tx.data).unwrap());
         if cost > gas_left {
@@ -1117,18 +1279,23 @@ pub fn produce_block(
         }
         let v = Validator { store, base_fee };
         match v.validate_transaction(tx) {
-            Err(e) => eprintln!("[produce] VALIDATE FAIL tx={} err={e}", tx.tx_id),
+            Err(e) => {
+                tracing::warn!(tx = %tx.tx_id, error = %e, "skipping invalid tx")
+            }
             Ok(()) => match execute_transaction(store, tx, &ctx) {
                 Ok(()) => {
                     executed.push(tx.clone());
                     gas_left -= cost;
                 }
-                Err(e) => eprintln!("[produce] EXEC REVERT tx={} err={e}", tx.tx_id),
+                Err(e) => {
+                    tracing::warn!(tx = %tx.tx_id, error = %e, "tx reverted during production")
+                }
             },
         }
     }
 
     match_pending_tasks(store, height);
+    execute_deterministic_tasks(store, height, &producer.address);
 
     // Roots over observable state (Rust-defined; see compute_state_root note).
     let state_root = compute_state_root(store);
@@ -1166,14 +1333,15 @@ pub fn produce_block(
     let sig = producer.signing.sign(header.hash.as_bytes());
     header.validator_signature = hex::encode(sig.to_bytes());
 
+    let block = Block {
+        header: header.clone(),
+        transactions: executed.clone(),
+    };
     store.put_block_by_hash(
         &header.hash,
-        &serde_json::to_value(&Block {
-            header: header.clone(),
-            transactions: executed.clone(),
-        })
-        .expect("block serialize"),
+        &serde_json::to_value(&block).expect("block serialize"),
     );
+    stamp_receipts(store, &block);
 
     let next_base_fee = crate::gas::compute_base_fee(
         base_fee,
@@ -1184,10 +1352,7 @@ pub fn produce_block(
     );
     store.set_meta_u64("baseFee", next_base_fee);
 
-    Ok(Block {
-        header,
-        transactions: executed,
-    })
+    Ok(block)
 }
 
 /// Current head pointer stored in meta.

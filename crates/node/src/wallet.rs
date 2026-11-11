@@ -77,23 +77,15 @@ pub async fn query_balance(rpc_url: &str, address: &str) -> Result<u64, String> 
     Ok(body["balance"].as_u64().unwrap_or(0))
 }
 
-/// Build + submit a signed transfer transaction.
-pub async fn send_transfer(
-    rpc_url: &str,
+/// Build a signed transfer envelope. Used by the CLI wallet and by the
+/// faucet, so both produce byte-identical transactions.
+pub fn build_signed_transfer(
+    signing: &SigningKey,
     from_addr: &str,
-    secret_b64: &str,
     to: &str,
     amount: u64,
     nonce: u64,
-) -> Result<String, String> {
-    let sk_bytes = base64::engine::general_purpose::STANDARD
-        .decode(secret_b64)
-        .map_err(|e| e.to_string())?;
-    let sk_arr: [u8; 32] = sk_bytes[..32]
-        .try_into()
-        .map_err(|_| "bad key length".to_string())?;
-    let signing = SigningKey::from_bytes(&sk_arr);
-
+) -> Result<serde_json::Value, String> {
     let data = json!({ "type": "transfer", "data": {} });
     let payload = json!({
         "data": data,
@@ -114,7 +106,7 @@ pub async fn send_transfer(
     let sig_hex = hex::encode(sig.to_bytes());
     let pk_hex = hex::encode(signing.verifying_key().to_bytes());
 
-    let body = json!({
+    Ok(json!({
         "txId": tx_id,
         "from": from_addr,
         "to": to,
@@ -123,7 +115,79 @@ pub async fn send_transfer(
         "data": data,
         "publicKey": pk_hex,
         "signature": sig_hex,
+    }))
+}
+
+/// Build a signed `submitInference` envelope for the built-in model.
+pub fn build_signed_inference(
+    signing: &SigningKey,
+    from_addr: &str,
+    model: &str,
+    input: &str,
+    max_fee: u64,
+    deadline: u64,
+    nonce: u64,
+) -> Result<serde_json::Value, String> {
+    let mut h = sha2::Sha256::new();
+    h.update(input.as_bytes());
+    let input_commitment = hex::encode(h.finalize());
+
+    let data = json!({
+        "type": "submitInference",
+        "data": {
+            "requester": from_addr,
+            "targetModel": model,
+            "input": input,
+            "inputCommitment": input_commitment,
+            "maxFee": max_fee,
+            "deadline": deadline,
+            "verificationType": "optimistic",
+        }
     });
+    let payload = json!({
+        "data": data,
+        "from": from_addr,
+        "nonce": nonce,
+        "to": "",
+        "value": 0,
+    });
+
+    let payload_str = canonical_json(&payload).map_err(|e| e.to_string())?;
+    let mut h = sha2::Sha256::new();
+    h.update(payload_str.as_bytes());
+    let tx_id = hex::encode(h.finalize());
+
+    let sig = signing.sign(tx_id.as_bytes());
+    Ok(json!({
+        "txId": tx_id,
+        "from": from_addr,
+        "to": "",
+        "value": 0,
+        "nonce": nonce,
+        "data": data,
+        "publicKey": hex::encode(signing.verifying_key().to_bytes()),
+        "signature": hex::encode(sig.to_bytes()),
+    }))
+}
+
+/// Build + submit a signed transfer transaction.
+pub async fn send_transfer(
+    rpc_url: &str,
+    from_addr: &str,
+    secret_b64: &str,
+    to: &str,
+    amount: u64,
+    nonce: u64,
+) -> Result<String, String> {
+    let sk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(secret_b64)
+        .map_err(|e| e.to_string())?;
+    let sk_arr: [u8; 32] = sk_bytes[..32]
+        .try_into()
+        .map_err(|_| "bad key length".to_string())?;
+    let signing = SigningKey::from_bytes(&sk_arr);
+
+    let body = build_signed_transfer(&signing, from_addr, to, amount, nonce)?;
 
     let client = reqwest::Client::new();
     let resp = client

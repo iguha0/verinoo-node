@@ -4,6 +4,7 @@
 use verinoo_zk::{argmax, f2i, i2f, layernorm, relu, softmax};
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct OpVector {
     op: String,
     #[serde(rename = "inputFixed")]
@@ -74,7 +75,6 @@ fn q16_16_matmul_column_major_exact() {
     let bias: Vec<i32> = vec![655, -1311, 1966, -2621]; // [0.01, -0.02, 0.03, -0.04]
 
     // Column-major: weights[k * n_out + i] connects input k to output i.
-    let n_in = input.len();
     let n_out = 4;
 
     // Manual step-by-step for out[0]:
@@ -89,27 +89,19 @@ fn q16_16_matmul_column_major_exact() {
 
     use verinoo_zk::fmul;
     let mut results = Vec::new();
-    for i in 0..n_out {
-        let mut acc = bias[i];
-        for k in 0..n_in {
+    for (i, &b) in bias.iter().enumerate().take(n_out) {
+        let mut acc = b;
+        for (k, &inp) in input.iter().enumerate() {
             let wi = k * n_out + i;
-            let product = fmul(input[k], weights[wi]);
-            eprintln!(
-                "out[{i}] k={k} w_idx={wi} w_val={} inp={} product={}",
-                weights[wi], input[k], product
-            );
-            acc = acc.wrapping_add(product);
+            acc = acc.wrapping_add(fmul(inp, weights[wi]));
         }
         results.push(acc);
     }
-    eprintln!("before relu: {:?}", results);
 
     let after_relu: Vec<i32> = results.iter().map(|&v| if v > 0 { v } else { 0 }).collect();
-    eprintln!("after relu: {:?}", after_relu);
 
     // Compare with verinoo-zk execute_layer
     let via_dispatch = verinoo_zk::execute_layer("attention", &weights, &input, Some(&bias));
-    eprintln!("via dispatch: {:?}", via_dispatch);
 
     assert_eq!(
         via_dispatch, after_relu,
