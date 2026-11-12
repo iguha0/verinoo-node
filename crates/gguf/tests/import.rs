@@ -112,14 +112,19 @@ fn missing_bias_tensors_become_zeros_and_are_reported() {
 }
 
 #[test]
-fn k_quants_are_refused_by_name() {
+fn k_quants_are_imported_and_named() {
     let path = write_tmp("k-quant.gguf", &k_quant());
     let mut file = Gguf::open(&path).unwrap();
     let mut options = opts();
     options.layers = Some(vec!["quant".into()]);
-    let err = convert(&mut file, &options).expect_err("Q4_K must be refused");
-    assert!(err.contains("Q4_K"), "{err}");
-    assert!(err.contains("quant.weight"), "{err}");
+    let imported = convert(&mut file, &options).expect("Q4_K is supported");
+    assert!(
+        imported.notes.iter().any(|n| n.contains("Q4_K")),
+        "{:?}",
+        imported.notes
+    );
+    assert_eq!(imported.spec.layers[0].input, 256);
+    assert_eq!(imported.spec.layers[0].output, 2);
 }
 
 #[test]

@@ -185,7 +185,8 @@ become zeros and are reported as notes.
 |---|---|
 | `F32`, `F16`, `BF16` | read directly, then quantised to Q16.16 |
 | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0` | dequantised with the llama.cpp block layouts |
-| `Q2_K` … `Q8_K` (K-quants) | refused by name — a wrong dequantisation would silently change every answer |
+| `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` | dequantised with the llama.cpp super-block layouts; checked against reference vectors from the official `gguf` Python package |
+| `Q8_1`, IQ-quants | refused by name — no reference layout in this importer |
 
 `--activation relu` (default) inserts a `relu` between dense layers; `none`
 leaves the chain linear. `--labels` is required because GGUF stores no class

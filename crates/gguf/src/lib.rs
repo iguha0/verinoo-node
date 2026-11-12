@@ -15,10 +15,12 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Quantised weights (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0) are dequantised with the
-//! llama.cpp block layouts and then requantised to Q16.16; F32, F16 and BF16
-//! convert directly. K-quants are refused by name — a wrong dequantisation
-//! would silently change every answer the chain records.
+//! Quantised weights (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants Q2_K …
+//! Q8_K) are dequantised with the llama.cpp block layouts and then requantised
+//! to Q16.16; F32, F16 and BF16 convert directly. The K-quant layouts are
+//! checked byte-for-byte against reference vectors from the official `gguf`
+//! Python package, because a wrong dequantisation would silently change every
+//! answer the chain records.
 
 pub mod convert;
 pub mod gguf;

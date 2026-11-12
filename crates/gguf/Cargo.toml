@@ -12,3 +12,7 @@ path = "src/bin/gguf-import.rs"
 serde_json = { workspace = true }
 verinoo-runtime = { path = "../runtime" }
 verinoo-onnx = { path = "../onnx" }
+
+[dev-dependencies]
+serde = { workspace = true }
+hex = { workspace = true }

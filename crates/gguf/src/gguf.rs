@@ -43,14 +43,20 @@ pub fn type_name(kind: u32) -> &'static str {
 /// Bytes per block (or per element for unquantised types).
 pub fn type_size(kind: u32) -> Option<usize> {
     match kind {
-        0 => Some(4),  // F32
-        1 => Some(2),  // F16
-        2 => Some(18), // Q4_0
-        3 => Some(20), // Q4_1
-        6 => Some(22), // Q5_0
-        7 => Some(24), // Q5_1
-        8 => Some(34), // Q8_0
-        30 => Some(2), // BF16
+        0 => Some(4),    // F32
+        1 => Some(2),    // F16
+        2 => Some(18),   // Q4_0
+        3 => Some(20),   // Q4_1
+        6 => Some(22),   // Q5_0
+        7 => Some(24),   // Q5_1
+        8 => Some(34),   // Q8_0
+        10 => Some(84),  // Q2_K
+        11 => Some(110), // Q3_K
+        12 => Some(144), // Q4_K
+        13 => Some(176), // Q5_K
+        14 => Some(210), // Q6_K
+        15 => Some(292), // Q8_K
+        30 => Some(2),   // BF16
         _ => None,
     }
 }
@@ -59,7 +65,31 @@ pub fn type_size(kind: u32) -> Option<usize> {
 pub fn block_elements(kind: u32) -> usize {
     match kind {
         2 | 3 | 6 | 7 | 8 => 32,
+        10..=15 => 256,
         _ => 1,
+    }
+}
+
+/// QK_K: the super-block width used by the K-quants.
+const QK_K: usize = 256;
+
+fn read_f16(bytes: &[u8], off: usize) -> f32 {
+    f16_to_f32(u16::from_le_bytes([bytes[off], bytes[off + 1]]))
+}
+
+fn read_i8(bytes: &[u8], off: usize) -> i8 {
+    bytes[off] as i8
+}
+
+/// Reference layout for the 6-bit scale/min pairs in Q4_K and Q5_K.
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
     }
 }
 
@@ -439,6 +469,182 @@ pub fn dequantize(kind: u32, bytes: &[u8], elements: usize) -> Result<Vec<f32>, 
                 }
             }
         }
+        10 => {
+            // Q2_K: scales[16] | qs[64] | d(f16) | dmin(f16)
+            for block in bytes.chunks_exact(size) {
+                let d = read_f16(block, 80);
+                let min = read_f16(block, 82);
+                let scales = &block[0..16];
+                let qs = &block[16..80];
+                let mut is = 0usize;
+                for n in 0..2 {
+                    let mut shift = 0u32;
+                    for _ in 0..4 {
+                        let sc = scales[is];
+                        is += 1;
+                        let dl = d * (sc & 0x0f) as f32;
+                        let ml = min * (sc >> 4) as f32;
+                        for l in 0..16 {
+                            out.push(dl * ((qs[n * 32 + l] >> shift) & 3) as f32 - ml);
+                        }
+                        let sc = scales[is];
+                        is += 1;
+                        let dl = d * (sc & 0x0f) as f32;
+                        let ml = min * (sc >> 4) as f32;
+                        for l in 0..16 {
+                            out.push(dl * ((qs[n * 32 + l + 16] >> shift) & 3) as f32 - ml);
+                        }
+                        shift += 2;
+                    }
+                }
+            }
+        }
+        11 => {
+            // Q3_K: hmask[32] | qs[64] | scales[12] | d(f16)
+            for block in bytes.chunks_exact(size) {
+                let d_all = read_f16(block, 108);
+                let hm = &block[0..32];
+                let qs = &block[32..96];
+                let raw = &block[96..108];
+                let mut aux = [0u32; 4];
+                for (i, slot) in aux.iter_mut().take(3).enumerate() {
+                    *slot = u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+                }
+                let tmp = aux[2];
+                aux[2] = ((aux[0] >> 4) & 0x0f0f_0f0f) | (((tmp >> 4) & 0x0303_0303) << 4);
+                aux[3] = ((aux[1] >> 4) & 0x0f0f_0f0f) | (((tmp >> 6) & 0x0303_0303) << 4);
+                aux[0] = (aux[0] & 0x0f0f_0f0f) | ((tmp & 0x0303_0303) << 4);
+                aux[1] = (aux[1] & 0x0f0f_0f0f) | (((tmp >> 2) & 0x0303_0303) << 4);
+                let mut scales = [0i8; 16];
+                for (i, word) in aux.iter().enumerate() {
+                    for (b, byte) in word.to_le_bytes().iter().enumerate() {
+                        scales[i * 4 + b] = *byte as i8;
+                    }
+                }
+                let mut is = 0usize;
+                let mut m: u8 = 1;
+                for n in 0..2 {
+                    let mut shift = 0u32;
+                    for _ in 0..4 {
+                        let dl = d_all * (scales[is] as f32 - 32.0);
+                        is += 1;
+                        for l in 0..16 {
+                            let q = ((qs[n * 32 + l] >> shift) & 3) as i8;
+                            let h = if hm[l] & m != 0 { 0 } else { 4 };
+                            out.push(dl * (q - h) as f32);
+                        }
+                        let dl = d_all * (scales[is] as f32 - 32.0);
+                        is += 1;
+                        for l in 0..16 {
+                            let q = ((qs[n * 32 + l + 16] >> shift) & 3) as i8;
+                            let h = if hm[l + 16] & m != 0 { 0 } else { 4 };
+                            out.push(dl * (q - h) as f32);
+                        }
+                        shift += 2;
+                        m <<= 1;
+                    }
+                }
+            }
+        }
+        12 => {
+            // Q4_K: d(f16) | dmin(f16) | scales[12] | qs[128]
+            for block in bytes.chunks_exact(size) {
+                let d = read_f16(block, 0);
+                let min = read_f16(block, 2);
+                let scales = &block[4..16];
+                let qs = &block[16..144];
+                let mut is = 0usize;
+                for j in 0..4 {
+                    let (sc, m) = get_scale_min_k4(is, scales);
+                    let d1 = d * sc as f32;
+                    let m1 = min * m as f32;
+                    let (sc, m) = get_scale_min_k4(is + 1, scales);
+                    let d2 = d * sc as f32;
+                    let m2 = min * m as f32;
+                    let q = &qs[j * 32..(j + 1) * 32];
+                    for &byte in q {
+                        out.push(d1 * (byte & 0x0f) as f32 - m1);
+                    }
+                    for &byte in q {
+                        out.push(d2 * (byte >> 4) as f32 - m2);
+                    }
+                    is += 2;
+                }
+            }
+        }
+        13 => {
+            // Q5_K: d(f16) | dmin(f16) | scales[12] | qh[32] | qs[128]
+            for block in bytes.chunks_exact(size) {
+                let d = read_f16(block, 0);
+                let min = read_f16(block, 2);
+                let scales = &block[4..16];
+                let qh = &block[16..48];
+                let ql = &block[48..176];
+                let mut is = 0usize;
+                let mut u1: u8 = 1;
+                let mut u2: u8 = 2;
+                for j in 0..4 {
+                    let (sc, m) = get_scale_min_k4(is, scales);
+                    let d1 = d * sc as f32;
+                    let m1 = min * m as f32;
+                    let (sc, m) = get_scale_min_k4(is + 1, scales);
+                    let d2 = d * sc as f32;
+                    let m2 = min * m as f32;
+                    for l in 0..32 {
+                        let v = (ql[j * 32 + l] & 0x0f) + if qh[l] & u1 != 0 { 16 } else { 0 };
+                        out.push(d1 * v as f32 - m1);
+                    }
+                    for l in 0..32 {
+                        let v = (ql[j * 32 + l] >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 };
+                        out.push(d2 * v as f32 - m2);
+                    }
+                    is += 2;
+                    u1 <<= 2;
+                    u2 <<= 2;
+                }
+            }
+        }
+        14 => {
+            // Q6_K: ql[128] | qh[64] | scales[16] | d(f16)
+            for block in bytes.chunks_exact(size) {
+                let ql = &block[0..128];
+                let qh = &block[128..192];
+                let sc = &block[192..208];
+                let d = read_f16(block, 208);
+                let mut chunk = [0f32; QK_K];
+                for n in 0..2 {
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q1 = ((ql[n * 64 + l] & 0x0f) | ((qh[n * 32 + l] & 3) << 4)) as i8 - 32;
+                        let q2 = ((ql[n * 64 + l + 32] & 0x0f) | (((qh[n * 32 + l] >> 2) & 3) << 4))
+                            as i8
+                            - 32;
+                        let q3 =
+                            ((ql[n * 64 + l] >> 4) | (((qh[n * 32 + l] >> 4) & 3) << 4)) as i8 - 32;
+                        let q4 = ((ql[n * 64 + l + 32] >> 4) | (((qh[n * 32 + l] >> 6) & 3) << 4))
+                            as i8
+                            - 32;
+                        chunk[n * 128 + l] = d * read_i8(sc, n * 8 + is) as f32 * q1 as f32;
+                        chunk[n * 128 + l + 32] =
+                            d * read_i8(sc, n * 8 + is + 2) as f32 * q2 as f32;
+                        chunk[n * 128 + l + 64] =
+                            d * read_i8(sc, n * 8 + is + 4) as f32 * q3 as f32;
+                        chunk[n * 128 + l + 96] =
+                            d * read_i8(sc, n * 8 + is + 6) as f32 * q4 as f32;
+                    }
+                }
+                out.extend_from_slice(&chunk);
+            }
+        }
+        15 => {
+            // Q8_K: d(f32) | qs[256] | bsums[16] (bsums are not needed for weights)
+            for block in bytes.chunks_exact(size) {
+                let d = f32::from_le_bytes(block[0..4].try_into().unwrap());
+                for &q in &block[4..260] {
+                    out.push(d * (q as i8) as f32);
+                }
+            }
+        }
         other => return Err(format!("unsupported ggml type {other}")),
     }
 
@@ -607,9 +813,9 @@ mod tests {
 
     #[test]
     fn unsupported_types_are_named() {
-        assert_eq!(type_name(12), "Q4_K");
-        assert!(type_size(12).is_none());
-        let err = dequantize(12, &[0; 144], 256).unwrap_err();
+        assert_eq!(type_name(9), "Q8_1");
+        assert!(type_size(9).is_none());
+        let err = dequantize(9, &[0; 36], 32).unwrap_err();
         assert!(err.contains("unsupported"), "{err}");
     }
 }
