@@ -52,17 +52,19 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   block, no prevote/precommit, no equivocation slashing in the live path.
 - **Not a general model host.** Dense / relu / softmax classifiers over the
   hashed-unigram featuriser convert from ONNX (`onnx-import`) or GGUF
-  (`gguf-import`, dequantising Q4/Q5/Q8) — see
+  (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K) — see
   [`docs/runtime.md`](runtime.md). Transformer graphs — attention, convolutions,
   arbitrary tokenizers, sampling — are not supported, so a customer's LLM
   checkpoint cannot run yet. Tasks for models a node has not loaded fall back to
   the manual claim → submit result flow and are **not** verified by the chain.
 - **Not ZK-proven.** The attention/matmul dispute path still falls back to hash
-  equality (ADR 003); `full-zk` is not what it sounds like.
-- **No catch-up sync.** Nodes must start together and stay online. A node that
-  misses a block stalls the network at that height.
-- **No multi-tenant auth.** Any caller with a funded key can submit; there are
-  no API keys, quotas or per-tenant isolation yet.
+  equality (ADR 003); `full-zk` is not what it sounds like. With consensus
+  re-execution, verification is recomputation; the dispute game is test-only
+  and targets the manual-claim path.
+- **Catch-up, not snapshot sync.** A node that falls behind replays blocks from
+  `VNN_SYNC_URLS`; a very long chain takes proportionally longer to join.
+- **Auth is gateway-local.** API keys are address-bound and enforce a daily
+  quota, but quotas are billing/abuse control, not a consensus rule.
 
 ## API
 
@@ -108,7 +110,7 @@ cargo run -p verinoo-onnx --bin onnx-import -- \
   --onnx customer.onnx --model-id customer-v1 --labels a,b,c \
   --out models/customer-v1.graph.json
 
-# from a customer GGUF dense classifier (Q4/Q5/Q8 dequantised)
+# from a customer GGUF dense classifier (Q4/Q5/Q8 and Q2_K–Q6_K dequantised)
 cargo run -p verinoo-gguf --bin gguf-import -- \
   --gguf customer.gguf --model-id customer-v1 --labels a,b,c \
   --out models/customer-v1.graph.json

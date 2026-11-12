@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (68 tests) |
+| Test suite | green | `cargo test --workspace --locked` (76 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -32,7 +32,7 @@ claims a technical buyer will test in the first diligence call.
 | Model | works (small) | `intent-classifier-v1`, 8 196 params, 98.4% train / 100% held-out |
 | Operator model set | works | `models/acme-support-v1.graph.json`, executed on 2 nodes |
 | ONNX classifier import | works | `verinoo-onnx`, parity vs f32, 10 tests |
-| GGUF classifier import | works (experimental) | `verinoo-gguf`, Q4/Q5/Q8 dequant, K-quants refused, 12 tests |
+| GGUF classifier import | works (experimental) | `verinoo-gguf`, Q4/Q5/Q8 + Q2_K–Q6_K dequant, 15 tests |
 | Result commitment | works | state root covers every executed output |
 | Receipts + verification | works | `/v1/verify` recompute, live 2-node run |
 | Metering | works | `/v1/usage`, CSV export |
@@ -43,29 +43,28 @@ claims a technical buyer will test in the first diligence call.
 
 1. **No transformer runtime.** Dense / relu / softmax classifiers convert from
    ONNX (`onnx-import`, parity-checked against f32) or GGUF (`gguf-import`,
-   Q4/Q5/Q8 dequantised), and any model in the node's set (`VNN_MODEL_DIR`)
-   executes deterministically. Graphs with attention, convolutions or arbitrary
-   tokenizers are refused, so a customer's LLM checkpoint cannot run.
-   Separately, `exec::spec::get_layer_spec` still fabricates layer shapes for
-   dispute games on a model *name*. Format and conversion:
-   [`docs/runtime.md`](runtime.md).
+   Q4/Q5/Q8 and Q2_K–Q6_K dequantised), and any model in the node's set
+   (`VNN_MODEL_DIR`) executes deterministically. Graphs with attention,
+   convolutions or arbitrary tokenizers are refused, so a customer's LLM
+   checkpoint cannot run. This is the main product gap.
 2. **No finality.** `RoundRobin` selects producers; there are no prevote /
    precommit rounds, so a block is only as final as the single producer's
    signature. No equivocation slashing in the live path.
-3. **Trusted setup is single-operator.** ADR 001: two machines, one person.
-   Not a credible trust claim for a paying customer.
-4. **Attention/matmul disputes fall back to hash equality.** ADR 003 — the SNARK
-   path is not aligned with the WASM runtime, so `full-zk` is not what it says.
-5. **No settlement asset.** Fees are denominated in a testnet balance with a
-   faucet; there is no token or on-chain fiat settlement. Usage is metered and
-   exportable (`/v1/usage/:addr/csv`), but invoicing is manual.
-6. **No operator story.** Single process, no HA, no backup/restore runbook, no
-   key management beyond an env seed.
-7. **No block sync.** A node only accepts a block that extends *its own* head.
-   A node that starts after genesis, or falls behind, is rejected forever. All
-   nodes must be started together and stay online; there is no catch-up
-   protocol and no state snapshot transfer. Because production is slot-based,
-   one missed block stalls the whole network at that height.
+3. **The dispute game is not live over RPC for a real model.** With consensus
+   re-execution, verification is recomputation and there is nothing to dispute
+   in the deterministic path. The game that exists targets the manual-claim
+   path and `exec::spec::get_layer_spec` still fabricates layer shapes from a
+   model *name* (ADR 003), so exposing it now would be misleading. Test-only.
+4. **No token or on-chain fiat settlement.** Fees use a testnet balance and a
+   faucet. Usage is metered and exportable (`/v1/usage/:addr/csv`); invoicing is
+   manual. A token is a legal/strategy decision, not an engineering task.
+5. **Operational HA is manual.** Backups, restore, API-key rotation, a catch-up
+   replica and an incident runbook now exist ([`docs/operations.md`](operations.md)),
+   but there is no automatic failover, no split-brain protection and no way to
+   remove a validator from the active set without a coordinated re-genesis.
+6. **No state snapshot transfer.** Catch-up replays blocks from the caller's
+   height; a node far behind replays from genesis, which is O(chain length).
+   There is no snapshot download yet.
 
 ## Prepared in this pass
 
@@ -101,6 +100,19 @@ claims a technical buyer will test in the first diligence call.
   boots, so `VNN_VALIDATORS` can be assembled without starting a node.
 - `scripts/demo-2node.sh` reproduces the two-validator proof (11 checks) and
   `scripts/verify.sh <taskId>` verifies any task against any node.
+- Address-bound API keys with per-key daily quotas, hashed at rest, issued and
+  revoked with `verinoo-node apikey`, reloaded with SIGHUP. `/v1/usage` is
+  tenant-scoped when keys are enabled.
+- GGUF K-quants (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K) dequantise with the
+  llama.cpp layouts and are checked against reference vectors from the official
+  `gguf` Python package.
+- Catch-up sync: `GET /blocks/since/:index` plus `VNN_SYNC_URLS`. A late
+  replica replays blocks through the same validation and state-root check;
+  `scripts/demo-sync.sh` proves a three-block catch-up.
+- `scripts/backup.sh` takes a consistent stopped-service backup, and
+  [`docs/operations.md`](operations.md) covers restore, API-key rotation,
+  validator-key rotation, a catch-up replica/HA recipe, monitoring and
+  incident response.
 
 ## Verified end-to-end (2-node product run)
 
@@ -194,13 +206,16 @@ domain still belong to the older reference node.
 | ~~Receipt API (signed receipt + block anchor)~~ | **done**: `/v1/infer`, `/v1/tasks`, `/v1/verify` | — |
 | ~~Runtime for an operator-supplied model~~ | **done**: `verinoo-runtime`, dense/relu/softmax over Q16.16 | — |
 | ~~ONNX classifier importer with a parity harness~~ | **done**: `verinoo-onnx`, `onnx-import` | — |
-| ~~GGUF dense classifier importer~~ | **done**: `verinoo-gguf`, `gguf-import`, Q4/Q5/Q8 | — |
+| ~~GGUF dense classifier importer~~ | **done**: `verinoo-gguf`, `gguf-import`, Q4/Q5/Q8 + K-quants | — |
 | ~~Metering + billing export~~ | **done**: `/v1/usage`, `/v1/usage/:addr/csv` | — |
-| API keys, quotas, per-tenant isolation | gateway in front of `/v1/infer` | 1–2 wk |
-| Dispute game live over RPC (currently test-only) | expose challenge/bisect/recompute endpoints | 2–3 wk |
+| ~~API keys, quotas, tenant isolation~~ | **done**: address-bound keys, per-key daily quota, SIGHUP rotation (`verinoo-node apikey`) | — |
+| ~~Block catch-up sync~~ | **done**: `/blocks/since`, `VNN_SYNC_URLS`, validated replay (`scripts/demo-sync.sh`) | — |
+| ~~Backups, restore, key rotation, incident runbook~~ | **done**: `scripts/backup.sh`, [`docs/operations.md`](operations.md) | — |
+| Dispute game live for a real model | commit layer specs/weights at model registration; replace `get_layer_spec` | 2–3 wk |
 | Finality or honest framing | Malachite adapter **or** document "operator-attested with economic recourse" | 4–6 wk / 1 wk |
 | Public multi-party ceremony | external contributors to powers-of-tau | 2 wk + coordination |
-| Operations | HA pair, backups, key rotation, incident runbook | 2–3 wk |
+| Automatic HA / validator removal | failover, split-brain protection, on-chain set changes | 2–3 wk |
+| State snapshot transfer | serve and verify a signed state snapshot | 1–2 wk |
 
 ## Recommended sequence
 
@@ -208,10 +223,13 @@ domain still belong to the older reference node.
    asserted" page.~~ Done: `docs/pilot.md`, `scripts/demo.sh`,
    `scripts/demo-2node.sh`.
 2. Run three paid design partners at $5k for eight weeks against a classifier
-   they care about (ONNX or GGUF, dense/relu/softmax).
-3. Add API keys, quotas and per-tenant isolation behind `/v1/infer` before
-   self-serve pricing.
-4. Only then decide between network (token, validators) and audit SaaS (fiat).
+   they care about (ONNX or GGUF, dense/relu/softmax). Issue each one an API key
+   bound to its funded address with a daily quota.
+3. Decide from those pilots whether the next engineering investment is a
+   transformer runtime or deeper audit/ops features. Do not build BFT or a
+   token before a pilot asks for it.
+4. Use fiat invoicing from the CSV export; a token is a separate legal and
+   product decision.
 
 ## Do not claim
 

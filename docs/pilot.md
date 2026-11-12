@@ -84,10 +84,12 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
   run yet.
 - **Not ZK-proven.** The attention/matmul dispute path falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like.
-- **No catch-up sync.** Nodes must start together and stay online. A node that
-  falls behind stalls at that height; there is no snapshot transfer yet.
-- **No multi-tenant auth.** Any caller with a funded testnet key can submit; no
-  API keys, quotas or tenant isolation yet.
+- **Catch-up, not snapshot sync.** A late node replays blocks from genesis via
+  `VNN_SYNC_URLS`; there is no state snapshot transfer yet, so a very long
+  chain takes proportionally longer to join.
+- **Auth is gateway-local.** API keys are address-bound and enforce a daily
+  quota, but quotas are billing/abuse control, not a consensus rule. The public
+  demo runs without keys; paid deployments enable `VNN_API_KEYS_FILE`.
 
 ## Wire in your own classifier
 
@@ -100,7 +102,7 @@ cargo run -p verinoo-onnx --bin onnx-import -- \
   --onnx your-model.onnx --model-id your-model-v1 \
   --labels class_a,class_b,class_c --out models/your-model-v1.graph.json
 
-# GGUF dense classifier (Q4/Q5/Q8 dequantised; K-quants refused)
+# GGUF dense classifier (Q4/Q5/Q8 and Q2_K–Q6_K dequantised)
 cargo run -p verinoo-gguf --bin gguf-import -- \
   --gguf your-model.gguf --model-id your-model-v1 \
   --labels class_a,class_b,class_c --out models/your-model-v1.graph.json
@@ -116,7 +118,7 @@ state root and peers reject the block instead of forking.
 - **Design partner: $5,000 / 8 weeks.** Dedicated validator set, your classifier
   wired in, a joint verification run, and a weekly sync. Billed in fiat; usage
   reported from the CSV export.
-- **Usage: $0.50 per 1,000 tasks** once self-serve API keys and quotas ship.
+- **Usage: $0.50 per 1,000 tasks** on a self-serve key with a daily quota.
 - **Enterprise: from $60k / year** for a private network and custom runtime work.
 
 Charge for the receipt, not the token count: the buyer is paying to prove what a
@@ -124,11 +126,17 @@ model returned.
 
 ## Known engineering gaps before self-serve
 
-1. API keys, quotas, per-tenant isolation (1–2 weeks).
-2. Live dispute-game RPC; today the challenge path is exercised in tests
-   (2–3 weeks).
-3. Byzantine finality (4–6 weeks) or continued honest "operator-attested with
+1. Transformer/attention runtime; today only dense/relu/softmax classifiers
+   run (4–8 weeks).
+2. Byzantine finality (4–6 weeks) or continued honest "operator-attested with
    economic recourse" framing.
-4. Operations: HA pair, backups, key rotation, incident runbook (2–3 weeks).
+3. Automatic HA/failover and on-chain validator removal (2–3 weeks). Manual
+   replica promotion and coordinated key rotation are documented in
+   [`docs/operations.md`](operations.md).
+4. State snapshot transfer for fast joins (1–2 weeks).
+5. Dispute games for a real model; the deterministic path verifies by
+   recomputation, so there is currently nothing to dispute.
 
-Nothing in that list blocks a design-partner pilot against a classifier.
+API keys, quotas, catch-up sync, backups, restore, API-key rotation and an
+incident runbook now exist. Nothing in the list above blocks a design-partner
+pilot against a classifier.

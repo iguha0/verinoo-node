@@ -9,7 +9,7 @@ consensus against a real (small) model with on-chain receipts and a
 verification endpoint. Consensus is still round-robin with no BFT finality.
 Models come from the compiled-in reference classifier plus operator graph models
 loaded from `VNN_MODEL_DIR`. Dense/relu/softmax classifiers convert from ONNX
-(`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8); transformer
+(`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K); transformer
 checkpoints — attention, arbitrary tokenizers, sampling — cannot run yet. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
@@ -25,7 +25,7 @@ checkpoints — attention, arbitrary tokenizers, sampling — cannot run yet. Se
 | `model` | `intent-classifier-v1`: deterministic Q16.16 inference + trainer |
 | `runtime` | integer-only graph runtime for operator-supplied models |
 | `onnx` | ONNX classifier → runtime graph (`onnx-import`), with float/integer parity |
-| `gguf` | GGUF dense classifier → runtime graph (`gguf-import`), Q4/Q5/Q8 dequantisation |
+| `gguf` | GGUF dense classifier → runtime graph (`gguf-import`), Q4/Q5/Q8 + K-quant dequantisation |
 | `zk` | Q16.16 op vectors and conformance against the WASM runtime |
 | `node` | Binary: wiring, RPC API, wallet CLI, systemd/deploy assets |
 
@@ -92,6 +92,11 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `VNN_VALIDATOR` | `false` | produce blocks |
 | `VNN_VALIDATORS` | self if validator | active set, comma-separated |
 | `VNN_SEEDS` | *(none)* | `/ip4/<host>/tcp/<port>` peers |
+| `VNN_SYNC_URLS` | *(none)* | peer HTTP APIs for catch-up replay, comma-separated |
+| `VNN_API_KEYS_FILE` | `/etc/verinoo/api-keys.json` if present | tenant keys; absent = public demo mode |
+
+Catch-up: a node that starts late or falls behind replays validated blocks from
+`VNN_SYNC_URLS`. Proof: `./scripts/demo-sync.sh`.
 
 ## API
 
@@ -101,13 +106,14 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `GET /status` | chain id, height, head hash, mempool depth |
 | `GET /metrics` | height, head age, mempool, validator count |
 | `GET /blocks` | latest 20 blocks |
+| `GET /blocks/since/:index` | up to 200 blocks after `index` (catch-up sync) |
 | `GET /account/:address` | balance + nonce |
 | `GET /validators` | active validator set |
 | `GET /mempool` | mempool depth |
 | `POST /tx` | validate, enqueue, and gossip a signed tx |
 | `POST /faucet` | testnet drip (10 000, 60 s per address) |
 | `GET /v1/models` | models this node executes, with weights hash |
-| `POST /v1/infer` | submit a signed inference transaction |
+| `POST /v1/infer` | submit a signed inference transaction (`Authorization: Bearer <key>` when keys are enabled) |
 | `GET /v1/tasks/:id` | task status, output and receipt |
 | `GET /v1/verify/:id` | recompute the output and compare with the chain |
 | `GET /v1/usage/:addr` | per-address metering (JSON) |
@@ -144,23 +150,34 @@ cargo run -p verinoo-model --bin export -- \
 verinoo-node infer --model acme-support-v1 --input "my parcel was never delivered"
 ```
 
-## Wallet
+## Wallet and API keys
 
 ```bash
 verinoo-node wallet generate --output key.json
 verinoo-node wallet balance --key-file key.json --node http://localhost:7100
 verinoo-node wallet send --key-file key.json --to ai_... --amount 100
+
+# tenant key bound to the wallet address, 5 000 inference calls/day
+verinoo-node apikey new --tenant acme --address ai_... --quota 5000 \
+  --file /etc/verinoo/api-keys.json
+systemctl kill -s HUP verinoo-node    # reload without downtime
 ```
+
+Keys are stored as hashes and reloaded with SIGHUP. See
+[`docs/operations.md`](docs/operations.md) for backups, restore, rotation,
+replica/HA and incident response.
 
 ## Test and deploy
 
 ```bash
 cargo build --workspace --locked
-cargo test --workspace --locked        # 68 tests
+cargo test --workspace --locked        # 76 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/demo.sh                      # single node, ~45 s
 ./scripts/demo-2node.sh                # two validators, ~2 min
+./scripts/demo-sync.sh                 # late replica catches up
+sudo ./scripts/backup.sh               # consistent DB backup
 sudo REPO_DIR=/opt/verinoo ./deploy/setup-vps.sh   # Ubuntu 24.04
 ```
 
