@@ -7,6 +7,31 @@ claimed yet.
 
 Assessment date: 2026-11-12. Scope: the Rust node in this repository.
 
+## Live demo
+
+The `/v1` API is live on the testnet node behind `https://verinoo.com`
+(single validator, restarts possible, no SLA):
+
+```bash
+curl -s https://verinoo.com/v1/models | jq
+```
+
+Run a full request against it:
+
+```bash
+verinoo-node wallet generate --output key.json
+ADDR=$(jq -r .address key.json)
+curl -s -X POST https://verinoo.com/faucet \
+  -H 'content-type: application/json' -d "{\"address\":\"$ADDR\"}"
+sleep 12
+verinoo-node infer --key-file key.json \
+  --input "my parcel was never delivered" --node https://verinoo.com
+./scripts/verify.sh <taskId> --node https://verinoo.com
+```
+
+The root `/status` and `/health` on `verinoo.com` still belong to the older
+reference node; the verifiable-inference product is the `/v1` surface.
+
 ## Run the proof yourself
 
 Two commands, no hosted service, no token:

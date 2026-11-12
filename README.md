@@ -34,6 +34,23 @@ is the **reference client**: its engine defines validation semantics, and its
 test-suite exports the golden fixtures this workspace reproduces exactly. See
 `crates/conformance/fixtures/`.
 
+## Live testnet
+
+The `/v1` API is deployed behind **https://verinoo.com** (single validator,
+testnet, no SLA):
+
+```bash
+curl -s https://verinoo.com/v1/models | jq
+verinoo-node wallet generate --output key.json
+ADDR=$(jq -r .address key.json)
+curl -s -X POST https://verinoo.com/faucet \
+  -H 'content-type: application/json' -d "{\"address\":\"$ADDR\"}"
+sleep 12
+verinoo-node infer --key-file key.json \
+  --input "my parcel was never delivered" --node https://verinoo.com
+./scripts/verify.sh <taskId> --node https://verinoo.com
+```
+
 ## Run a node
 
 ```bash
