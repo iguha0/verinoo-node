@@ -5,6 +5,7 @@
 //! authorization, chain linkage, timestamp sanity, txRoot, duplicate
 //! rejection, per-tx canonical + signature checks).
 
+mod auth;
 mod rpc;
 mod wallet;
 
@@ -36,6 +37,10 @@ pub struct Shared {
     /// derive the same funded genesis account, otherwise faucet drips would
     /// only exist on the node that served them.
     pub faucet: verinoo_exec::engine::ProducerKey,
+    /// Serialises chain advancement between block production, gossip
+    /// application and catch-up sync. Two writers without this can apply
+    /// different blocks at the same height.
+    pub chain_lock: tokio::sync::Mutex<()>,
     policy: std::sync::Mutex<Policy>,
 }
 
@@ -202,6 +207,7 @@ async fn validator_loop(
         }
         let batch: Vec<_> = shared.mempool.lock().await.drain(..).collect();
 
+        let _guard = shared.chain_lock.lock().await;
         match produce_block(&shared.store, &batch, &producer, shared.now_ms()) {
             Ok(block) => {
                 let n = block.transactions.len();
@@ -244,12 +250,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return address_cli(&args[2..]);
     }
 
+    // API-key administration (issue / list / revoke tenant keys).
+    if args.len() > 1 && args[1] == "apikey" {
+        return auth::cli(&args[2..]).map_err(|e| e.into());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // API keys are optional: no file (and no VNN_API_KEYS_FILE) means the
+    // public demo mode where any funded key may submit.
+    let api_auth = auth::Auth::from_env()?;
+    if api_auth.is_enabled() {
+        tracing::info!(
+            "api keys enabled ({} entries) | {}",
+            api_auth.len(),
+            api_auth
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+        api_auth.spawn_reload_on_sighup();
+    } else {
+        tracing::warn!("api keys disabled — any funded key may submit inference");
+    }
 
     // Config via env (deploy-friendly): VNN_* variables.
     let validator = std::env::var("VNN_VALIDATOR")
@@ -359,6 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         params: cfg.genesis.clone(),
         mempool: tokio::sync::Mutex::new(Vec::new()),
         faucet,
+        chain_lock: tokio::sync::Mutex::new(()),
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
@@ -442,8 +471,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Existing databases predate the height index; walk back once on startup
+    // so /blocks/since can serve ranges immediately.
+    backfill_height_index(&shared.store);
+
     // RPC server.
-    tokio::spawn(rpc::serve(shared.clone(), net.clone(), cfg.api_port));
+    tokio::spawn(rpc::serve(
+        shared.clone(),
+        net.clone(),
+        cfg.api_port,
+        api_auth.clone(),
+    ));
 
     // Event pump consumes the wire stream.
     let pump_shared = shared.clone();
@@ -470,20 +508,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     match serde_json::from_str::<Block>(&payload) {
-                        Ok(block) => match admit_block(&shared, &block) {
-                            Ok(()) => {
-                                let producer = block.header.validator.clone();
-                                tracing::info!(
-                                    "admitted block #{} from {}",
-                                    block.header.index,
-                                    &producer[..12.min(producer.len())]
-                                );
-                                commit_block(&shared, &block, &producer);
+                        Ok(block) => {
+                            let _guard = shared.chain_lock.lock().await;
+                            match admit_block(&shared, &block) {
+                                Ok(()) => {
+                                    let producer = block.header.validator.clone();
+                                    tracing::info!(
+                                        "admitted block #{} from {}",
+                                        block.header.index,
+                                        &producer[..12.min(producer.len())]
+                                    );
+                                    commit_block(&shared, &block, &producer);
+                                }
+                                Err(reason) => {
+                                    tracing::warn!("rejected block: {reason}");
+                                }
                             }
-                            Err(reason) => {
-                                tracing::warn!("rejected block: {reason}");
-                            }
-                        },
+                        }
                         Err(e) => tracing::debug!("bad block payload: {e}"),
                     }
                 }
@@ -506,9 +547,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // Catch-up sync: poll peer HTTP APIs and replay missing blocks through the
+    // same validation as gossip. A node that starts late or falls behind can
+    // recover instead of stalling the network.
+    let sync_urls: Vec<String> = std::env::var("VNN_SYNC_URLS")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !sync_urls.is_empty() {
+        tracing::info!("catch-up sync from {}", sync_urls.join(","));
+        tokio::spawn(sync_loop(shared.clone(), sync_urls));
+    }
+
     // Idle forever; tasks do the work.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Walk back from the head once and record height -> hash for each block that
+/// predates the index. Stops at the first indexed height so restarts are cheap.
+fn backfill_height_index(store: &verinoo_state::StateStore) {
+    let Some(head) = current_head(store) else {
+        return;
+    };
+    let mut cur = Some(head);
+    let mut indexed = 0usize;
+    while let Some(block) = cur {
+        let key = format!("blockheight:{}", block.header.index);
+        if store.get_meta(&key).is_some() {
+            break;
+        }
+        store.set_meta(&key, &serde_json::json!(block.header.hash));
+        indexed += 1;
+        if block.header.index == 0 {
+            break;
+        }
+        cur = store
+            .get_block_by_hash(&block.header.previous_hash)
+            .and_then(|v| serde_json::from_value::<Block>(v).ok());
+    }
+    if indexed > 0 {
+        tracing::info!("indexed {indexed} block height(s) for catch-up sync");
+    }
+}
+
+async fn sync_loop(shared: Arc<Shared>, urls: Vec<String>) {
+    let client = reqwest::Client::new();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
+    loop {
+        ticker.tick().await;
+        for url in &urls {
+            match sync_once(&shared, &client, url).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("synced {n} block(s) from {url}"),
+                Err(e) => tracing::debug!("sync from {url} failed: {e}"),
+            }
+        }
+    }
+}
+
+async fn sync_once(shared: &Shared, client: &reqwest::Client, base: &str) -> Result<usize, String> {
+    let base = base.trim_end_matches('/');
+    let status: serde_json::Value = client
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let peer_height = status["height"].as_u64().unwrap_or(0);
+    let our_height = shared.head().map(|b| b.header.index).unwrap_or(0);
+    if peer_height <= our_height {
+        return Ok(0);
+    }
+    let blocks: Vec<Block> = client
+        .get(format!("{base}/blocks/since/{our_height}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut applied = 0usize;
+    for block in blocks {
+        let _guard = shared.chain_lock.lock().await;
+        let current = shared.head().map(|b| b.header.index).unwrap_or(0);
+        if block.header.index != current + 1 {
+            break;
+        }
+        admit_block(shared, &block)?;
+        let producer = block.header.validator.clone();
+        commit_block(shared, &block, &producer);
+        if shared.head().map(|b| b.header.index) != Some(block.header.index) {
+            return Err(format!(
+                "block #{} did not advance head (state root or model set mismatch?)",
+                block.header.index
+            ));
+        }
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 /// `verinoo-node address --seed <string>` — the validator address a node with
@@ -555,6 +699,7 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut model = verinoo_model::MODEL_ID.to_string();
     let mut max_fee: u64 = 100;
     let mut rpc_url = "http://localhost:7100".to_string();
+    let mut api_key: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -579,13 +724,17 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 rpc_url = args[i + 1].clone();
                 i += 1;
             }
+            "--api-key" if i + 1 < args.len() => {
+                api_key = Some(args[i + 1].clone());
+                i += 1;
+            }
             _ => {}
         }
         i += 1;
     }
 
     if key_file.is_empty() || input.is_empty() {
-        eprintln!("Usage: verinoo-node infer --key-file <file> --input \"<text>\" [--model id] [--fee n] [--node url]");
+        eprintln!("Usage: verinoo-node infer --key-file <file> --input \"<text>\" [--model id] [--fee n] [--node url] [--api-key key]");
         std::process::exit(1);
     }
 
@@ -608,11 +757,13 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &signing, &address, &model, &input, max_fee, deadline, nonce,
     )?;
 
-    let resp = reqwest::Client::new()
+    let mut req = reqwest::Client::new()
         .post(format!("{rpc_url}/v1/infer"))
-        .json(&body)
-        .send()
-        .await?;
+        .json(&body);
+    if let Some(key) = &api_key {
+        req = req.header("authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -644,8 +795,10 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         println!("Usage: verinoo-node wallet <command> [options]");
         println!("  generate --output <file>");
         println!("  balance  --key-file <file> [--node <url>]");
-        println!("  send     --key-file <file> --to <addr> --amount <n> [--node <url>]");
-        println!("\nInference:\n  infer    --key-file <file> --input \"<text>\" [--model id] [--fee n] [--node <url>]");
+        println!(
+            "  send     --key-file <file> --to <addr> --amount <n> [--node <url>] [--api-key key]"
+        );
+        println!("\nInference:\n  infer    --key-file <file> --input \"<text>\" [--model id] [--fee n] [--node <url>] [--api-key key]");
         return Ok(());
     }
 
@@ -655,6 +808,7 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut to_addr = String::new();
     let mut amount: u64 = 0;
     let mut rpc_url = "http://localhost:7100".to_string();
+    let mut api_key: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -682,6 +836,10 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--node" if i + 1 < args.len() => {
                 rpc_url = args[i + 1].clone();
+                i += 1;
+            }
+            "--api-key" if i + 1 < args.len() => {
+                api_key = Some(args[i + 1].clone());
                 i += 1;
             }
             _ => {}
@@ -717,9 +875,16 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| e.to_string())?;
             let nonce = body["nonce"].as_u64().unwrap_or(0) + 1;
 
-            let result =
-                wallet::send_transfer(&rpc_url, &from_addr, &secret_b64, &to_addr, amount, nonce)
-                    .await?;
+            let result = wallet::send_transfer(
+                &rpc_url,
+                &from_addr,
+                &secret_b64,
+                &to_addr,
+                amount,
+                nonce,
+                api_key.as_deref(),
+            )
+            .await?;
             println!("✓ Transfer submitted: {result}");
         }
         _ => eprintln!("Unknown wallet command: {cmd}"),

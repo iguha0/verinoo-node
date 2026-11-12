@@ -178,6 +178,7 @@ pub async fn send_transfer(
     to: &str,
     amount: u64,
     nonce: u64,
+    api_key: Option<&str>,
 ) -> Result<String, String> {
     let sk_bytes = base64::engine::general_purpose::STANDARD
         .decode(secret_b64)
@@ -190,9 +191,13 @@ pub async fn send_transfer(
     let body = build_signed_transfer(&signing, from_addr, to, amount, nonce)?;
 
     let client = reqwest::Client::new();
-    let resp = client
+    let mut req = client
         .post(format!("{rpc_url}/tx"))
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if let Some(key) = api_key {
+        req = req.header("authorization", format!("Bearer {key}"));
+    }
+    let resp = req
         .body(serde_json::to_string(&body).map_err(|e| e.to_string())?)
         .send()
         .await

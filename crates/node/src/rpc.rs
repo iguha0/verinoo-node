@@ -5,22 +5,26 @@
 
 use axum::{
     extract::State,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Extension, Json, Router,
 };
 use std::sync::Arc;
 
+use crate::auth::{Auth, AuthError};
 use crate::Shared;
 
 pub async fn serve(
     shared: Arc<Shared>,
     net: verinoo_network::NetworkNode,
     port: u16,
+    auth: Auth,
 ) -> Result<(), String> {
     let app = Router::new()
         .route("/status", get(status))
         .route("/health", get(health))
         .route("/blocks", get(blocks))
+        .route("/blocks/since/:index", get(blocks_since))
         .route("/mempool", get(mempool))
         .route("/account/:address", get(account))
         .route("/validators", get(validators))
@@ -36,7 +40,8 @@ pub async fn serve(
         .route("/v1/usage/:address/csv", get(v1_usage_csv))
         .layer(axum::middleware::from_fn(cors))
         .with_state(shared)
-        .layer(Extension(net));
+        .layer(Extension(net))
+        .layer(Extension(auth));
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -86,7 +91,7 @@ async fn cors(
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("content-type"),
+        HeaderValue::from_static("content-type, authorization"),
     );
     res
 }
@@ -105,6 +110,38 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         "mempool": shared.mempool.lock().await.len(),
         "validators": shared.params.validators,
     }))
+}
+
+/// Blocks from `index + 1` up to the head, capped at 200 per request. A node
+/// that fell behind replays these through the same validation and state-root
+/// checks as gossip, so catch-up cannot bypass consensus.
+async fn blocks_since(
+    State(shared): State<Arc<Shared>>,
+    axum::extract::Path(from): axum::extract::Path<u64>,
+) -> Json<serde_json::Value> {
+    let Some(head) = shared.head() else {
+        return Json(serde_json::json!([]));
+    };
+    let start = from.saturating_add(1);
+    if start > head.header.index {
+        return Json(serde_json::json!([]));
+    }
+    let end = start.saturating_add(199).min(head.header.index);
+    let mut out = Vec::new();
+    for height in start..=end {
+        let Some(hash) = shared
+            .store
+            .get_meta(&format!("blockheight:{height}"))
+            .and_then(|v| v.as_str().map(String::from))
+        else {
+            break;
+        };
+        let Some(block) = shared.store.get_block_by_hash(&hash) else {
+            break;
+        };
+        out.push(block);
+    }
+    Json(serde_json::json!(out))
 }
 
 async fn blocks(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
@@ -266,11 +303,33 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
     }))
 }
 
+fn auth_error(e: AuthError) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        e.status(),
+        Json(serde_json::json!({ "error": e.message() })),
+    )
+}
+
 async fn submit_tx(
     State(shared): State<Arc<Shared>>,
     Extension(net): Extension<verinoo_network::NetworkNode>,
+    Extension(auth): Extension<Auth>,
+    headers: HeaderMap,
     Json(tx): Json<verinoo_types::tx::TxEnvelope>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    // Authentication is opt-in: a node with no key file accepts any funded
+    // sender (public demo). When keys are configured, a key may only submit for
+    // the address it was issued to.
+    let caller = if auth.is_enabled() {
+        let caller = auth.authorize(&headers).map_err(auth_error)?;
+        if caller.address != tx.from {
+            return Err(auth_error(AuthError::AddressMismatch));
+        }
+        Some(caller)
+    } else {
+        None
+    };
+
     // Full validation at submission time — fail fast with the exact reason.
     // (Stateful rules like nonce/balance are evaluated against current state;
     // they are re-checked at block production per reference semantics.)
@@ -294,6 +353,12 @@ async fn submit_tx(
             axum::http::StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "already in mempool" })),
         ));
+    }
+    if let Some(caller) = &caller {
+        if tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference {
+            auth.consume_quota(&shared.store, caller, shared.now_ms())
+                .map_err(auth_error)?;
+        }
     }
     let payload = serde_json::to_string(&tx).map_err(|e| {
         (
@@ -427,16 +492,32 @@ fn usage_snapshot(shared: &Shared, address: &str) -> serde_json::Value {
 
 async fn v1_usage(
     State(shared): State<Arc<Shared>>,
+    Extension(auth): Extension<Auth>,
+    headers: HeaderMap,
     axum::extract::Path(address): axum::extract::Path<String>,
-) -> Json<serde_json::Value> {
-    Json(usage_snapshot(&shared, &address))
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if auth.is_enabled() {
+        let caller = auth.authorize(&headers).map_err(auth_error)?;
+        if caller.address != address {
+            return Err(auth_error(AuthError::AddressMismatch));
+        }
+    }
+    Ok(Json(usage_snapshot(&shared, &address)))
 }
 
 /// Metering export for invoicing.
 async fn v1_usage_csv(
     State(shared): State<Arc<Shared>>,
+    Extension(auth): Extension<Auth>,
+    headers: HeaderMap,
     axum::extract::Path(address): axum::extract::Path<String>,
-) -> impl axum::response::IntoResponse {
+) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if auth.is_enabled() {
+        let caller = auth.authorize(&headers).map_err(auth_error)?;
+        if caller.address != address {
+            return Err(auth_error(AuthError::AddressMismatch));
+        }
+    }
     let u = usage_snapshot(&shared, &address);
     let body = format!(
         "address,tasks,completed,pending,failed,feesCommitted,balance\n{},{},{},{},{},{},{}\n",
@@ -448,5 +529,5 @@ async fn v1_usage_csv(
         u["feesCommitted"],
         u["balance"],
     );
-    ([(axum::http::header::CONTENT_TYPE, "text/csv")], body)
+    Ok(([(axum::http::header::CONTENT_TYPE, "text/csv")], body))
 }

@@ -790,7 +790,10 @@ pub fn execute_transaction(
                     node.reputation = (node.reputation + 15).min(100);
                     store.set_node(&node);
                 }
-                eprintln!("[verif] DEFENDER WINS — challenger slashed {ch_bond}");
+                tracing::info!(
+                    bond = ch_bond,
+                    "dispute resolved: defender wins, challenger slashed"
+                );
             } else {
                 // CHALLENGER WINS: defender slashed.
                 game["status"] = json!("resolved_slash");
@@ -825,7 +828,10 @@ pub fn execute_transaction(
                     }
                     store.set_validator(&val);
                 }
-                eprintln!("[verif] CHALLENGER WINS — defender slashed {df_bond}");
+                tracing::info!(
+                    bond = df_bond,
+                    "dispute resolved: challenger wins, defender slashed"
+                );
             }
 
             game["resolvedAt"] = json!(ctx.height);
@@ -1377,5 +1383,11 @@ pub fn set_head(store: &StateStore, block: &Block) {
             "hash": block.header.hash,
             "block": serde_json::to_value(block).unwrap(),
         }),
+    );
+    // Height -> hash index, so a syncing node can fetch a range of blocks
+    // without walking the whole chain from the head.
+    store.set_meta(
+        &format!("blockheight:{}", block.header.index),
+        &serde_json::json!(block.header.hash),
     );
 }
