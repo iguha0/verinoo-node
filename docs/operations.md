@@ -23,7 +23,7 @@ node and leaves the older reference node on `/status` and `/health`.
 
 ```bash
 cd /opt/verinoo
-git fetch --tags && git checkout v0.1.0-testnet
+git fetch --tags && git checkout v0.2.0-testnet
 cargo build --release --locked -p verinoo-node
 install -m 0755 target/release/verinoo-node /usr/local/bin/verinoo-node
 systemctl restart verinoo-node

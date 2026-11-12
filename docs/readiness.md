@@ -190,7 +190,7 @@ the receipt verifies on the node that did not produce the block.
 
 ## Live deployment (2026-11-12)
 
-`https://verinoo.com/v1/*` is served by this node (`v0.1.0-testnet`, single
+`https://verinoo.com/v1/*` is served by this node (`v0.2.0-testnet`, single
 validator, systemd unit `verinoo-node`, data in `/var/lib/verinoo`). Nginx
 proxies `/v1/`, `/faucet` and `/account/` to `127.0.0.1:7100` with rate limits;
 the API and P2P ports are firewalled. Verified against the public endpoint:

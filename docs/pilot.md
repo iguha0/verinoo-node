@@ -10,7 +10,7 @@ Assessment date: 2026-11-12. Scope: the Rust node in this repository.
 ## Download and live demo
 
 Prebuilt `x86_64` Linux binary (OpenSSL 3):
-<https://github.com/iguha0/verinoo-node/releases/tag/v0.1.0-testnet>
+<https://github.com/iguha0/verinoo-node/releases/tag/v0.2.0-testnet>
 
 The `/v1` API is live on the testnet node behind `https://verinoo.com`
 (single validator, restarts possible, no SLA):
