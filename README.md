@@ -13,7 +13,11 @@ loaded from `VNN_MODEL_DIR`. Dense/relu/softmax classifiers convert from ONNX
 checkpoints — attention, arbitrary tokenizers, sampling — cannot run yet. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
-[`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary.
+[`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary,
+[`docs/privacy.md`](docs/privacy.md) for input encryption, and
+[`docs/transformer.md`](docs/transformer.md) /
+[`docs/adr/004-bft-finality.md`](docs/adr/004-bft-finality.md) for the
+not-yet-wired transformer kernel and BFT design.
 
 | Crate | Purpose |
 |---|---|
@@ -53,6 +57,17 @@ verinoo-node infer --key-file key.json \
   --input "my parcel was never delivered" --node https://verinoo.com
 ./scripts/verify.sh <taskId> --node https://verinoo.com
 ```
+
+## Client SDKs
+
+- [`sdk/typescript`](sdk/typescript) — zero-dependency ESM, Node >= 20; built-in
+  canonical JSON, Ed25519 signing, X25519 input encryption, polling and verify.
+- [`sdk/python`](sdk/python) — `cryptography` + stdlib; same transaction and
+  encryption semantics.
+
+Both encrypt inputs by default when the node advertises `/v1/input-key`. See
+[`docs/privacy.md`](docs/privacy.md) for the threat model: encryption protects
+inputs from API/block readers, but the operator can decrypt.
 
 ## Run a node
 
@@ -94,6 +109,9 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `VNN_SEEDS` | *(none)* | `/ip4/<host>/tcp/<port>` peers |
 | `VNN_SYNC_URLS` | *(none)* | peer HTTP APIs for catch-up replay, comma-separated |
 | `VNN_API_KEYS_FILE` | `/etc/verinoo/api-keys.json` if present | tenant keys; absent = public demo mode |
+| `VNN_INPUT_KEY` | *(none)* | network X25519 secret (64 hex); enables encrypted inputs |
+| `VNN_REQUIRE_ENCRYPTED_INPUT` | `false` | reject plaintext inference submissions |
+| `VNN_BLOCK_TIME_MS` | chain default (10 000) | block interval; identical on every validator |
 
 Catch-up: a node that starts late or falls behind replays validated blocks from
 `VNN_SYNC_URLS`. Proof: `./scripts/demo-sync.sh`.
@@ -113,6 +131,7 @@ Catch-up: a node that starts late or falls behind replays validated blocks from
 | `POST /tx` | validate, enqueue, and gossip a signed tx |
 | `POST /faucet` | testnet drip (10 000, 60 s per address) |
 | `GET /v1/models` | models this node executes, with weights hash |
+| `GET /v1/input-key` | network X25519 key for encrypted inputs |
 | `POST /v1/infer` | submit a signed inference transaction (`Authorization: Bearer <key>` when keys are enabled) |
 | `GET /v1/tasks/:id` | task status, output and receipt |
 | `GET /v1/verify/:id` | recompute the output and compare with the chain |
@@ -171,7 +190,7 @@ replica/HA and incident response.
 
 ```bash
 cargo build --workspace --locked
-cargo test --workspace --locked        # 76 tests
+cargo test --workspace --locked        # 89 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/demo.sh                      # single node, ~45 s

@@ -55,8 +55,10 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K) — see
   [`docs/runtime.md`](runtime.md). Transformer graphs — attention, convolutions,
   arbitrary tokenizers, sampling — are not supported, so a customer's LLM
-  checkpoint cannot run yet. Tasks for models a node has not loaded fall back to
-  the manual claim → submit result flow and are **not** verified by the chain.
+  checkpoint cannot run yet. A Q16.16 attention kernel exists as a prototype
+  (`crates/runtime/src/attention.rs`) but is not wired into model loading. Tasks
+  for models a node has not loaded fall back to the manual claim → submit result
+  flow and are **not** verified by the chain.
 - **Not ZK-proven.** The attention/matmul dispute path still falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like. With consensus
   re-execution, verification is recomputation; the dispute game is test-only
@@ -65,6 +67,10 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   `VNN_SYNC_URLS`; a very long chain takes proportionally longer to join.
 - **Auth is gateway-local.** API keys are address-bound and enforce a daily
   quota, but quotas are billing/abuse control, not a consensus rule.
+- **Input privacy is validator-confidential, not operator-blind.** Inputs are
+  encrypted to a network key; API/block readers see ciphertext, but every
+  validator (including the operator) can decrypt. Pre-encryption tasks are
+  public. See [`docs/privacy.md`](privacy.md).
 
 ## API
 
@@ -73,6 +79,7 @@ Base URL is the node's RPC port (default `:7100`).
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/v1/models` | models this node can execute, with `weightsHash` and parameter count |
+| `GET` | `/v1/input-key` | network X25519 key for encrypted inputs |
 | `POST` | `/v1/infer` | submit a signed inference tx (same body as `/tx`); returns `txId` + `taskId` |
 | `GET` | `/v1/tasks/:taskId` | task state, output, and the receipt once anchored |
 | `GET` | `/v1/verify/:taskId` | recompute and compare; returns `verified`, both hashes, the output and the receipt |

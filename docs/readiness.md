@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (76 tests) |
+| Test suite | green | `cargo test --workspace --locked` (89 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -33,6 +33,11 @@ claims a technical buyer will test in the first diligence call.
 | Operator model set | works | `models/acme-support-v1.graph.json`, executed on 2 nodes |
 | ONNX classifier import | works | `verinoo-onnx`, parity vs f32, 10 tests |
 | GGUF classifier import | works (experimental) | `verinoo-gguf`, Q4/Q5/Q8 + Q2_K–Q6_K dequant, 15 tests |
+| Input encryption | works (validator-confidential) | X25519 + HKDF + ChaCha20-Poly1305; task/block redaction; `docs/privacy.md` |
+| SDKs | works | `sdk/typescript` (8 tests), `sdk/python` (8 tests), live-tested against an encrypted node |
+| Block-time override | works | `VNN_BLOCK_TIME_MS=1000` gives ~1–2 s task latency; network-wide setting |
+| Attention kernel | prototype | Q16.16 single/multi-head, 6 tests; not wired into model loading (`docs/transformer.md`) |
+| BFT finality | design only | `docs/adr/004-bft-finality.md`; no code |
 | Result commitment | works | state root covers every executed output |
 | Receipts + verification | works | `/v1/verify` recompute, live 2-node run |
 | Metering | works | `/v1/usage`, CSV export |
@@ -113,6 +118,18 @@ claims a technical buyer will test in the first diligence call.
   [`docs/operations.md`](operations.md) covers restore, API-key rotation,
   validator-key rotation, a catch-up replica/HA recipe, monitoring and
   incident response.
+- Input encryption (`verinoo-crypto`): X25519 + HKDF-SHA256 + ChaCha20-Poly1305,
+  network-key decryption at execution, ciphertext in blocks/state, redacted
+  task responses, `VNN_INPUT_KEY` / `VNN_REQUIRE_ENCRYPTED_INPUT`, and a
+  documented threat model in [`docs/privacy.md`](privacy.md).
+- TypeScript and Python SDKs with canonical JSON, Ed25519 signing, input
+  encryption, faucet, task polling and verification; both live-tested against
+  an encrypted node.
+- `VNN_BLOCK_TIME_MS` lets a pilot run 1 s blocks (single validator) for ~1–2 s
+  task latency; every validator must use the same value.
+- A deterministic Q16.16 attention kernel prototype (`crates/runtime/src/attention.rs`)
+  and a transformer roadmap (`docs/transformer.md`). Not wired into consensus.
+- A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
 
 ## Verified end-to-end (2-node product run)
 
@@ -238,3 +255,8 @@ domain still belong to the older reference node.
   committed model set execute deterministically; ONNX and GGUF classifiers
   convert, but there is no transformer runtime.
 - "ZK-proven" — attention disputes fall back to hash equality.
+- "Inputs are private from the operator" — inputs are encrypted to the
+  validator set; every validator, including the operator, can decrypt. Pre-
+  encryption tasks remain public.
+- "Transformer support" or "BFT" — the attention kernel is a prototype and the
+  finality design is not implemented.

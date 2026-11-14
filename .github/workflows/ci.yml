@@ -16,3 +16,8 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
+      - name: SDK tests
+        run: |
+          cd sdk/typescript && node --test
+          python3 -m pip install --quiet cryptography pytest
+          cd ../python && python3 -m pytest -q

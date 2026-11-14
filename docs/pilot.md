@@ -79,7 +79,9 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
   election with one producer signature per block; no BFT, no finality gadget,
   no equivocation slashing in the live path.
 - **Not an LLM host.** Only dense / relu / softmax classifiers over the
-  hashed-unigram featuriser execute. Attention, convolutions, arbitrary
+  hashed-unigram featuriser execute. A deterministic Q16.16 attention kernel
+  exists as a prototype (`crates/runtime/src/attention.rs`) but is not wired
+  into model loading or consensus. Attention, convolutions, arbitrary
   tokenizers and sampling are not supported, so a Llama-class checkpoint cannot
   run yet.
 - **Not ZK-proven.** The attention/matmul dispute path falls back to hash
@@ -88,8 +90,13 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
   `VNN_SYNC_URLS`; there is no state snapshot transfer yet, so a very long
   chain takes proportionally longer to join.
 - **Auth is gateway-local.** API keys are address-bound and enforce a daily
-  quota, but quotas are billing/abuse control, not a consensus rule. The public
-  demo runs without keys; paid deployments enable `VNN_API_KEYS_FILE`.
+  quota, but quotas are billing/abuse control, not a consensus rule. Keys are
+  issued by the operator (`verinoo-node apikey`); there is no public signup yet.
+  The public demo runs without keys; paid deployments enable `VNN_API_KEYS_FILE`.
+- **Input privacy is validator-confidential, not operator-blind.** Inputs are
+  encrypted to a network X25519 key, so API/block readers see only ciphertext
+  (`docs/privacy.md`). Every validator, including the operator, can decrypt.
+  Pre-encryption tasks remain public; start a fresh chain for a pilot.
 
 ## Wire in your own classifier
 
@@ -126,17 +133,19 @@ model returned.
 
 ## Known engineering gaps before self-serve
 
-1. Transformer/attention runtime; today only dense/relu/softmax classifiers
-   run (4–8 weeks).
-2. Byzantine finality (4–6 weeks) or continued honest "operator-attested with
-   economic recourse" framing.
-3. Automatic HA/failover and on-chain validator removal (2–3 weeks). Manual
+1. Transformer runtime. The Q16.16 attention kernel is a prototype; embeddings,
+   tokenizer, layernorm, FFN, KV cache, sampling and model loading are not
+   implemented (`docs/transformer.md`). 4–8 weeks.
+2. Byzantine finality. `docs/adr/004-bft-finality.md` is a design only; no
+   prevote/precommit, certificate or slashing code exists. 5.5–7 weeks.
+3. Self-serve key signup; keys are issued manually today.
+4. Automatic HA/failover and on-chain validator removal (2–3 weeks). Manual
    replica promotion and coordinated key rotation are documented in
    [`docs/operations.md`](operations.md).
-4. State snapshot transfer for fast joins (1–2 weeks).
-5. Dispute games for a real model; the deterministic path verifies by
+5. State snapshot transfer for fast joins (1–2 weeks).
+6. Dispute games for a real model; the deterministic path verifies by
    recomputation, so there is currently nothing to dispute.
 
-API keys, quotas, catch-up sync, backups, restore, API-key rotation and an
-incident runbook now exist. Nothing in the list above blocks a design-partner
-pilot against a classifier.
+API keys, quotas, SDKs (TypeScript + Python), input encryption, catch-up sync,
+backups, restore, API-key rotation and an incident runbook now exist. Nothing
+in the list above blocks a design-partner pilot against a classifier.

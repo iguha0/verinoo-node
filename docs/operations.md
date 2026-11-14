@@ -79,6 +79,42 @@ systemctl kill -s HUP verinoo-node
 `--quota 0` means unlimited. Quotas are gateway-local and reset per UTC day.
 They are a billing/abuse control, not a consensus rule.
 
+## Input encryption key
+
+Inputs are encrypted to one network X25519 key so blocks and API responses carry
+ciphertext. The key is validator-confidential, not operator-blind.
+
+```bash
+openssl rand -hex 32          # write to VNN_INPUT_KEY on every validator
+curl -fsS localhost:7100/v1/input-key
+```
+
+- Back up the key with the database. Without it, encrypted tasks cannot be
+  re-executed or verified.
+- Add `VNN_REQUIRE_ENCRYPTED_INPUT=true` to reject plaintext submissions on a
+  paid deployment.
+- Rotate only after draining pending encrypted tasks, then restart every
+  validator with the new key. There is no online rotation or re-encryption.
+- Pre-encryption tasks and blocks remain plaintext permanently.
+
+Full threat model: [`docs/privacy.md`](privacy.md).
+
+## Block time and latency
+
+`VNN_BLOCK_TIME_MS` overrides the chain's default interval and must be identical
+on every validator. A single-validator demo at `1000` gives roughly 1–2 s task
+latency; the two- and multi-validator safety story is unchanged (still
+round-robin, no BFT). Changing it does not change state.
+
+## SDKs
+
+- `sdk/typescript` — zero-dependency Node >= 20 client.
+- `sdk/python` — `cryptography` + stdlib client.
+
+Both build canonical transactions, sign with Ed25519, encrypt inputs to
+`/v1/input-key`, and poll/verify tasks. Use them instead of hand-rolling the
+canonical JSON.
+
 ## Validator key rotation (coordinated)
 
 There is no live validator-set governance yet. `VNN_VALIDATORS` is seeded into
