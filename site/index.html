@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Verinoo. Prove what your model returned.</title>
+<meta name="description" content="Verinoo runs inference during block application and commits a receipt any third party can verify. A Rust testnet for verifiable classifiers.">
+<meta property="og:title" content="Verinoo. Prove what your model returned.">
+<meta property="og:description" content="Inference runs during block application. Every node re-executes it and commits a receipt any third party can check.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://verinoo.com/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='2' fill='%231f6a4d'/%3E%3Cpath d='M9 16.5l4.5 4.5L23 11.5' fill='none' stroke='%23f6f5f0' stroke-width='2.4'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #edece7;
+    --surface: #f6f5f0;
+    --ink: #151816;
+    --muted: #5b625d;
+    --faint: #626963;
+    --line: #cfcdc3;
+    --line-strong: #b6b4a8;
+    --accent: #1f6a4d;
+    --accent-soft: #d9e8df;
+    --accent-ink: #f6f5f0;
+    --receipt-bg: #141816;
+    --receipt-ink: #e9e7e0;
+    --receipt-muted: #9aa39d;
+    --receipt-line: #2b3230;
+    --receipt-accent: #6fbf94;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --max: 1240px;
+    --pad: clamp(20px, 4vw, 48px);
+    --radius: 2px;
+    --ease: cubic-bezier(.16, 1, .3, 1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111413;
+      --surface: #171b19;
+      --ink: #ecebe5;
+      --muted: #9aa39d;
+      --faint: #8b948e;
+      --line: #2b3230;
+      --line-strong: #3a423e;
+      --accent: #6fbf94;
+      --accent-soft: #1b2a23;
+      --accent-ink: #0e1411;
+      --receipt-bg: #0b0e0d;
+      --receipt-ink: #ecebe5;
+      --receipt-muted: #8f9892;
+      --receipt-line: #252c29;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  html, body { max-width: 100%; overflow-x: hidden; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    pointer-events: none;
+    opacity: .026;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E");
+  }
+  ::selection { background: var(--accent-soft); color: var(--ink); }
+  a { color: inherit; text-decoration: none; }
+  button, input { font: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .skip {
+    position: absolute; left: -9999px; top: 8px; z-index: 100;
+    background: var(--ink); color: var(--bg); padding: 10px 14px;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .skip:focus { left: 12px; }
+  .wrap { width: 100%; max-width: var(--max); margin: 0 auto; padding-inline: var(--pad); }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* nav */
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    height: 64px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .nav-inner { height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+  .wordmark { font-family: var(--serif); font-size: 22px; letter-spacing: -.03em; line-height: 1; }
+  .wordmark span { color: var(--accent); }
+  .nav-links { display: flex; align-items: center; gap: 26px; font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .nav-links a:hover { color: var(--ink); }
+  .nav-cta {
+    font-family: var(--mono); font-size: 12px; color: var(--ink);
+    border-bottom: 1px solid var(--line-strong); padding-bottom: 2px; white-space: nowrap;
+  }
+  .nav-cta:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* hero */
+  .hero { position: relative; border-bottom: 1px solid var(--line); overflow: hidden; }
+  .hero::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px);
+    background-size: 100% 36px;
+    opacity: .28;
+    -webkit-mask-image: linear-gradient(to bottom, #000 0%, transparent 78%);
+    mask-image: linear-gradient(to bottom, #000 0%, transparent 78%);
+  }
+  .hero-inner {
+    position: relative; z-index: 1;
+    display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: clamp(32px, 5vw, 72px);
+    align-items: start;
+    min-height: min(760px, calc(100dvh - 64px));
+    padding-block: clamp(56px, 8vh, 96px);
+  }
+  .hero-copy { max-width: 720px; }
+  .eyebrow {
+    display: flex; align-items: center; gap: 10px;
+    margin: 0 0 22px;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .15em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .eyebrow::before { content: ""; width: 26px; height: 1px; background: var(--accent); }
+  h1 {
+    margin: 0;
+    font-family: var(--serif); font-weight: 500;
+    font-size: clamp(42px, 5.6vw, 76px); line-height: .99; letter-spacing: -.035em;
+    text-wrap: balance;
+  }
+  .lede {
+    margin: 24px 0 0; max-width: 46ch;
+    font-size: clamp(17px, 1.45vw, 20px); line-height: 1.52; color: var(--muted);
+    text-wrap: pretty;
+  }
+  .cta-row { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin-top: 32px; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px; padding: 0 20px;
+    border: 1px solid var(--accent); border-radius: var(--radius);
+    background: var(--accent); color: var(--accent-ink);
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: .01em;
+    cursor: pointer;
+    transition: transform .2s var(--ease), background .2s var(--ease), border-color .2s var(--ease);
+  }
+  .btn:hover { background: color-mix(in srgb, var(--accent) 86%, #000); border-color: color-mix(in srgb, var(--accent) 86%, #000); }
+  .btn:active { transform: translateY(1px); }
+  .btn[disabled] { opacity: .65; cursor: progress; }
+  .link {
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+    border-bottom: 1px solid var(--line-strong); padding-bottom: 2px;
+    transition: color .2s var(--ease), border-color .2s var(--ease);
+  }
+  .link:hover { color: var(--accent); border-color: var(--accent); }
+  .hero-note { margin: 28px 0 0; font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+  .hero-note a { border-bottom: 1px solid var(--line-strong); }
+  .hero-note a:hover { color: var(--ink); }
+
+  /* receipt */
+  .receipt {
+    position: relative;
+    background: var(--receipt-bg); color: var(--receipt-ink);
+    border: 1px solid var(--receipt-line); border-radius: var(--radius);
+    padding: 22px;
+    font-family: var(--mono); font-size: 11.5px;
+    box-shadow: 0 24px 80px rgba(10, 14, 12, .16);
+  }
+  .receipt::before {
+    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 1px;
+    background: repeating-linear-gradient(90deg, var(--receipt-line) 0 6px, transparent 6px 12px);
+  }
+  .receipt-head {
+    display: flex; align-items: center; gap: 9px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--receipt-line);
+    font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--receipt-muted);
+  }
+  .receipt-head .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--receipt-accent);
+    box-shadow: 0 0 0 3px rgba(111, 191, 148, .16);
+  }
+  .receipt-head .right { margin-left: auto; letter-spacing: .04em; text-transform: none; }
+  .receipt dl { margin: 16px 0 0; display: grid; gap: 10px; }
+  .receipt .row { display: flex; justify-content: space-between; gap: 18px; line-height: 1.4; }
+  .receipt dt { color: var(--receipt-muted); flex: none; }
+  .receipt dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+  .receipt dd .ok { color: var(--receipt-accent); }
+  .receipt-foot {
+    margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--receipt-line);
+    display: flex; justify-content: space-between; gap: 12px;
+    font-size: 10.5px; color: var(--receipt-muted);
+  }
+
+  /* sections */
+  .band { border-bottom: 1px solid var(--line); }
+  .band-inner { padding-block: clamp(64px, 9vw, 112px); }
+  h2 {
+    margin: 0;
+    font-family: var(--serif); font-weight: 500;
+    font-size: clamp(32px, 4vw, 52px); line-height: 1.05; letter-spacing: -.03em;
+    text-wrap: balance; max-width: 22ch;
+  }
+  .section-sub {
+    margin: 18px 0 0; max-width: 62ch;
+    font-size: 17px; line-height: 1.58; color: var(--muted);
+    text-wrap: pretty;
+  }
+  h3 { margin: 0; font-size: 19px; line-height: 1.3; letter-spacing: -.012em; }
+
+  /* problem */
+  .ledger { margin-top: 56px; border-top: 1px solid var(--line); }
+  .ledger-row {
+    display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 24px;
+    padding: 26px 0; border-bottom: 1px solid var(--line);
+  }
+  .num { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; color: var(--accent); padding-top: 4px; }
+  .ledger-row p { margin: 8px 0 0; max-width: 64ch; color: var(--muted); line-height: 1.55; }
+
+  /* how */
+  .steps {
+    list-style: none; margin: 56px 0 0; padding: 0;
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+  }
+  .step { padding: 24px 24px 0 0; border-right: 1px solid var(--line); min-width: 0; }
+  .step + .step { padding-left: 24px; }
+  .step:last-child { border-right: 0; padding-right: 0; }
+  .step-num { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+  .step h3 { margin-top: 18px; }
+  .step p { margin: 8px 0 0; color: var(--muted); font-size: 14.5px; line-height: 1.55; }
+  .step code {
+    display: inline-block; margin-top: 16px;
+    padding: 4px 8px; border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--surface); color: var(--ink);
+    font-family: var(--mono); font-size: 10.5px; overflow-wrap: anywhere;
+  }
+
+  /* proof */
+  .proof-grid {
+    display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr);
+    gap: clamp(32px, 5vw, 72px); align-items: start;
+  }
+  .verify-form { margin-top: 32px; }
+  .verify-form label { display: block; font-family: var(--mono); font-size: 11px; letter-spacing: .06em; color: var(--muted); }
+  .input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; margin-top: 10px; }
+  .input-row input {
+    width: 100%; min-width: 0; height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--line-strong); border-radius: var(--radius);
+    background: var(--surface); color: var(--ink);
+    font-family: var(--mono); font-size: 12.5px;
+  }
+  .input-row input::placeholder { color: var(--faint); }
+  .helper { margin: 8px 0 0; font-size: 12.5px; color: var(--faint); }
+  .result {
+    margin-top: 24px; min-height: 150px;
+    padding: 18px;
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--surface);
+  }
+  .result-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .result-status { display: inline-flex; align-items: center; gap: 8px; }
+  .result-status::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint);
+  }
+  .result-status.ok { color: var(--accent); }
+  .result-status.ok::before { background: var(--accent); }
+  .result-status.bad { color: var(--ink); }
+  .result-status.bad::before { background: var(--ink); }
+  .result-grid { margin: 16px 0 0; display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
+  .result-grid div { min-width: 0; }
+  .result-grid dt { font-family: var(--mono); font-size: 10px; letter-spacing: .06em; color: var(--muted); }
+  .result-grid dd { margin: 3px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+  .result-note { margin: 16px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+  .skeleton { height: 12px; width: 68%; margin-top: 16px; border-radius: 1px; background: linear-gradient(90deg, var(--line) 25%, var(--surface) 50%, var(--line) 75%); background-size: 200% 100%; animation: shimmer 1.2s linear infinite; }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+  details { margin-top: 18px; }
+  summary { cursor: pointer; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  summary:hover { color: var(--ink); }
+  pre {
+    margin: 12px 0 0; padding: 14px; overflow-x: auto;
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--surface); color: var(--ink);
+    font-family: var(--mono); font-size: 11px; line-height: 1.6;
+  }
+  .field-grid { margin-top: 28px; display: grid; grid-template-columns: 1fr 1fr; gap: 0 28px; }
+  .field { padding: 12px 0; border-top: 1px solid var(--line); min-width: 0; }
+  .field dt { font-family: var(--mono); font-size: 10px; letter-spacing: .07em; color: var(--muted); }
+  .field dd { margin: 4px 0 0; font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+  .field-note { margin: 20px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+  .live-meta { margin-top: 18px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); overflow-wrap: anywhere; }
+
+  /* limits */
+  .limits-grid { display: grid; grid-template-columns: 1fr 1fr; gap: clamp(32px, 5vw, 72px); margin-top: 48px; }
+  .limits-grid h3 { font-size: 16px; font-weight: 600; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+  .limits-grid ul { list-style: none; margin: 0; padding: 0; }
+  .limits-grid li {
+    display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 16px;
+    padding: 14px 0; border-bottom: 1px solid var(--line);
+    font-size: 14.5px; line-height: 1.5;
+  }
+  .tag { font-family: var(--mono); font-size: 10px; letter-spacing: .04em; padding-top: 2px; }
+  .tag.live { color: var(--accent); }
+  .tag.not { color: var(--faint); }
+
+  /* cases */
+  .cases {
+    margin-top: 48px;
+    display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr);
+    border-top: 1px solid var(--line);
+  }
+  .case { padding: 32px 32px 32px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+  .case:nth-child(2n) { padding-left: 32px; border-left: 1px solid var(--line); }
+  .case-a { grid-row: span 2; padding-right: 40px; }
+  .case-label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .03em; color: var(--accent); }
+  .case h3 { margin-top: 14px; font-family: var(--serif); font-size: clamp(24px, 2.6vw, 32px); font-weight: 500; line-height: 1.12; letter-spacing: -.02em; text-wrap: balance; }
+  .case p { margin: 12px 0 0; max-width: 48ch; color: var(--muted); font-size: 15px; line-height: 1.55; }
+  .case-a p { max-width: 34ch; }
+  .mini-receipt {
+    margin: 24px 0 0; padding-top: 14px; border-top: 1px solid var(--line);
+    display: grid; gap: 8px;
+    font-family: var(--mono); font-size: 10.5px;
+  }
+  .mini-receipt div { display: flex; justify-content: space-between; gap: 16px; }
+  .mini-receipt dt { color: var(--muted); }
+  .mini-receipt dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+  .case-wide { grid-column: 1 / -1; padding-left: 0; border-left: 0; }
+  .case-wide p { max-width: 72ch; }
+
+  /* pilot */
+  .pilot-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: clamp(32px, 6vw, 96px); align-items: start; }
+  .pilot-panel { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--surface); padding: 28px; }
+  .price { margin: 0; font-family: var(--serif); font-size: clamp(38px, 4.4vw, 52px); line-height: 1; letter-spacing: -.035em; }
+  .price span { font-family: var(--mono); font-size: 11.5px; letter-spacing: 0; color: var(--muted); }
+  .pilot-panel ul { list-style: none; margin: 24px 0 0; padding: 0; }
+  .pilot-panel li { padding: 11px 0; border-top: 1px solid var(--line); font-size: 14px; line-height: 1.45; color: var(--muted); }
+  .pilot-panel .btn { width: 100%; margin-top: 24px; }
+  .pilot-note { margin: 14px 0 0; font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--faint); }
+
+  /* footer */
+  footer { padding: 40px 0 56px; }
+  .footer-inner { display: flex; justify-content: space-between; align-items: flex-start; gap: 32px; flex-wrap: wrap; }
+  .footer-brand p { margin: 10px 0 0; max-width: 34ch; font-size: 13.5px; line-height: 1.5; color: var(--muted); }
+  .footer-links { display: flex; gap: 22px; flex-wrap: wrap; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .footer-links a:hover { color: var(--ink); }
+  .footer-bottom {
+    margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--line);
+    display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  }
+
+  /* reveal */
+  .js .reveal { opacity: 0; transform: translateY(14px); transition: opacity .7s var(--ease), transform .7s var(--ease); transition-delay: calc(var(--i, 0) * 70ms); }
+  .js .reveal.in { opacity: 1; transform: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .js .reveal { opacity: 1; transform: none; transition: none; }
+    .skeleton { animation: none; }
+    * { transition-duration: .01ms !important; }
+  }
+
+  @media (max-width: 980px) {
+    .hero-inner { grid-template-columns: 1fr; min-height: auto; padding-block: 64px; align-items: start; }
+    .receipt { max-width: 560px; }
+    .steps { grid-template-columns: 1fr 1fr; }
+    .step { padding-right: 24px; padding-bottom: 28px; }
+    .step:nth-child(2n) { border-right: 0; padding-right: 0; }
+    .step:nth-child(2n + 1) { padding-left: 0; }
+    .step:nth-child(n + 3) { border-top: 1px solid var(--line); padding-top: 24px; }
+    .proof-grid { grid-template-columns: 1fr; }
+    .pilot-grid { grid-template-columns: 1fr; }
+    .pilot-panel { max-width: 520px; }
+  }
+  @media (max-width: 760px) {
+    .nav-links a:not(.nav-cta) { display: none; }
+    .hero-inner { padding-block: 48px; }
+    h1 { font-size: clamp(40px, 11vw, 58px); }
+    .ledger-row { grid-template-columns: 42px minmax(0, 1fr); gap: 14px; }
+    .steps { grid-template-columns: 1fr; }
+    .step, .step + .step { padding: 22px 0; border-right: 0; border-top: 1px solid var(--line); }
+    .step:first-child { border-top: 0; }
+    .limits-grid { grid-template-columns: 1fr; }
+    .cases { grid-template-columns: 1fr; }
+    .case, .case:nth-child(2n) { padding: 26px 0; border-left: 0; }
+    .case-a { grid-row: auto; }
+    .case-wide { grid-column: auto; }
+    .result-grid { grid-template-columns: 1fr; }
+    .field-grid { grid-template-columns: 1fr; }
+    .footer-inner { flex-direction: column; }
+  }
+  @media (max-width: 540px) {
+    .input-row { grid-template-columns: 1fr; }
+    .input-row .btn { width: 100%; }
+    .receipt { padding: 18px; }
+    .receipt .row { gap: 12px; }
+    .cta-row { align-items: flex-start; flex-direction: column; gap: 16px; }
+  }
+</style>
+<script>document.documentElement.classList.add('js');</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav aria-label="Main">
+  <div class="wrap nav-inner">
+    <a class="wordmark" href="/" aria-label="Verinoo home">verinoo<span>.</span></a>
+    <div class="nav-links">
+      <a href="#how">How it works</a>
+      <a href="#verify">Live proof</a>
+      <a href="#limits">Limits</a>
+      <a href="#cases">Use cases</a>
+      <a class="nav-cta" href="https://github.com/iguha0/verinoo-node/issues/new?title=Design%20partner%20pilot">Request a pilot</a>
+    </div>
+  </div>
+</nav>
+
+<main id="main">
+
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap hero-inner">
+      <div class="hero-copy">
+        <p class="eyebrow reveal">Verifiable inference / testnet</p>
+        <h1 id="hero-title" class="reveal" style="--i:1">Prove what your model returned.</h1>
+        <p class="lede reveal" style="--i:2">Inference runs during block application. Every node re-executes it and commits a receipt any third party can check.</p>
+        <div class="cta-row reveal" style="--i:3">
+          <a class="btn" href="#verify">Verify a receipt</a>
+          <a class="link" href="https://github.com/iguha0/verinoo-node/blob/main/docs/pilot.md">Read the pilot brief <span aria-hidden="true">→</span></a>
+        </div>
+        <p class="hero-note reveal" style="--i:4">Live testnet. Dense classifiers only. No BFT. <a href="#limits">Read the limits</a>.</p>
+      </div>
+
+      <aside class="receipt reveal" style="--i:2" aria-label="Example receipt from the live testnet">
+        <div class="receipt-head">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="hero-status" style="color:var(--receipt-accent)">Verified</span>
+          <span class="right" id="hero-height">height 14,040</span>
+        </div>
+        <dl>
+          <div class="row"><dt>task</dt><dd>06bef12e6e59d917b5d411063463c41a</dd></div>
+          <div class="row"><dt>model</dt><dd>intent-classifier-v1</dd></div>
+          <div class="row"><dt>output</dt><dd class="ok">shipping</dd></div>
+          <div class="row"><dt>weights</dt><dd title="b05ee3db61cae8602016bcafb3c1a99da12c2506f878d573b78808ae2788d467">b05ee3db61cae860…</dd></div>
+          <div class="row"><dt>input</dt><dd>encrypted</dd></div>
+          <div class="row"><dt>block</dt><dd id="hero-block" title="b970d27ef4bf21bc0b531e6e2f0211fc0266fceacf90fb53d9c19df1a3970dad">b970d27ef4bf21bc…</dd></div>
+          <div class="row"><dt>validator</dt><dd id="hero-validator" title="ai_6fd864e347f655827362931a18a18eeee615bf44">ai_6fd864e347f6…</dd></div>
+        </dl>
+        <div class="receipt-foot">
+          <span>ed25519 signature over block</span>
+          <span>GET /v1/verify</span>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="band" id="problem" aria-labelledby="problem-title">
+    <div class="wrap band-inner">
+      <h2 id="problem-title" class="reveal">A log is not a receipt.</h2>
+      <p class="section-sub reveal" style="--i:1">A database row can be edited. It does not prove the input, the weights, or the computation that produced an answer.</p>
+      <div class="ledger">
+        <div class="ledger-row reveal"><span class="num">01</span><div><h3>Logs are not evidence.</h3><p>An operator can change a row, redeploy a model, or lose the original request. The answer survives; the proof does not.</p></div></div>
+        <div class="ledger-row reveal" style="--i:1"><span class="num">02</span><div><h3>Weights drift silently.</h3><p>A retrain changes every answer. Without a weights hash, you cannot say which parameters produced the output an auditor is asking about.</p></div></div>
+        <div class="ledger-row reveal" style="--i:2"><span class="num">03</span><div><h3>Disputes have no artifact.</h3><p>When a customer or regulator challenges a decision, a screenshot is not enough. You need a result that can be recomputed independently.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="how" aria-labelledby="how-title">
+    <div class="wrap band-inner">
+      <h2 id="how-title" class="reveal">The block is the proof.</h2>
+      <p class="section-sub reveal" style="--i:1">The model runs inside state transition, in integer arithmetic, on every node. The output is consensus state, not a claim attached to a response.</p>
+      <ol class="steps">
+        <li class="step reveal"><span class="step-num">01</span><h3>Encrypt the input</h3><p>The client encrypts to the validator network key. Blocks and APIs carry ciphertext, not the request.</p><code>X25519 + ChaCha20-Poly1305</code></li>
+        <li class="step reveal" style="--i:1"><span class="step-num">02</span><h3>Submit a transaction</h3><p>A signed request enters the mempool. The transaction commits to the input and the exact model id.</p><code>POST /v1/infer</code></li>
+        <li class="step reveal" style="--i:2"><span class="step-num">03</span><h3>Re-execute on every node</h3><p>During block application, every node runs the same Q16.16 forward pass and derives the same bytes.</p><code>apply_block → resultHash</code></li>
+        <li class="step reveal" style="--i:3"><span class="step-num">04</span><h3>Anchor the receipt</h3><p>The block signature binds the result, the weights hash and the input commitment. Anyone can recompute it.</p><code>GET /v1/verify/:id</code></li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="band" id="verify" aria-labelledby="verify-title">
+    <div class="wrap band-inner">
+      <div class="proof-grid">
+        <div>
+          <h2 id="verify-title" class="reveal">Check a receipt yourself.</h2>
+          <p class="section-sub reveal" style="--i:1">Paste a task id. A node recomputes the model and compares the result with the value committed in the block.</p>
+          <form id="verify-form" class="verify-form reveal" style="--i:2">
+            <label for="task-id">Task id</label>
+            <div class="input-row">
+              <input id="task-id" name="task-id" type="text" value="06bef12e6e59d917b5d411063463c41a" autocomplete="off" spellcheck="false" maxlength="80" aria-describedby="task-help">
+              <button class="btn" type="submit" id="verify-button">Verify</button>
+            </div>
+            <p class="helper" id="task-help">The example is a real receipt from the live testnet.</p>
+          </form>
+          <noscript><p class="helper">The in-page verifier needs JavaScript. The curl command below works without it.</p></noscript>
+          <div id="verify-result" class="result reveal" style="--i:3" aria-live="polite">
+            <div class="result-head"><span class="result-status ok">Verified</span><span class="mono">06bef12e6e59…</span></div>
+            <dl class="result-grid">
+              <div><dt>Model</dt><dd>intent-classifier-v1</dd></div>
+              <div><dt>Output</dt><dd>shipping</dd></div>
+              <div><dt>On-chain hash</dt><dd class="mono">2b22e4f6c8a1b7ef…</dd></div>
+              <div><dt>Recomputed</dt><dd class="mono">2b22e4f6c8a1b7ef…</dd></div>
+              <div><dt>Block</dt><dd class="mono">#14,040</dd></div>
+              <div><dt>Validator</dt><dd class="mono">ai_6fd864e347f6…</dd></div>
+            </dl>
+            <p class="result-note">The node re-ran the model and matched the value committed in the block.</p>
+          </div>
+          <details class="reveal" style="--i:4">
+            <summary>Verify from the command line</summary>
+            <pre>curl -s https://verinoo.com/v1/verify/06bef12e6e59d917b5d411063463c41a \
+  | jq '{verified, output, receipt}'</pre>
+          </details>
+        </div>
+
+        <aside aria-labelledby="fields-title">
+          <h3 id="fields-title" class="reveal" style="font-family:var(--serif);font-size:22px;font-weight:500;letter-spacing:-.02em;color:var(--ink);">The receipt binds</h3>
+          <dl class="field-grid reveal" style="--i:1">
+            <div class="field"><dt>taskId</dt><dd>06bef12e6e59d917…</dd></div>
+            <div class="field"><dt>modelId</dt><dd>intent-classifier-v1</dd></div>
+            <div class="field"><dt>weightsHash</dt><dd>b05ee3db61cae860…</dd></div>
+            <div class="field"><dt>inputHash</dt><dd>c0bad63fcdd0685a…</dd></div>
+            <div class="field"><dt>outputHash</dt><dd>2b22e4f6c8a1b7ef…</dd></div>
+            <div class="field"><dt>blockHash</dt><dd>b970d27ef4bf21bc…</dd></div>
+            <div class="field"><dt>validator</dt><dd>ai_6fd864e347f6…</dd></div>
+            <div class="field"><dt>signature</dt><dd>71a5818ef7aefedc…</dd></div>
+          </dl>
+          <p class="field-note reveal" style="--i:2">A receipt is JSON. Hand it to an auditor and they can run the same check on any node in the network.</p>
+          <p class="live-meta reveal" style="--i:3">Live model set <span id="model-count">2 models</span> / <span id="model-set">510eb42bc26754d3…</span></p>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="limits" aria-labelledby="limits-title">
+    <div class="wrap band-inner">
+      <h2 id="limits-title" class="reveal">What is live. What is not.</h2>
+      <p class="section-sub reveal" style="--i:1">The honest version, because a technical buyer will test it in the first call.</p>
+      <div class="limits-grid">
+        <div class="reveal">
+          <h3>Live today</h3>
+          <ul>
+            <li><span class="tag live">live</span><span>Consensus re-execution of dense, relu and softmax classifiers</span></li>
+            <li><span class="tag live">live</span><span>ONNX and GGUF import, including Q2_K to Q6_K</span></li>
+            <li><span class="tag live">live</span><span>Encrypted inputs, receipts and <span class="mono">/v1/verify</span></span></li>
+            <li><span class="tag live">live</span><span>API keys, quotas, metering and CSV export</span></li>
+            <li><span class="tag live">live</span><span>Catch-up sync, backups and TypeScript/Python SDKs</span></li>
+          </ul>
+        </div>
+        <div class="reveal" style="--i:1">
+          <h3>Not yet</h3>
+          <ul>
+            <li><span class="tag not">not yet</span><span>Transformer and LLM runtime. Attention is a prototype.</span></li>
+            <li><span class="tag not">not yet</span><span>BFT finality. Today the producer signature is the finality.</span></li>
+            <li><span class="tag not">not yet</span><span>ZK proofs. Verification is re-execution, not a succinct proof.</span></li>
+            <li><span class="tag not">not yet</span><span>Operator-blind privacy. Validators can decrypt inputs.</span></li>
+            <li><span class="tag not">not yet</span><span>Automatic HA, snapshot sync and token settlement.</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="cases" aria-labelledby="cases-title">
+    <div class="wrap band-inner">
+      <h2 id="cases-title" class="reveal">Where a receipt matters.</h2>
+      <p class="section-sub reveal" style="--i:1">When an answer has to survive an audit, a dispute, or a model change.</p>
+      <div class="cases">
+        <article class="case case-a reveal">
+          <p class="case-label">Support triage</p>
+          <h3>A ticket is routed to the wrong queue. Six months later, someone asks why.</h3>
+          <p>The receipt names the model, the weights, the input hash and the block. You can replay the decision instead of reconstructing it from logs.</p>
+          <dl class="mini-receipt" aria-label="Receipt fields">
+            <div><dt>model</dt><dd>intent-classifier-v1</dd></div>
+            <div><dt>weights</dt><dd>b05ee3db61cae860…</dd></div>
+            <div><dt>input</dt><dd>encrypted</dd></div>
+            <div><dt>block</dt><dd>#14,040</dd></div>
+          </dl>
+        </article>
+        <article class="case reveal" style="--i:1">
+          <p class="case-label">Claims intake</p>
+          <h3>Defend a classification months after the model has changed.</h3>
+          <p>The weights hash proves which parameters produced the answer.</p>
+        </article>
+        <article class="case reveal" style="--i:2">
+          <p class="case-label">Document review</p>
+          <h3>Show exactly which model version read the document.</h3>
+          <p>The model set hash and receipt are committed together.</p>
+        </article>
+        <article class="case case-wide reveal" style="--i:3">
+          <p class="case-label">Model change audit</p>
+          <h3>Tie every old answer to the parameters that produced it.</h3>
+          <p>A retrain changes the weights hash. Old answers stay tied to the parameters that produced them, so the change is visible, not silent.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="pilot" aria-labelledby="pilot-title">
+    <div class="wrap band-inner">
+      <div class="pilot-grid">
+        <div>
+          <h2 id="pilot-title" class="reveal">Bring one classifier.</h2>
+          <p class="section-sub reveal" style="--i:1">We wire it in, run a joint verification, and hand you a receipt you can defend. Eight weeks, one model, one workflow.</p>
+          <p class="section-sub reveal" style="--i:2; margin-top:16px;">Best fit: a dense classifier in support, claims, document review or risk. Not an LLM workload.</p>
+        </div>
+        <div class="pilot-panel reveal" style="--i:2">
+          <p class="price">$5,000 <span>/ 8 weeks</span></p>
+          <ul>
+            <li>Dedicated validator node and model set</li>
+            <li>Your ONNX or GGUF classifier wired in</li>
+            <li>Joint verification run and receipt walkthrough</li>
+            <li>Weekly sync and a written limits brief</li>
+          </ul>
+          <a class="btn" href="https://github.com/iguha0/verinoo-node/issues/new?title=Design%20partner%20pilot">Request a pilot</a>
+          <p class="pilot-note">Production usage is priced per verified task. Ask for a quote after the pilot.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <a class="wordmark" href="/">verinoo<span>.</span></a>
+        <p>Verifiable inference on a Rust testnet. Receipts, not logs.</p>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/iguha0/verinoo-node">GitHub</a>
+        <a href="/v1/models">Live API</a>
+        <a href="https://github.com/iguha0/verinoo-node/blob/main/docs/pilot.md">Pilot brief</a>
+        <a href="https://github.com/iguha0/verinoo-node/blob/main/docs/privacy.md">Privacy</a>
+        <a href="https://github.com/iguha0/verinoo-node/blob/main/docs/readiness.md">Readiness</a>
+        <a href="https://github.com/iguha0/verinoo-node/blob/main/LICENSE">AGPL-3.0</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>Testnet. Single validator. No SLA.</span>
+      <span>Read the limits.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const api = '';
+  const example = '06bef12e6e59d917b5d411063463c41a';
+  const $ = (s, r = document) => r.querySelector(s);
+  const short = (v, n = 10) => (v && v.length > n ? v.slice(0, n) + '…' : (v || ''));
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  // Scroll reveal, disabled when motion is reduced.
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduce && 'IntersectionObserver' in window) {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      }
+    }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+    document.querySelectorAll('.reveal').forEach((el, i) => {
+      if (!el.style.getPropertyValue('--i')) el.style.setProperty('--i', String(i % 4));
+      io.observe(el);
+    });
+  } else {
+    document.querySelectorAll('.reveal').forEach((el) => el.classList.add('in'));
+  }
+
+  // Live model set.
+  fetch(api + '/v1/models', { headers: { accept: 'application/json' } })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+    .then((d) => {
+      const set = $('#model-set');
+      const count = $('#model-count');
+      if (set && d.modelSetHash) set.textContent = short(d.modelSetHash, 16);
+      if (count && Array.isArray(d.models)) count.textContent = d.models.length + ' models';
+    })
+    .catch(() => {
+      const set = $('#model-set');
+      if (set) set.textContent = 'API unavailable';
+    });
+
+  // Refresh the example receipt from the live node.
+  fetch(api + '/v1/verify/' + example, { headers: { accept: 'application/json' } })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+    .then((d) => {
+      const status = $('#hero-status');
+      if (status) {
+        status.textContent = d.verified ? 'Verified' : 'Not verified';
+        status.style.color = d.verified ? 'var(--receipt-accent)' : 'var(--receipt-ink)';
+      }
+      if (d.receipt) {
+        const height = $('#hero-height');
+        if (height) height.textContent = 'height ' + Number(d.receipt.height).toLocaleString('en-US');
+        const block = $('#hero-block');
+        if (block) { block.textContent = short(d.receipt.blockHash, 16); block.title = d.receipt.blockHash || ''; }
+        const validator = $('#hero-validator');
+        if (validator) { validator.textContent = short(d.receipt.validator, 14); validator.title = d.receipt.validator || ''; }
+      }
+    })
+    .catch(() => {});
+
+  // Verify widget.
+  const form = $('#verify-form');
+  const input = $('#task-id');
+  const out = $('#verify-result');
+  const button = $('#verify-button');
+
+  const setLoading = () => {
+    if (button) { button.disabled = true; button.textContent = 'Verifying…'; }
+    if (out) out.innerHTML = '<div class="result-head"><span class="result-status">Checking</span><span class="mono">GET /v1/verify</span></div><div class="skeleton"></div>';
+  };
+  const restore = () => {
+    if (button) { button.disabled = false; button.textContent = 'Verify'; }
+  };
+  const renderError = (msg) => {
+    if (!out) return;
+    out.innerHTML = '<div class="result-head"><span class="result-status bad">Error</span><span class="mono">no receipt</span></div><p class="result-note">' + esc(msg) + '</p>';
+    restore();
+  };
+  const parseOutput = (raw) => {
+    if (!raw) return 'no output';
+    try {
+      const v = JSON.parse(raw);
+      if (v && v.label) return v.label + (Array.isArray(v.scores) ? ' (scores ' + v.scores.join(', ') + ')' : '');
+      return raw;
+    } catch { return raw; }
+  };
+  const renderResult = (d) => {
+    if (!out) return;
+    const ok = !!d.verified;
+    const r = d.receipt || {};
+    out.innerHTML = [
+      '<div class="result-head"><span class="result-status ' + (ok ? 'ok' : 'bad') + '">' + (ok ? 'Verified' : 'Not verified') + '</span><span class="mono">' + esc(short(d.taskId, 12)) + '</span></div>',
+      '<dl class="result-grid">',
+      '<div><dt>Model</dt><dd>' + esc(d.modelId || 'unknown') + '</dd></div>',
+      '<div><dt>Output</dt><dd>' + esc(parseOutput(d.output)) + '</dd></div>',
+      '<div><dt>On-chain hash</dt><dd class="mono" title="' + esc(d.onChainHash || '') + '">' + esc(short(d.onChainHash, 20)) + '</dd></div>',
+      '<div><dt>Recomputed</dt><dd class="mono" title="' + esc(d.recomputedHash || '') + '">' + esc(short(d.recomputedHash, 20)) + '</dd></div>',
+      '<div><dt>Block</dt><dd class="mono">' + (r.height ? '#' + Number(r.height).toLocaleString('en-US') : 'not anchored') + '</dd></div>',
+      '<div><dt>Validator</dt><dd class="mono" title="' + esc(r.validator || '') + '">' + esc(short(r.validator, 14)) + '</dd></div>',
+      '</dl>',
+      '<p class="result-note">' + (ok ? 'The node re-ran the model and matched the value committed in the block.' : 'The recomputed value did not match the committed value.') + '</p>',
+      d.reason ? '<p class="result-note">' + esc(d.reason) + '</p>' : ''
+    ].join('');
+    restore();
+  };
+
+  if (form && input) {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const id = input.value.trim();
+      if (!id) { renderError('Enter a task id.'); return; }
+      setLoading();
+      try {
+        const res = await fetch(api + '/v1/verify/' + encodeURIComponent(id), { headers: { accept: 'application/json' } });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          renderError(body.error || ('Verification failed (HTTP ' + res.status + ').'));
+          return;
+        }
+        renderResult(body);
+      } catch {
+        renderError('Could not reach the API. Try again.');
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>

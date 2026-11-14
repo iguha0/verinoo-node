@@ -8,3 +8,6 @@ docs/reddit-post-draft.md
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Local browser artifacts
+.playwright-mcp/
