@@ -310,7 +310,7 @@ impl Auth {
             return Ok(0);
         }
         let _guard = self.quota_lock.lock().expect("quota lock");
-        let key = quota_key(&caller.tenant, &caller.address, now_ms);
+        let key = quota_key(&caller.address, now_ms);
         let used = store.meta_u64_or(&key, 0);
         if used >= caller.daily_quota {
             return Err(AuthError::QuotaExceeded {
@@ -374,8 +374,10 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-pub fn quota_key(tenant: &str, address: &str, now_ms: u64) -> String {
-    format!("quota:{tenant}:{address}:{}", now_ms / QUOTA_DAY_MS)
+pub fn quota_key(address: &str, now_ms: u64) -> String {
+    // Per address, not per key: issuing a second key for the same address must
+    // not multiply its daily allowance.
+    format!("quota:{address}:{}", now_ms / QUOTA_DAY_MS)
 }
 
 // ============================== CLI ==============================

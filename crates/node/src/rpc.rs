@@ -33,6 +33,7 @@ pub async fn serve(
         .route("/tx", post(submit_tx))
         // ---- v1 product surface ----
         .route("/v1/models", get(v1_models))
+        .route("/v1/input-key", get(v1_input_key))
         .route("/v1/infer", post(submit_tx))
         .route("/v1/tasks/:task_id", get(v1_task))
         .route("/v1/verify/:task_id", get(v1_verify))
@@ -325,6 +326,11 @@ async fn submit_tx(
         if caller.address != tx.from {
             return Err(auth_error(AuthError::AddressMismatch));
         }
+        tracing::debug!(
+            tenant = %caller.tenant,
+            address = %caller.address,
+            "api key authorized"
+        );
         Some(caller)
     } else {
         None
@@ -345,6 +351,40 @@ async fn submit_tx(
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e })),
         ));
+    }
+
+    if tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference {
+        let has_encrypted = tx
+            .data
+            .data
+            .get("encryptedInput")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        let has_plain = tx
+            .data
+            .data
+            .get("input")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let bad = |msg: &str| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
+        };
+        if has_encrypted && has_plain {
+            return Err(bad("submit either input or encryptedInput, not both"));
+        }
+        // Commitment-only submissions are allowed for the manual-claim path.
+        if encrypted_input_required() && !has_encrypted {
+            return Err(bad(
+                "this node requires encrypted input; fetch /v1/input-key and send encryptedInput",
+            ));
+        }
+        if has_encrypted && verinoo_crypto::input_key().is_none() {
+            return Err(bad("this node has no input key configured"));
+        }
     }
 
     let mut mp = shared.mempool.lock().await;
@@ -399,6 +439,23 @@ async fn v1_models() -> Json<serde_json::Value> {
     }))
 }
 
+fn encrypted_input_required() -> bool {
+    std::env::var("VNN_REQUIRE_ENCRYPTED_INPUT")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
+/// Public key clients use to encrypt inference inputs. When `publicKey` is
+/// present, clients should send `encryptedInput` instead of plaintext `input`.
+async fn v1_input_key() -> Json<serde_json::Value> {
+    let key = verinoo_crypto::input_public_key_hex();
+    Json(serde_json::json!({
+        "publicKey": key,
+        "required": encrypted_input_required(),
+        "algorithm": verinoo_crypto::ALGORITHM,
+    }))
+}
+
 async fn v1_task(
     State(shared): State<Arc<Shared>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
@@ -408,8 +465,28 @@ async fn v1_task(
         .get_task(&task_id)
         .ok_or_else(|| not_found("task not found"))?;
     let receipt = verinoo_exec::engine::receipt_for(&shared.store, &task_id);
+    let input_commitment = task.input_commitment.clone();
+    let encrypted = task.encrypted_input.is_some();
+    let mut task_json = serde_json::to_value(&task).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    if let Some(obj) = task_json.as_object_mut() {
+        // Inputs and ciphertext are not part of the public task view. The
+        // commitment is enough to match a receipt; verification recomputes
+        // server-side.
+        obj.remove("input");
+        obj.remove("encryptedInput");
+        obj.insert(
+            "inputHash".into(),
+            serde_json::Value::String(input_commitment),
+        );
+        obj.insert("encrypted".into(), serde_json::Value::Bool(encrypted));
+    }
     Ok(Json(serde_json::json!({
-        "task": task,
+        "task": task_json,
         "receipt": receipt,
         "anchored": receipt.is_some(),
     })))
@@ -442,7 +519,19 @@ async fn v1_verify(
         })));
     }
 
-    let recomputed = model.result_json(&task.input);
+    let plaintext = match verinoo_exec::engine::plaintext_input(&task) {
+        Ok(text) => text,
+        Err(reason) => {
+            return Ok(Json(serde_json::json!({
+                "taskId": task_id,
+                "verified": false,
+                "reason": reason,
+                "modelId": model.model_id(),
+                "encrypted": task.encrypted_input.is_some(),
+            })))
+        }
+    };
+    let recomputed = model.result_json(&plaintext);
     let recomputed_hash = verinoo_model::sha256_hex(&recomputed);
     let on_chain = task.result_hash.clone().unwrap_or_default();
     let receipt = verinoo_exec::engine::receipt_for(&shared.store, &task_id);

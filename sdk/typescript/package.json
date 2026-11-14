@@ -1,0 +1,28 @@
+{
+  "name": "@verinoo/sdk",
+  "version": "0.1.0",
+  "description": "Verinoo TypeScript/Node client SDK (zero runtime dependencies)",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "verinoo",
+    "inference",
+    "ed25519",
+    "x25519",
+    "chacha20-poly1305"
+  ],
+  "license": "AGPL-3.0"
+}

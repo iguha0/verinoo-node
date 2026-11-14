@@ -295,3 +295,105 @@ fn runtime_results_are_part_of_the_state_root() {
         "same inputs and models must produce one root"
     );
 }
+
+fn install_test_input_key() -> String {
+    let key = verinoo_crypto::NetworkKey::from_secret([42u8; 32]);
+    let _ = verinoo_crypto::install_input_key(key);
+    verinoo_crypto::input_public_key_hex().expect("input key installed")
+}
+
+#[test]
+fn encrypted_input_is_executed_and_never_appears_in_the_block() {
+    let public_key = install_test_input_key();
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-enc", 3);
+    let user = keypair("encrypted-requester");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let plaintext = "my parcel was never delivered";
+    let commitment = verinoo_crypto::sha256_hex(plaintext);
+    let encrypted = verinoo_crypto::encrypt(&public_key, plaintext, &commitment).unwrap();
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": verinoo_model::MODEL_ID,
+            "encryptedInput": encrypted,
+            "inputCommitment": commitment,
+            "maxFee": 100,
+            "deadline": 1_000,
+            "verificationType": "optimistic",
+        }),
+        1,
+    );
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let block_json = serde_json::to_string(&block).unwrap();
+    assert!(
+        !block_json.contains(plaintext),
+        "plaintext leaked into the block payload"
+    );
+
+    let head = current_head(&store).unwrap();
+    verinoo_exec::engine::validate_block(
+        &block,
+        &head.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .unwrap();
+    set_head(&store, &block);
+
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, "completed");
+    assert!(task.input.is_empty(), "plaintext must not be stored");
+    assert!(
+        task.encrypted_input.is_some(),
+        "ciphertext must be retained"
+    );
+    assert_eq!(
+        verinoo_exec::engine::plaintext_input(task).unwrap(),
+        plaintext
+    );
+    let output = task.result_output.clone().unwrap();
+    assert!(output.contains("\"shipping\""), "{output}");
+    assert_eq!(Some(verinoo_model::sha256_hex(&output)), task.result_hash);
+}
+
+#[test]
+fn an_encrypted_task_with_a_wrong_commitment_does_not_execute() {
+    let public_key = install_test_input_key();
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-bad", 4);
+    let user = keypair("bad-commitment");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let plaintext = "please cancel my subscription";
+    let wrong = verinoo_crypto::sha256_hex("different text");
+    let encrypted = verinoo_crypto::encrypt(&public_key, plaintext, &wrong).unwrap();
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": verinoo_model::MODEL_ID,
+            "encryptedInput": encrypted,
+            "inputCommitment": wrong,
+            "maxFee": 100,
+            "deadline": 1_000,
+        }),
+        1,
+    );
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    set_head(&store, &block);
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    if let Some(task) = tasks.first() {
+        assert_eq!(task.status, "pending", "wrong commitment must not complete");
+    }
+}

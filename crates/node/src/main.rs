@@ -279,6 +279,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("api keys disabled — any funded key may submit inference");
     }
 
+    // Input encryption uses one network X25519 key shared by every validator.
+    // Without it, inputs are plaintext in blocks and API state.
+    if let Ok(raw) = std::env::var("VNN_INPUT_KEY") {
+        if !raw.trim().is_empty() {
+            let key = verinoo_crypto::NetworkKey::from_hex(raw.trim())?;
+            let public = key.public_key_hex();
+            verinoo_crypto::install_input_key(key)
+                .map_err(|_| "VNN_INPUT_KEY was already installed".to_string())?;
+            tracing::info!("input encryption enabled | network key {}", &public[..16]);
+        }
+    }
+    if verinoo_crypto::input_key().is_none() {
+        tracing::warn!(
+            "input encryption disabled — plaintext inputs are public; set VNN_INPUT_KEY"
+        );
+    }
+
     // Config via env (deploy-friendly): VNN_* variables.
     let validator = std::env::var("VNN_VALIDATOR")
         .map(|v| v == "1" || v == "true")
@@ -535,16 +552,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Validator loop (optional).
+    // Validator loop (optional). Block time is a network-wide setting: every
+    // validator must use the same value or slots drift.
+    let block_time_ms = std::env::var("VNN_BLOCK_TIME_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| shared_params_block_time(&shared));
+    if block_time_ms != shared_params_block_time(&shared) {
+        tracing::info!("block time override: {block_time_ms} ms");
+    }
     if cfg.validator {
         let v_shared = shared.clone();
         let v_net = net.clone();
-        tokio::spawn(validator_loop(
-            v_shared,
-            v_net,
-            signing,
-            shared_params_block_time(&shared),
-        ));
+        tokio::spawn(validator_loop(v_shared, v_net, signing, block_time_ms));
     }
 
     // Catch-up sync: poll peer HTTP APIs and replay missing blocks through the
@@ -700,10 +720,12 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut max_fee: u64 = 100;
     let mut rpc_url = "http://localhost:7100".to_string();
     let mut api_key: Option<String> = None;
+    let mut plaintext = false;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--plaintext" => plaintext = true,
             "--key-file" if i + 1 < args.len() => {
                 key_file = args[i + 1].clone();
                 i += 1;
@@ -734,7 +756,7 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if key_file.is_empty() || input.is_empty() {
-        eprintln!("Usage: verinoo-node infer --key-file <file> --input \"<text>\" [--model id] [--fee n] [--node url] [--api-key key]");
+        eprintln!("Usage: verinoo-node infer --key-file <file> --input \"<text>\" [--model id] [--fee n] [--node url] [--api-key key] [--plaintext]");
         std::process::exit(1);
     }
 
@@ -753,9 +775,33 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs()
         + 3_600;
-    let body = wallet::build_signed_inference(
-        &signing, &address, &model, &input, max_fee, deadline, nonce,
-    )?;
+
+    // Encrypt by default when the node advertises a network input key. The
+    // plaintext never enters the transaction, block or task state.
+    let network_key: serde_json::Value = match reqwest::get(format!("{rpc_url}/v1/input-key")).await
+    {
+        Ok(resp) => resp.json().await.unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    };
+    let public_key = network_key["publicKey"].as_str().unwrap_or("");
+    let body = if !plaintext && !public_key.is_empty() {
+        let commitment = verinoo_crypto::sha256_hex(&input);
+        let encrypted = verinoo_crypto::encrypt(public_key, &input, &commitment)?;
+        wallet::build_signed_inference_encrypted(
+            &signing,
+            &address,
+            &model,
+            &encrypted,
+            &commitment,
+            max_fee,
+            deadline,
+            nonce,
+        )?
+    } else {
+        wallet::build_signed_inference(
+            &signing, &address, &model, &input, max_fee, deadline, nonce,
+        )?
+    };
 
     let mut req = reqwest::Client::new()
         .post(format!("{rpc_url}/v1/infer"))

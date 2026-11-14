@@ -17,6 +17,7 @@ tracing = "0.1"
 verinoo-zk = { path = "../zk" }
 verinoo-model = { path = "../model" }
 verinoo-runtime = { path = "../runtime" }
+verinoo-crypto = { path = "../crypto" }
 base64 = "0.22"
 
 [dev-dependencies]

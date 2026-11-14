@@ -3703,6 +3703,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "verinoo-crypto"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "hex",
+ "hkdf",
+ "rand 0.8.7",
+ "serde",
+ "sha2",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "verinoo-exec"
 version = "0.1.0"
 dependencies = [
@@ -3714,6 +3728,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tracing",
+ "verinoo-crypto",
  "verinoo-model",
  "verinoo-runtime",
  "verinoo-state",
@@ -3778,6 +3793,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "verinoo-crypto",
  "verinoo-exec",
  "verinoo-model",
  "verinoo-network",

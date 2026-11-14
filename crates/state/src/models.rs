@@ -48,8 +48,18 @@ pub struct InferenceTask {
     pub input_commitment: String,
     /// Clear-text input. Committed by hash in `input_commitment`; carried so
     /// every node can re-execute the task deterministically at block apply.
+    /// Empty for encrypted tasks (the `encrypted_input` payload is used
+    /// instead). Public API responses must redact both.
     #[serde(default)]
     pub input: String,
+    /// JSON-encoded `verinoo_crypto::EncryptedInput`. Only the network key can
+    /// decrypt it; blocks and API responses carry ciphertext, not plaintext.
+    #[serde(
+        rename = "encryptedInput",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub encrypted_input: Option<String>,
     #[serde(rename = "maxFee")]
     pub max_fee: u64,
     pub deadline: u64,

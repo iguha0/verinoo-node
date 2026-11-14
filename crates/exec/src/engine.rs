@@ -488,12 +488,63 @@ pub fn execute_transaction(
                 tx.tx_id
             ))[..32]
                 .to_string();
+            let plain_input = data["input"].as_str().unwrap_or("").to_string();
+            let encrypted = data.get("encryptedInput").filter(|v| !v.is_null());
+            if !plain_input.is_empty() && encrypted.is_some() {
+                return Err(EngineError::Reverted(
+                    "submit either input or encryptedInput, not both".into(),
+                ));
+            }
+            let encrypted_input = match encrypted {
+                Some(value) => {
+                    let parsed: verinoo_crypto::EncryptedInput =
+                        serde_json::from_value(value.clone()).map_err(|_| {
+                            EngineError::Reverted("malformed encryptedInput".into())
+                        })?;
+                    if parsed.ephemeral_public_key.is_empty()
+                        || parsed.nonce.is_empty()
+                        || parsed.ciphertext.is_empty()
+                    {
+                        return Err(EngineError::Reverted("malformed encryptedInput".into()));
+                    }
+                    Some(
+                        serde_json::to_string(&parsed)
+                            .map_err(|_| EngineError::Reverted("encryptedInput encode".into()))?,
+                    )
+                }
+                None => None,
+            };
+            // Commitment-only submissions are the reference/manual-claim path:
+            // they are assigned but not executed deterministically.
+            let mut commitment = data["inputCommitment"].as_str().unwrap_or("").to_string();
+            if commitment.is_empty() {
+                if encrypted_input.is_some() {
+                    return Err(EngineError::Reverted(
+                        "encryptedInput requires inputCommitment".into(),
+                    ));
+                }
+                commitment = verinoo_crypto::sha256_hex(&plain_input);
+            }
+            if encrypted_input.is_some() && commitment.len() != 64 {
+                return Err(EngineError::Reverted(
+                    "inputCommitment must be 64 hex chars".into(),
+                ));
+            }
+            if encrypted_input.is_none()
+                && !plain_input.is_empty()
+                && verinoo_crypto::sha256_hex(&plain_input) != commitment
+            {
+                return Err(EngineError::Reverted(
+                    "input does not match inputCommitment".into(),
+                ));
+            }
             store.set_task(&InferenceTask {
                 task_id,
                 requester: data["requester"].as_str().unwrap_or(&tx.from).into(),
                 target_model: data["targetModel"].as_str().unwrap_or("").into(),
-                input_commitment: data["inputCommitment"].as_str().unwrap_or("").into(),
-                input: data["input"].as_str().unwrap_or("").into(),
+                input_commitment: commitment,
+                input: plain_input,
+                encrypted_input,
                 max_fee: data["maxFee"].as_u64().unwrap_or(0),
                 deadline: data["deadline"].as_u64().unwrap_or(0),
                 verification_type: data["verificationType"]
@@ -1069,6 +1120,29 @@ pub fn execute_models() -> Vec<serde_json::Value> {
 /// Every node executes the same integer-only forward pass while applying the
 /// block, so the output is consensus state rather than the producer's claim.
 /// Tasks for models this node cannot execute keep the manual lifecycle.
+/// Resolve a task's plaintext input for deterministic execution.
+///
+/// Encrypted tasks are decrypted with the node's installed network key. A
+/// missing or wrong key is a configuration mismatch: the task stays pending and
+/// a warning is logged rather than committing a result peers cannot reproduce.
+pub fn plaintext_input(task: &InferenceTask) -> Result<String, String> {
+    if !task.input.is_empty() {
+        if !task.input_commitment.is_empty()
+            && verinoo_crypto::sha256_hex(&task.input) != task.input_commitment
+        {
+            return Err("stored input does not match inputCommitment".into());
+        }
+        return Ok(task.input.clone());
+    }
+    let raw = task
+        .encrypted_input
+        .as_deref()
+        .ok_or_else(|| "task has no input".to_string())?;
+    let encrypted: verinoo_crypto::EncryptedInput =
+        serde_json::from_str(raw).map_err(|_| "malformed encrypted input".to_string())?;
+    verinoo_crypto::decrypt_with_installed(&encrypted, &task.input_commitment)
+}
+
 fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) {
     let mut tasks: Vec<InferenceTask> = store.iter_prefix("task:");
     tasks.retain(|t| t.status == "pending" || t.status == "assigned");
@@ -1092,7 +1166,14 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
                 executor.to_string()
             }
         };
-        let output = model.result_json(&task.input);
+        let plaintext = match plaintext_input(&task) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(task = %task.task_id, error = %e, "cannot resolve task input");
+                continue;
+            }
+        };
+        let output = model.result_json(&plaintext);
         let result_hash = sha256_hex(&output);
         task.status = "completed".into();
         task.result_output = Some(output);
@@ -1128,11 +1209,16 @@ pub fn stamp_receipts(store: &StateStore, block: &Block) {
         let weights_hash = ExecModel::resolve(&task.target_model)
             .map(|m| m.weights_hash())
             .unwrap_or_default();
+        let input_hash = if task.input.is_empty() {
+            task.input_commitment.clone()
+        } else {
+            verinoo_model::sha256_hex(&task.input)
+        };
         let receipt = json!({
             "taskId": task.task_id,
             "modelId": task.target_model,
             "weightsHash": weights_hash,
-            "inputHash": verinoo_model::sha256_hex(&task.input),
+            "inputHash": input_hash,
             "outputHash": task.result_hash,
             "height": height,
             "blockHash": block.header.hash,

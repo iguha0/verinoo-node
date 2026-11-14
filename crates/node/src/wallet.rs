@@ -128,10 +128,7 @@ pub fn build_signed_inference(
     deadline: u64,
     nonce: u64,
 ) -> Result<serde_json::Value, String> {
-    let mut h = sha2::Sha256::new();
-    h.update(input.as_bytes());
-    let input_commitment = hex::encode(h.finalize());
-
+    let input_commitment = verinoo_crypto::sha256_hex(input);
     let data = json!({
         "type": "submitInference",
         "data": {
@@ -144,6 +141,43 @@ pub fn build_signed_inference(
             "verificationType": "optimistic",
         }
     });
+    finish_inference(signing, from_addr, data, nonce)
+}
+
+/// Build a signed inference envelope whose input is encrypted to the network
+/// key. The plaintext never enters the transaction, block or task state.
+#[allow(clippy::too_many_arguments)]
+pub fn build_signed_inference_encrypted(
+    signing: &SigningKey,
+    from_addr: &str,
+    model: &str,
+    encrypted: &verinoo_crypto::EncryptedInput,
+    input_commitment: &str,
+    max_fee: u64,
+    deadline: u64,
+    nonce: u64,
+) -> Result<serde_json::Value, String> {
+    let data = json!({
+        "type": "submitInference",
+        "data": {
+            "requester": from_addr,
+            "targetModel": model,
+            "encryptedInput": encrypted,
+            "inputCommitment": input_commitment,
+            "maxFee": max_fee,
+            "deadline": deadline,
+            "verificationType": "optimistic",
+        }
+    });
+    finish_inference(signing, from_addr, data, nonce)
+}
+
+fn finish_inference(
+    signing: &SigningKey,
+    from_addr: &str,
+    data: serde_json::Value,
+    nonce: u64,
+) -> Result<serde_json::Value, String> {
     let payload = json!({
         "data": data,
         "from": from_addr,
@@ -151,12 +185,10 @@ pub fn build_signed_inference(
         "to": "",
         "value": 0,
     });
-
     let payload_str = canonical_json(&payload).map_err(|e| e.to_string())?;
     let mut h = sha2::Sha256::new();
     h.update(payload_str.as_bytes());
     let tx_id = hex::encode(h.finalize());
-
     let sig = signing.sign(tx_id.as_bytes());
     Ok(json!({
         "txId": tx_id,
