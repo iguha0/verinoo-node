@@ -3,3 +3,8 @@
 .DS_Store
 docs/linkedin-post.md
 docs/reddit-post-draft.md
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
