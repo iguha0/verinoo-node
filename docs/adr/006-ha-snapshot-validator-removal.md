@@ -2,12 +2,15 @@
 
 ## Status
 
-**Proposed — not implemented.** This document describes target designs and the
-integration work required. No code in this repository implements automatic
-failover, split-brain protection, state snapshot transfer, or a consensus
-validator-set change. Nothing here may be cited as shipped behavior.
+**Partially implemented — readiness observability only.** `GET /ready`, the
+`syncing` flag, `peerCount`, and `validatorSetHash` are implemented as described
+in "API failover, health checks, DNS, and load balancer". The rest of this
+document remains a target design: no code in this repository implements
+automatic failover, split-brain protection, state snapshot transfer, or a
+consensus validator-set change. Do not cite anything else here as shipped
+behavior.
 
-Date: 2026-11-15
+Date: 2026-11-15 (readiness surface implemented 2026-11-15)
 Scope: `crates/node`, `crates/state`, `crates/exec`, `crates/network`,
 `scripts/`, and operations documentation.
 
@@ -83,9 +86,9 @@ The supported shape is one active validator and one passive replica:
 - The replica may serve read APIs (`/status`, `/blocks`, `/account`,
   `/v1/tasks`, `/v1/verify`) and accept transactions. It must not produce
   blocks until promoted.
-- A load balancer may send reads to either node only if it checks height and
-  lag. A stale read is not a correctness failure, but it is a bad receipt
-  experience.
+- A load balancer may send reads to either node only if it checks readiness and
+  lag (`GET /ready`). A stale read is not a correctness failure, but it is a bad
+  receipt experience.
 - Inference submission is a transaction, so any node can accept it and gossip
   it (`NetworkEvent::Tx` handling at `crates/node/src/main.rs:546-559`). The
   block producer includes it if it has the tx. A replica that is behind may
@@ -153,16 +156,27 @@ stop/start with a fencing requirement.
 
 ### API failover, health checks, DNS, and load balancer
 
-- `GET /health` (`crates/node/src/rpc.rs:111`) currently returns
-  `ok: head.is_some()`, `height`, and `headAgeMs` based on the head block
-  timestamp. A lagging replica with an old head still returns `ok: true`.
-  A load balancer must therefore use `headAgeMs` and a height comparison, not
-  `ok` alone.
-- Proposed readiness fields: `serving` (head exists), `height`,
-  `finalizedHeight` (after ADR 004), `headAgeMs`, `peerCount`, `syncing`
-  (true while `sync_once` is applying blocks), and `validatorSetHash`.
-  `/ready` should return 200 only when `height` is within a configured
-  tolerance of the best known peer and `headAgeMs < 3 * block_time`.
+- `GET /ready` (`crates/node/src/rpc.rs`) is the readiness surface. It returns
+  200 only when a head exists (`serving`), `sync_once` is not running
+  (`syncing == false`), `headAgeMs < 3 * block_time_ms`, and the local height is
+  within `VNN_PEER_LAG_BLOCKS` of the best peer height observed through
+  `VNN_SYNC_URLS`. It returns 503 with a stable `reason`: `no_head`, `syncing`,
+  `stale_head`, or `behind_peer`. The response also includes `height`,
+  `headAgeMs`, `peerCount` (live libp2p connections), `syncing`,
+  `validatorSetHash`, and `reason` (null when ready).
+- Peer height is only available when catch-up sync is configured. A node with
+  no `VNN_SYNC_URLS` (for example the live single validator) has no peer height,
+  so the `behind_peer` condition is skipped rather than fabricated. `peerCount`
+  is always the real connection count, including 0 when isolated.
+- `GET /health` remains liveness only: `ok: head.is_some()` with `height` and
+  `headAgeMs`. A lagging replica with an old head still returns `ok: true`, so
+  a load balancer must use `/ready`, not `ok` alone.
+- `validatorSetHash` is lowercase hex SHA-256 over the active validator
+  addresses sorted, deduplicated, and joined with `\n`. It comes from `val:`
+  state when non-empty, otherwise from the genesis/`VNN_VALIDATORS` list. It
+  covers addresses only, not keys or stake, and never panics on an empty set.
+  `/status` exposes the same `syncing` and `validatorSetHash` values alongside
+  its existing fields. `finalizedHeight` still waits on ADR 004.
 - API failover: DNS name or load balancer in front of the API ports. Use
   active/passive for writes that depend on a specific validator (there are
   none today: `POST /tx` and `/v1/infer` just gossip transactions) and
@@ -461,10 +475,11 @@ restart toggle:
 
 Do the prerequisites before the visible features:
 
-1. **State-root coverage and set hash (1 wk).** Add `val:` and `meta:` set
-   parameters to `compute_state_root`; add `validatorSetHash` to `/status` and
-   refuse to run with a mismatched set. This is a prerequisite for on-chain
-   removal and for BFT.
+1. **State-root coverage and set hash (1 wk).** `validatorSetHash` is now
+   exposed on `/status` and `/ready` (addresses only), but `val:` and `meta:`
+   set parameters are not yet in `compute_state_root`, and the node does not
+   refuse to run with a mismatched set. This coverage is a prerequisite for
+   on-chain removal and for BFT.
 2. **Snapshot format, manifest, and verifier (1-2 wk).** Add
    `StateStore::checkpoint_to`, a manifest builder/signer, a download/verify/
    apply tool, and tests. Do not serve snapshots until the verifier rejects
@@ -472,10 +487,11 @@ Do the prerequisites before the visible features:
 3. **Catch-up from a snapshot (0.5-1 wk).** Start `sync_once` at the snapshot
    height; keep `/blocks/since` unchanged. Add `/snapshot/manifest` and a file
    endpoint behind a flag.
-4. **HA runbook and fencing (1 wk).** Add `/ready`, height/lag checks, a
-   promotion script that refuses to run while the old process is alive, and
-   split-brain alerts. Automated failover is a separate 2-3 wk item and should
-   not be promised before the fencing primitive exists.
+4. **HA runbook and fencing (1 wk).** `/ready`, height/lag checks, `peerCount`,
+   `syncing`, and `validatorSetHash` are implemented. A promotion script that
+   refuses to run while the old process is alive and split-brain alerts remain.
+   Automated failover is a separate 2-3 wk item and should not be promised
+   before the fencing primitive exists.
 5. **Validator key binding and registration/unregistration (2-3 wk).** Add
    `BindValidatorKey`, epoch activation, deactivation, bond locking, and
    validator-set root coverage. Reject changes that break the quorum or the
@@ -567,6 +583,9 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
 
 ## Non-claims
 
+- **Readiness only.** `/ready`, `syncing`, `peerCount`, and `validatorSetHash`
+  are implemented as observability. They do not elect a leader, fence a host,
+  transfer state, or change consensus membership.
 - **Not implemented.** There is no automatic failover, leader lease, fencing
   primitive, snapshot endpoint, snapshot verifier, epoch activation,
   `BindValidatorKey`, or state-derived consensus set in this repository.
@@ -574,8 +593,9 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
   step. Running the same validator key on two hosts is not prevented by the
   node; it is detected, at best, after the fact.
 - **No split-brain protection.** There is no lease, lock, or quorum-based
-  leader election. ADR 004's evidence collection is not a prevention
-  mechanism.
+  leader election. `/ready`, `peerCount`, and `validatorSetHash` make a
+  divergent head or set visible, but they do not prevent it. ADR 004's evidence
+  collection is not a prevention mechanism.
 - **No snapshot transfer today.** A late node replays from genesis via
   `VNN_SYNC_URLS`; join time is O(chain length). A snapshot is a proposed
   format, not a served endpoint.

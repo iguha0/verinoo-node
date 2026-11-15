@@ -6,10 +6,12 @@
 //! rejection, per-tx canonical + signature checks).
 
 mod auth;
+mod readiness;
 mod rpc;
 mod wallet;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use verinoo_exec::engine::{current_head, produce_block, set_head, validate_block, Block};
@@ -41,6 +43,14 @@ pub struct Shared {
     /// application and catch-up sync. Two writers without this can apply
     /// different blocks at the same height.
     pub chain_lock: tokio::sync::Mutex<()>,
+    /// True while `sync_once` is fetching or applying peer blocks.
+    pub syncing: AtomicBool,
+    /// Highest peer height seen by catch-up sync; 0 means unknown.
+    pub best_peer_height: AtomicU64,
+    /// Effective block interval (env override or genesis default, min 500 ms).
+    pub block_time_ms: u64,
+    /// Allowed lag behind the best observed peer before `/ready` fails.
+    pub peer_lag_blocks: u64,
     policy: std::sync::Mutex<Policy>,
 }
 
@@ -110,6 +120,21 @@ impl Shared {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64
+    }
+    /// Active set from state, falling back to the genesis/configured list when
+    /// state has no `val:` entries.
+    pub fn validator_set_hash(&self) -> String {
+        let mut addresses = self.store.validator_addresses();
+        if addresses.is_empty() {
+            addresses = self.params.validators.clone();
+        }
+        readiness::validator_set_hash(&addresses)
+    }
+    pub fn best_peer_height(&self) -> Option<u64> {
+        match self.best_peer_height.load(Ordering::Relaxed) {
+            0 => None,
+            height => Some(height),
+        }
     }
 }
 
@@ -436,12 +461,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     verinoo_runtime::gpt::install_gpt_once(decoders);
 
+    // Readiness uses the same effective interval as block production.
+    let block_time_ms = std::env::var("VNN_BLOCK_TIME_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(cfg.genesis.block_time_ms)
+        .max(500);
+    if block_time_ms != cfg.genesis.block_time_ms {
+        tracing::info!("block time override: {block_time_ms} ms");
+    }
+    let peer_lag_blocks = std::env::var("VNN_PEER_LAG_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
+
     let shared = Arc::new(Shared {
         store,
         params: cfg.genesis.clone(),
         mempool: tokio::sync::Mutex::new(Vec::new()),
         faucet,
         chain_lock: tokio::sync::Mutex::new(()),
+        syncing: AtomicBool::new(false),
+        best_peer_height: AtomicU64::new(0),
+        block_time_ms,
+        peer_lag_blocks,
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
@@ -591,13 +634,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Validator loop (optional). Block time is a network-wide setting: every
     // validator must use the same value or slots drift.
-    let block_time_ms = std::env::var("VNN_BLOCK_TIME_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or_else(|| shared_params_block_time(&shared));
-    if block_time_ms != shared_params_block_time(&shared) {
-        tracing::info!("block time override: {block_time_ms} ms");
-    }
     if cfg.validator {
         let v_shared = shared.clone();
         let v_net = net.clone();
@@ -668,7 +704,24 @@ async fn sync_loop(shared: Arc<Shared>, urls: Vec<String>) {
     }
 }
 
+/// Clears `Shared::syncing` on every exit path from `sync_once`.
+struct SyncingGuard<'a>(&'a AtomicBool);
+
+impl<'a> SyncingGuard<'a> {
+    fn enter(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self(flag)
+    }
+}
+
+impl Drop for SyncingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 async fn sync_once(shared: &Shared, client: &reqwest::Client, base: &str) -> Result<usize, String> {
+    let _syncing = SyncingGuard::enter(&shared.syncing);
     let base = base.trim_end_matches('/');
     let status: serde_json::Value = client
         .get(format!("{base}/status"))
@@ -678,7 +731,13 @@ async fn sync_once(shared: &Shared, client: &reqwest::Client, base: &str) -> Res
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let peer_height = status["height"].as_u64().unwrap_or(0);
+    let peer_height = match status["height"].as_u64() {
+        Some(height) => {
+            shared.best_peer_height.fetch_max(height, Ordering::Relaxed);
+            height
+        }
+        None => 0,
+    };
     let our_height = shared.head().map(|b| b.header.index).unwrap_or(0);
     if peer_height <= our_height {
         return Ok(0);
@@ -858,10 +917,6 @@ async fn infer_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("tx:   {}", v["txId"].as_str().unwrap_or("-"));
     println!("poll: curl -s {rpc_url}/v1/tasks/{task_id}");
     Ok(())
-}
-
-fn shared_params_block_time(shared: &Shared) -> u64 {
-    shared.params.block_time_ms
 }
 
 fn sha256_hex_str(input: &str) -> String {

@@ -11,10 +11,12 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{Auth, AuthError, SelfServeError};
+use crate::readiness::{self, ReadinessInput};
 use crate::Shared;
 
 pub async fn serve(
@@ -26,6 +28,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/status", get(status))
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/blocks", get(blocks))
         .route("/blocks/since/:index", get(blocks_since))
         .route("/mempool", get(mempool))
@@ -107,7 +110,7 @@ fn request_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
     peer.ip().to_string()
 }
 
-/// Liveness/readiness probe for load balancers and systemd.
+/// Liveness probe. `ok` only means a head exists; use `/ready` for traffic.
 async fn health(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
     let head = shared.head();
     let (height, ts) = match &head {
@@ -121,6 +124,57 @@ async fn health(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         "headAgeMs": shared.now_ms().saturating_sub(ts),
         "validators": shared.params.validators.len(),
     }))
+}
+
+/// Readiness probe for load balancers and promotion checks. 200 only when the
+/// node has a fresh head, is not applying catch-up blocks, and is not behind
+/// the best peer observed by `VNN_SYNC_URLS`.
+async fn ready(
+    State(shared): State<Arc<Shared>>,
+    Extension(net): Extension<verinoo_network::NetworkNode>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    ready_report(&shared, shared.now_ms(), net.peer_count())
+}
+
+fn ready_report(
+    shared: &Shared,
+    now_ms: u64,
+    peer_count: usize,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let head = shared.head();
+    let (serving, height, ts) = match &head {
+        Some(block) => (true, block.header.index, block.header.timestamp),
+        None => (false, 0, 0),
+    };
+    let head_age_ms = now_ms.saturating_sub(ts);
+    let syncing = shared.syncing.load(Ordering::Relaxed);
+    let decision = readiness::evaluate(ReadinessInput {
+        serving,
+        syncing,
+        height,
+        head_age_ms,
+        block_time_ms: shared.block_time_ms,
+        best_peer_height: shared.best_peer_height(),
+        peer_lag_blocks: shared.peer_lag_blocks,
+    });
+    let status = if decision.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "ready": decision.ready,
+            "serving": serving,
+            "height": height,
+            "headAgeMs": head_age_ms,
+            "peerCount": peer_count,
+            "syncing": syncing,
+            "validatorSetHash": shared.validator_set_hash(),
+            "reason": decision.reason,
+        })),
+    )
 }
 
 /// Permissive CORS so browser-based testnet clients (faucet, explorer) can
@@ -152,17 +206,30 @@ async fn cors(
     res
 }
 
-async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
+async fn status(
+    State(shared): State<Arc<Shared>>,
+    Extension(net): Extension<verinoo_network::NetworkNode>,
+) -> Json<serde_json::Value> {
     let head = shared.head();
-    let (height, latest_hash, validator) = match head {
-        Some(b) => (b.header.index, b.header.hash, b.header.validator),
-        None => (0, String::new(), String::new()),
+    let now_ms = shared.now_ms();
+    let (height, latest_hash, validator, head_age_ms) = match head {
+        Some(b) => (
+            b.header.index,
+            b.header.hash,
+            b.header.validator,
+            now_ms.saturating_sub(b.header.timestamp),
+        ),
+        None => (0, String::new(), String::new(), 0),
     };
     Json(serde_json::json!({
         "chainId": shared.params.chain_id,
         "height": height,
         "latestHash": latest_hash,
         "validator": validator,
+        "headAgeMs": head_age_ms,
+        "peerCount": net.peer_count(),
+        "syncing": shared.syncing.load(Ordering::Relaxed),
+        "validatorSetHash": shared.validator_set_hash(),
         "mempool": shared.mempool.lock().await.len(),
         "validators": shared.params.validators,
     }))
@@ -764,6 +831,10 @@ mod tests {
     const ADDR: &str = "ai_0123456789abcdef0123456789abcdef01234567";
 
     fn test_shared() -> Arc<Shared> {
+        test_shared_with(GenesisParams::default())
+    }
+
+    fn test_shared_with(params: GenesisParams) -> Arc<Shared> {
         let store = StateStore::open_temp().unwrap();
         let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let address = verinoo_exec::engine::public_key_to_address(&hex::encode(
@@ -771,14 +842,128 @@ mod tests {
         ))
         .unwrap();
         let faucet = ProducerKey::from_parts(address, signing);
+        let block_time_ms = params.block_time_ms.max(500);
         Arc::new(Shared {
             store,
-            params: GenesisParams::default(),
+            params,
             mempool: tokio::sync::Mutex::new(Vec::new()),
             faucet,
             chain_lock: tokio::sync::Mutex::new(()),
+            syncing: std::sync::atomic::AtomicBool::new(false),
+            best_peer_height: std::sync::atomic::AtomicU64::new(0),
+            block_time_ms,
+            peer_lag_blocks: 2,
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
+    }
+
+    fn set_test_head(shared: &Shared, index: u64, timestamp: u64) {
+        let block = verinoo_exec::engine::Block {
+            header: verinoo_exec::engine::BlockHeader {
+                hash: "aa".repeat(32),
+                version: 1,
+                index,
+                timestamp,
+                previous_hash: "00".repeat(32),
+                validator: "genesis".into(),
+                validator_pub_key: String::new(),
+                validator_signature: String::new(),
+                state_root: "00".repeat(32),
+                tx_root: "00".repeat(32),
+                inference_tasks_root: "00".repeat(32),
+                compute_root: "00".repeat(32),
+            },
+            transactions: vec![],
+        };
+        verinoo_exec::engine::set_head(&shared.store, &block);
+    }
+
+    #[test]
+    fn ready_requires_a_head() {
+        let shared = test_shared();
+        let (status, body) = ready_report(&shared, shared.now_ms(), 0);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ready"], false);
+        assert_eq!(body.0["serving"], false);
+        assert_eq!(body.0["height"], 0);
+        assert_eq!(body.0["reason"], "no_head");
+        assert_eq!(body.0["peerCount"], 0);
+    }
+
+    #[test]
+    fn ready_accepts_a_fresh_head() {
+        let shared = test_shared();
+        set_test_head(&shared, 42, 1_000);
+        let (status, body) = ready_report(&shared, 1_500, 3);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ready"], true);
+        assert_eq!(body.0["serving"], true);
+        assert_eq!(body.0["height"], 42);
+        assert_eq!(body.0["headAgeMs"], 500);
+        assert_eq!(body.0["peerCount"], 3);
+        assert_eq!(body.0["syncing"], false);
+        assert_eq!(body.0["reason"], serde_json::Value::Null);
+        assert_eq!(body.0["validatorSetHash"], shared.validator_set_hash());
+    }
+
+    #[test]
+    fn ready_rejects_a_stale_head() {
+        let shared = test_shared();
+        set_test_head(&shared, 42, 1_000);
+        let stale_at = 1_000 + shared.block_time_ms * readiness::STALE_BLOCK_MULTIPLIER;
+        let (status, body) = ready_report(&shared, stale_at, 0);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ready"], false);
+        assert_eq!(body.0["reason"], "stale_head");
+    }
+
+    #[test]
+    fn ready_rejects_while_syncing() {
+        let shared = test_shared();
+        set_test_head(&shared, 42, 1_000);
+        shared.syncing.store(true, Ordering::Relaxed);
+        let (status, body) = ready_report(&shared, 1_100, 1);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ready"], false);
+        assert_eq!(body.0["syncing"], true);
+        assert_eq!(body.0["reason"], "syncing");
+    }
+
+    #[test]
+    fn ready_rejects_a_lagging_node_when_peer_height_is_known() {
+        let shared = test_shared();
+        set_test_head(&shared, 42, 1_000);
+        shared.best_peer_height.store(45, Ordering::Relaxed);
+        let (status, body) = ready_report(&shared, 1_100, 1);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["reason"], "behind_peer");
+    }
+
+    #[test]
+    fn validator_set_hash_falls_back_to_the_configured_set() {
+        let params = GenesisParams {
+            validators: vec!["ai_b".into(), "ai_a".into()],
+            ..GenesisParams::default()
+        };
+        let shared = test_shared_with(params);
+        assert_eq!(
+            shared.validator_set_hash(),
+            crate::readiness::validator_set_hash(&["ai_a".into(), "ai_b".into()])
+        );
+    }
+
+    #[test]
+    fn validator_set_hash_prefers_state_over_the_configured_set() {
+        let params = GenesisParams {
+            validators: vec!["ai_c".into()],
+            ..GenesisParams::default()
+        };
+        let shared = test_shared_with(params);
+        shared.store.seed_genesis_validators(&["ai_a".into()], 0);
+        assert_eq!(
+            shared.validator_set_hash(),
+            crate::readiness::validator_set_hash(&["ai_a".into()])
+        );
     }
 
     async fn call_issue(

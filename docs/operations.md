@@ -28,6 +28,7 @@ cargo build --release --locked -p verinoo-node
 install -m 0755 target/release/verinoo-node /usr/local/bin/verinoo-node
 systemctl restart verinoo-node
 curl -fsS localhost:7100/health
+curl -fsS localhost:7100/ready
 curl -fsS localhost:7100/v1/models
 ```
 
@@ -57,6 +58,7 @@ tar xzf /var/backups/verinoo/verinoo-YYYYMMDD-HHMMSS.tar.gz -C /var/lib/verinoo
 chown -R verinoo:verinoo /var/lib/verinoo/data
 systemctl start verinoo-node
 curl -fsS localhost:7100/health
+curl -fsS localhost:7100/ready
 ```
 
 Also back up `/etc/verinoo` and `/opt/verinoo/models`; without the same model set
@@ -135,7 +137,58 @@ Full threat model: [`docs/privacy.md`](privacy.md).
 `VNN_BLOCK_TIME_MS` overrides the chain's default interval and must be identical
 on every validator. A single-validator demo at `1000` gives roughly 1–2 s task
 latency; the two- and multi-validator safety story is unchanged (still
-round-robin, no BFT). Changing it does not change state.
+round-robin, no BFT). Changing it does not change state. The same effective
+interval drives the `/ready` staleness threshold.
+
+## Readiness (`/ready`)
+
+`GET /ready` is the load-balancer and promotion probe. It returns HTTP 200 only
+when all of these hold:
+
+- `serving`: a head exists.
+- `syncing` is false: catch-up sync is not fetching or applying blocks.
+- `headAgeMs < 3 * blockTimeMs`, using `VNN_BLOCK_TIME_MS` or the genesis
+  default.
+- When a peer height is known, `height + VNN_PEER_LAG_BLOCKS >= peerHeight`.
+
+Otherwise it returns HTTP 503 with a stable `reason`:
+
+| `reason` | Meaning |
+|---|---|
+| `no_head` | The node has no head block yet. |
+| `syncing` | `sync_once` is running. |
+| `stale_head` | The head is at least three block intervals old. |
+| `behind_peer` | The node is more than `VNN_PEER_LAG_BLOCKS` behind the best peer. |
+
+```json
+{
+  "ready": false,
+  "serving": true,
+  "height": 12345,
+  "headAgeMs": 4100,
+  "peerCount": 2,
+  "syncing": false,
+  "validatorSetHash": "51601458f4bce4547570cc8bb3dc800150d0da61e558100097b69fd07c32b70a",
+  "reason": "behind_peer"
+}
+```
+
+- `peerCount` is the live libp2p connection count (0 on an isolated or
+  single-validator node).
+- Peer height comes from the `/status` response of the URLs in
+  `VNN_SYNC_URLS`. A node without `VNN_SYNC_URLS` (for example the live
+  single validator) has no peer height, so the `behind_peer` condition is
+  skipped rather than fabricated. The best height ever observed is retained.
+- `validatorSetHash` is lowercase hex SHA-256 over the active validator
+  addresses sorted, deduplicated, and joined with `\n`. It is derived from
+  `val:` state when non-empty, otherwise from the genesis/`VNN_VALIDATORS`
+  list. Addresses only; public keys and stake are not included. Compare it
+  across nodes to detect a set mismatch. `/status` exposes the same value and
+  `syncing` field alongside its existing fields.
+- `GET /health` remains a liveness probe: `ok` only means a head exists. Do not
+  route traffic on `ok` alone.
+- `deploy/nginx-verinoo.conf` proxies `/ready`; add the same `location` to the
+  live nginx site before pointing an external load balancer at it.
 
 ## SDKs
 
@@ -175,17 +228,19 @@ VNN_API_KEYS_FILE=/etc/verinoo/api-keys.json
 ```
 
 The replica validates every replayed block and refuses a divergent state root.
-Point a load balancer health check at `GET /health` and send reads to either
-node. Promotion is manual: stop the old validator, start the replica with the
-validator seed and `VNN_VALIDATOR=true`, and update `VNN_SYNC_URLS` on the other
-nodes. There is no automatic failover and no split-brain protection.
+Point a load balancer health check at `GET /ready` and send reads only to a node
+that returns 200. A replica returns 503 while it is syncing, stale, or behind
+the best peer. Promotion is manual: stop the old validator, start the replica
+with the validator seed and `VNN_VALIDATOR=true`, and update `VNN_SYNC_URLS` on
+the other nodes. There is no automatic failover and no split-brain protection.
 
 ## Monitoring
 
 | Signal | Where | Alarm |
 |---|---|---|
-| liveness | `GET /health` (`ok`, `height`, `headAgeMs`) | `ok=false` or head age > 3× block time |
-| chain | `GET /status` | height not advancing |
+| readiness | `GET /ready` | HTTP 503 or a non-null `reason` |
+| liveness | `GET /health` (`ok`, `height`, `headAgeMs`) | `ok=false` |
+| chain | `GET /status` (`height`, `syncing`, `validatorSetHash`) | height not advancing, unexpected `syncing`, or hash differs across nodes |
 | mempool | `GET /metrics` | sustained growth |
 | service | `systemctl status verinoo-node` | restarts |
 | disk | `df -h /var/lib/verinoo` | < 20% free |
