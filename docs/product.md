@@ -46,6 +46,12 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   Train 100%, validation 90%, held-out 80% on a 10-example split; 80/80 label
   parity with its float reference on the full 80-example corpus. Small corpus,
   demonstration only.
+- **A GPT-style decoder now runs in consensus.** `tiny-gpt-v1` is a two-layer
+  causal decoder with a 320-token char-BPE tokenizer, a per-layer KV cache and
+  greedy decoding. 110,400 Q16.16 parameters, 32-token context, 24 new tokens
+  maximum. It matches its float reference token-for-token on 8 prompts. The
+  output is often template-like or garbled; this is a runtime demonstration,
+  not LLM quality.
 - **Deterministic across machines.** Inference is Q16.16 integer arithmetic with
   no floating point and no threading. Two independent nodes produced the same
   result hash for the same task in the verification run below.
@@ -57,17 +63,17 @@ the chain itself is inconsistent — that is the invariant a validator protects.
 - **Not trustless.** One operator runs both validators. There is no BFT
   consensus: round-robin leader election with a single producer signature per
   block, no prevote/precommit, no equivocation slashing in the live path.
-- **Not a general model host.** Dense / relu / softmax classifiers over the
-  hashed-unigram featuriser convert from ONNX (`onnx-import`) or GGUF
-  (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K) — see
-  [`docs/runtime.md`](runtime.md). A small transformer **encoder classifier**
-  runs through a separate runtime (`crates/runtime/src/transformer.rs`), with
-  word-level tokenization and CLS pooling. There is no decoder, causal mask,
-  KV cache, sampling, BPE/WordPiece tokenizer or ONNX attention import, so a
-  customer's LLM checkpoint cannot run yet. See
-  [`docs/transformer.md`](transformer.md). Tasks for models a node has not
-  loaded fall back to the manual claim → submit result flow and are **not**
-  verified by the chain.
+- **Not a production LLM host.** Dense / relu / softmax classifiers convert
+  from ONNX (`onnx-import`) or GGUF (`gguf-import`) — see
+  [`docs/runtime.md`](runtime.md). A transformer **encoder classifier** runs
+  through `crates/runtime/src/transformer.rs`, and a tiny **GPT-style decoder**
+  runs through `crates/runtime/src/gpt.rs` with char-BPE, a KV cache and greedy
+  decoding. The decoder is a 110k-parameter synthetic demo with a 32-token
+  context. There is no real GPT-2/LLaMA tokenizer, sampling, batching, long
+  context, safety layer or ONNX LLM import, so a customer's LLM checkpoint
+  cannot be served yet. See [`docs/decoder.md`](decoder.md). Tasks for models a
+  node has not loaded fall back to the manual claim → submit result flow and
+  are **not** verified by the chain.
 - **Not ZK-proven.** The attention/matmul dispute path still falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like. With consensus
   re-execution, verification is recomputation; the dispute game is test-only
@@ -175,6 +181,8 @@ prove what a model returned, which is worth more than the compute.
 The first thing a technical buyer will test is a model they care about. A
 dense classifier converts from ONNX or GGUF in one command, executes in
 consensus, and comes with a measured parity figure against its float reference
-(see [`docs/runtime.md`](runtime.md)); what is missing is a generative transformer/LLM runtime, so
-an LLM checkpoint still cannot run. Everything around it — receipts,
+(see [`docs/runtime.md`](runtime.md)). A transformer encoder and a tiny
+GPT-style decoder also run in consensus, but what is missing is production LLM
+support: a real tokenizer, long context, sampling, batching and model quality.
+An LLM checkpoint still cannot be served. Everything around it — receipts,
 verification, metering, settlement — already works.

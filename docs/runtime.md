@@ -130,6 +130,27 @@ dimension, and refuses a malformed file. A node that loads a different
 transformer file produces a different result hash and its peers reject the
 block, exactly like a graph-model mismatch.
 
+## GPT decoder models
+
+A third runtime executes a tiny GPT-style **decoder** with a char-BPE
+tokenizer, causal attention, a per-layer KV cache and greedy decoding. It is a
+demonstration model, not production LLM support. The format, tokenizer, cache
+and limits are in [`docs/decoder.md`](decoder.md).
+
+```bash
+python3 scripts/train_gpt.py
+
+verinoo-node infer --model tiny-gpt-v1 --input "please cancel"
+```
+
+`models/tiny-gpt-v1.json` is 110,400 Q16.16 parameters: token and position
+embeddings, two pre-norm decoder blocks (causal Q/K/V/O, layernorm, ReLU FFN),
+a final layernorm and a vocabulary head. Generation prefills the prompt, caches
+K/V per layer, then runs one forward step per new token and takes the argmax.
+The KV-cache path is tested to produce exactly the same logits as a full
+forward pass, and the Q16.16 greedy tokens match the float reference on the
+committed parity prompts.
+
 ## Importing ONNX
 
 ```bash
@@ -224,10 +245,10 @@ and refuses to write the file if the predicted class ever changes;
 
 ## Not supported
 
-* Generative transformer/LLM checkpoints: decoders, causal masks, KV caches,
-  sampling, BPE/WordPiece tokenizers and ONNX attention graphs. A small
-  transformer **encoder classifier** runs through the separate runtime above;
-  that is not LLM support.
+* Production LLM checkpoints: a real GPT-2/LLaMA tokenizer, long context,
+  sampling, batching, safety layers and ONNX attention graphs. A tiny
+  synthetic GPT-style **decoder** runs through the separate runtime above; it
+  is a demonstration, not LLM support.
 * Graph ops outside the list above: attention, convolutions, embedding lookups,
   arbitrary tokenizers. GGUF support is limited to extracting dense classifier
   layers.

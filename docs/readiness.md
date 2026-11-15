@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (97 tests) |
+| Test suite | green | `cargo test --workspace --locked` (104 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -43,17 +43,19 @@ claims a technical buyer will test in the first diligence call.
 | Metering | works | `/v1/usage`, CSV export |
 | Dispute ops | implemented | `exec/tests/r6_disputes.rs` (in-memory) |
 | Transformer encoder | works (experimental) | `intent-transformer-v1`, 5 508 params, Q16.16 attention, 80/80 label parity |
+| GPT decoder | works (demonstration) | `tiny-gpt-v1`, 110 400 params, BPE, KV cache, greedy, token parity on 8 prompts |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
 
-1. **No generative transformer or LLM runtime.** A small pre-norm transformer
-   **encoder classifier** now runs in consensus (`intent-transformer-v1`, one
-   layer, 16-wide, 5 508 params, 80/80 label parity against the float
-   reference). It uses a word-level vocabulary and CLS pooling. There is no
-   decoder, causal mask, KV cache, sampling, BPE/WordPiece tokenizer or ONNX
-   attention import, so a customer's LLM checkpoint still cannot run. Dense
-   classifiers from ONNX/GGUF continue to work. This is the main product gap.
+1. **No production LLM runtime.** A tiny GPT-style **decoder** now runs in
+   consensus (`tiny-gpt-v1`, 110,400 params, 320-token char-BPE, context 32,
+   greedy decoding, KV cache). It matches its float reference token-for-token
+   on 8 prompts. It is a synthetic demonstration: no real GPT-2/LLaMA
+   tokenizer, long context, sampling, batching, safety filters or production
+   model quality. A transformer **encoder classifier** also runs. A customer's
+   LLM checkpoint still cannot be imported or served. Dense classifiers from
+   ONNX/GGUF continue to work. This is the main product gap.
 2. **No finality.** `RoundRobin` selects producers; there are no prevote /
    precommit rounds, so a block is only as final as the single producer's
    signature. No equivocation slashing in the live path.
@@ -134,6 +136,11 @@ claims a technical buyer will test in the first diligence call.
   trained model, fixed-point exponential attention softmax, encrypted inputs
   and a weights-bound receipt. 80/80 label parity with the float reference on
   all 80 corpus examples. See [`docs/transformer.md`](transformer.md).
+- A deterministic GPT-style decoder (`crates/runtime/src/gpt.rs`) with a
+  char-BPE tokenizer, causal attention, a per-layer KV cache and greedy
+  decoding. `tiny-gpt-v1` is 110,400 Q16.16 parameters, matches the float
+  reference token-for-token on 8 prompts, and produces a weights-bound receipt.
+  See [`docs/decoder.md`](decoder.md). Demonstration model, not LLM quality.
 - A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
 
 ## Verified end-to-end (2-node product run)
@@ -256,13 +263,15 @@ domain still belong to the older reference node.
 ## Do not claim
 
 - "Trustless" — there is one operator and no BFT.
-- "Verified inference for any model" — only dense/relu/softmax graphs of the
-  committed model set execute deterministically; ONNX and GGUF classifiers
-  convert, but there is no transformer runtime.
+- "Verified inference for any model" — only the committed model set executes
+  deterministically: dense/relu/softmax graphs, a transformer encoder
+  classifier, and a tiny synthetic GPT-style decoder. A customer LLM checkpoint
+  still cannot be imported.
 - "ZK-proven" — attention disputes fall back to hash equality.
 - "Inputs are private from the operator" — inputs are encrypted to the
   validator set; every validator, including the operator, can decrypt. Pre-
   encryption tasks remain public.
-- "LLM or transformer generation support" — a small transformer encoder
-  classifier runs; there is no decoder, tokenizer beyond ASCII words, KV cache
-  or sampling. "BFT" — the finality design is not implemented.
+- "LLM support" — a 110k-parameter synthetic decoder runs, with char-BPE,
+  greedy decoding and a 32-token context. There is no real GPT-2/LLaMA
+  tokenizer, long context, sampling, batching, safety layer or production model
+  quality. "BFT" — the finality design is not implemented.

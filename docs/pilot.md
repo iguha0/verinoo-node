@@ -72,6 +72,7 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
 | Usage is metered for invoicing | `/v1/usage/:addr`, `/v1/usage/:addr/csv` |
 | A customer classifier can run | ONNX (`onnx-import`) and GGUF (`gguf-import`) import to a runtime graph with f32 parity checks |
 | A real transformer runs in consensus | `intent-transformer-v1`: Q16.16 attention encoder, 80/80 label parity, weights-bound receipt |
+| A causal decoder runs in consensus | `tiny-gpt-v1`: char-BPE, KV cache, greedy, token parity on 8 prompts |
 | On-chain settlement of fees | signed transfers, gas market, on-chain fee split |
 
 ## What is not claimed
@@ -79,11 +80,13 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
 - **Not trustless.** One operator runs both validators. Round-robin leader
   election with one producer signature per block; no BFT, no finality gadget,
   no equivocation slashing in the live path.
-- **Not an LLM host.** A small transformer **encoder classifier** now runs in
-  consensus (`intent-transformer-v1`, 5,508 params, 80/80 label parity). It has
-  a word-level vocabulary and no decoder, causal mask, KV cache, sampling or
-  BPE/WordPiece tokenizer. A Llama-class checkpoint cannot run yet. Dense
-  classifiers over the hashed-unigram featuriser remain the production path.
+- **Not a production LLM host.** A tiny GPT-style **decoder** now runs in
+  consensus (`tiny-gpt-v1`, 110,400 params, char-BPE, KV cache, greedy
+  decoding, 32-token context), and matches its float reference token-for-token
+  on 8 prompts. The output is often template-like or garbled. There is no real
+  GPT-2/LLaMA tokenizer, long context, sampling, batching, safety layer or
+  production model quality, so a Llama-class checkpoint cannot be served yet.
+  A transformer encoder classifier and dense classifiers also run.
 - **Not ZK-proven.** The attention/matmul dispute path falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like.
 - **Catch-up, not snapshot sync.** A late node replays blocks from genesis via
@@ -133,10 +136,10 @@ model returned.
 
 ## Known engineering gaps before self-serve
 
-1. Generative transformer/LLM runtime. A Q16.16 transformer encoder classifier
-   runs end-to-end (`docs/transformer.md`); decoders, causal masks, KV cache,
-   sampling, BPE/WordPiece tokenizers and ONNX attention import are not
-   implemented. 4–8 weeks.
+1. Production LLM runtime. A Q16.16 transformer encoder classifier and a tiny
+   GPT-style decoder (BPE, KV cache, greedy) run end-to-end. Real GPT-2/LLaMA
+   tokenizers, long context, sampling, batching, safety layers and ONNX LLM
+   import are not implemented (`docs/decoder.md`). 4–8 weeks.
 2. Byzantine finality. `docs/adr/004-bft-finality.md` is a design only; no
    prevote/precommit, certificate or slashing code exists. 5.5–7 weeks.
 3. Self-serve key signup; keys are issued manually today.

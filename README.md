@@ -11,15 +11,17 @@ Models come from the compiled-in reference classifier, operator graph models
 loaded from `VNN_MODEL_DIR`, and a transformer encoder classifier
 (`intent-transformer-v1`). Dense/relu/softmax classifiers convert from ONNX
 (`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K).
-A transformer encoder runs in consensus; a generative LLM runtime (decoder,
-KV cache, sampling, BPE) does not. See
+A transformer encoder and a tiny GPT-style decoder (char-BPE, KV cache,
+greedy decoding) run in consensus. Production LLM support (real tokenizers,
+long context, sampling, batching) does not. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
 [`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary,
 [`docs/privacy.md`](docs/privacy.md) for input encryption, and
-[`docs/transformer.md`](docs/transformer.md) /
+[`docs/transformer.md`](docs/transformer.md),
+[`docs/decoder.md`](docs/decoder.md) and
 [`docs/adr/004-bft-finality.md`](docs/adr/004-bft-finality.md) for the
-not-yet-wired transformer kernel and BFT design.
+transformer runtimes and the BFT design.
 
 | Crate | Purpose |
 |---|---|
@@ -29,7 +31,7 @@ not-yet-wired transformer kernel and BFT design.
 | `exec` | Validation, gas market, block production/application, dispute ops |
 | `network` | libp2p gossipsub block/tx propagation + mDNS |
 | `model` | `intent-classifier-v1`: deterministic Q16.16 inference + trainer |
-| `runtime` | integer-only graph runtime + transformer encoder for operator models |
+| `runtime` | integer-only graph runtime + transformer encoder + GPT decoder |
 | `onnx` | ONNX classifier → runtime graph (`onnx-import`), with float/integer parity |
 | `gguf` | GGUF dense classifier → runtime graph (`gguf-import`), Q4/Q5/Q8 + K-quant dequantisation |
 | `zk` | Q16.16 op vectors and conformance against the WASM runtime |
@@ -172,6 +174,9 @@ verinoo-node infer --model acme-support-v1 --input "my parcel was never delivere
 
 # a real transformer encoder in consensus (5,508 params, 80/80 label parity)
 verinoo-node infer --model intent-transformer-v1 --input "my parcel is delayed again"
+
+# a causal decoder with BPE, KV cache and greedy generation (demo model)
+verinoo-node infer --model tiny-gpt-v1 --input "please cancel"
 ```
 
 ## Wallet and API keys
@@ -195,7 +200,7 @@ replica/HA and incident response.
 
 ```bash
 cargo build --workspace --locked
-cargo test --workspace --locked        # 97 tests
+cargo test --workspace --locked        # 104 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/demo.sh                      # single node, ~45 s
