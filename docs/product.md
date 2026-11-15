@@ -50,10 +50,15 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   3.75M-parameter GPT-Neo decoder with the GPT-2 byte-level BPE tokenizer,
   causal attention, a per-layer KV cache and greedy decoding. 8 layers, 64
   hidden, 16 heads, 128-token context, 32 new tokens. It matches its float
-  reference **token-for-token for 32 tokens on 8 prompts**. It generates simple
-  children's stories, not production LLM quality. A synthetic `tiny-gpt-v1`
-  decoder also runs. The TinyStories weights are downloaded locally, not
-  redistributed, because the model card states no license.
+  reference **token-for-token for 32 tokens on 8 prompts**. The runtime also
+  has deterministic temperature/top-k/top-p sampling, a binary `.vnnw` weight
+  format with a SHA-256 payload check, and a local import of **Apache-2.0
+  DistilGPT-2** (81.9M parameters, 1,024-token context) that matches its float
+  reference for 16 greedy tokens on 3 prompts. DistilGPT-2 is not served on the
+  public 1-CPU node: at roughly 40 ms/token on a development Mac it can exceed a
+  1 s block, so it needs a GPU or optimistic-execution path. The TinyStories
+  weights are downloaded locally, not redistributed, because the model card
+  states no license.
 - **Deterministic across machines.** Inference is Q16.16 integer arithmetic with
   no floating point and no threading. Two independent nodes produced the same
   result hash for the same task in the verification run below.
@@ -70,10 +75,12 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   [`docs/runtime.md`](runtime.md). A transformer **encoder classifier** runs
   through `crates/runtime/src/transformer.rs`, and a **GPT-style decoder**
   runtime runs through `crates/runtime/src/gpt.rs` with char-BPE and GPT-2
-  byte-level BPE, a KV cache and greedy decoding. The real demo is a
-  3.75M-parameter GPT-Neo with a 128-token context. There is no long context,
-  sampling, batching, streaming, safety layer, large-model serving or clear
-  model license, so a customer's LLM checkpoint cannot be served yet. See
+  byte-level BPE, a KV cache, greedy or seeded sampling and binary weights. The
+  largest tested model is Apache-2.0 DistilGPT-2 (81.9M parameters, 1,024-token
+  context), imported and parity-tested locally but not served on the public
+  node. There is still no GPU executor, batching, streaming, safety layer,
+  large-model (7B+) serving or arbitrary-checkpoint import, and the live demo is
+  still a 3.75M-parameter GPT-Neo. See
   [`docs/decoder.md`](decoder.md). Tasks for models a node has not loaded fall
   back to the manual claim → submit result flow and are **not** verified by the
   chain.
@@ -186,7 +193,9 @@ dense classifier converts from ONNX or GGUF in one command, executes in
 consensus, and comes with a measured parity figure against its float reference
 (see [`docs/runtime.md`](runtime.md)). A transformer encoder and a tiny
 GPT-style decoder also run in consensus, including a real 3.75M-parameter
-pretrained model with the GPT-2 tokenizer, but what is missing is production LLM
-support: long context, sampling, batching, streaming, safety and large-model
-serving. An LLM checkpoint still cannot be served. Everything around it — receipts,
-verification, metering, settlement — already works.
+pretrained model with the GPT-2 tokenizer, a licensed 82M-parameter DistilGPT-2
+import with 1,024-token context and deterministic sampling. What is missing is
+production LLM serving: GPU execution, batching, streaming, safety and
+arbitrary-checkpoint import. DistilGPT-2 is local-only and slower than a 1 s
+block on CPU. Everything around it — receipts, verification, metering,
+settlement — already works.

@@ -12,9 +12,12 @@ loaded from `VNN_MODEL_DIR`, and a transformer encoder classifier
 (`intent-transformer-v1`). Dense/relu/softmax classifiers convert from ONNX
 (`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K).
 A transformer encoder and a GPT-style decoder runtime run in consensus. The
-decoder supports GPT-2 byte-level BPE and a real 3.75M-parameter pretrained
-GPT-Neo demo (`tiny-stories-1m`), plus a synthetic char-BPE model. Production
-LLM support (long context, sampling, batching, safety) does not. See
+decoder supports GPT-2 byte-level BPE, deterministic temperature/top-k/top-p
+sampling and binary `.vnnw` weights. It runs a synthetic char-BPE model, a
+3.75M-parameter GPT-Neo demo (`tiny-stories-1m`) and a locally imported
+Apache-2.0 82M-parameter DistilGPT-2 with 1,024-token context. Production LLM
+serving (GPU execution, batching, streaming, safety) is not deployed; the
+public node serves a small decoder demo, not DistilGPT-2. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
 [`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary,
@@ -186,6 +189,11 @@ verinoo-node infer --model tiny-gpt-v1 --input "please cancel"
 # weights are downloaded locally, not redistributed (no license on the model card)
 python3 scripts/import_tiny_stories.py
 verinoo-node infer --model tiny-stories-1m --input "Once upon a time"
+
+# Apache-2.0 DistilGPT-2: 81.9M params, 1,024 context, 328 MB binary weights.
+# Local/GPU path only; not served on the public 1-CPU node.
+python3 scripts/import_distilgpt2.py
+verinoo-node infer --model distilgpt2 --input "Once upon a time"
 ```
 
 ## Claims-triage pilot demo

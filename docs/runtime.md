@@ -133,8 +133,9 @@ block, exactly like a graph-model mismatch.
 ## GPT decoder models
 
 A third runtime executes GPT-style **decoders** with causal attention, a
-per-layer KV cache and greedy decoding. The format, tokenizers, cache and
-limits are in [`docs/decoder.md`](decoder.md).
+per-layer KV cache, greedy or seeded sampling, and optional binary `.vnnw`
+weights. The format, tokenizers, cache and limits are in
+[`docs/decoder.md`](decoder.md).
 
 ```bash
 # synthetic demo model
@@ -144,17 +145,26 @@ verinoo-node infer --model tiny-gpt-v1 --input "please cancel"
 # real pretrained TinyStories-1M (weights downloaded locally, not redistributed)
 python3 scripts/import_tiny_stories.py
 verinoo-node infer --model tiny-stories-1m --input "Once upon a time"
+
+# Apache-2.0 DistilGPT-2, 81.9M params, 1024 context, 328 MB binary weights
+# Local/GPU path only; not served on the public 1-CPU node.
+python3 scripts/import_distilgpt2.py
+verinoo-node infer --model distilgpt2 --input "Once upon a time"
 ```
 
 `tiny-gpt-v1` is 110,400 Q16.16 parameters: token and position embeddings, two
 pre-norm decoder blocks (causal Q/K/V/O, layernorm, ReLU FFN), a final
 layernorm and a vocabulary head. `tiny-stories-1m` is a 3.75M-parameter GPT-Neo
 decoder with the GPT-2 byte-level BPE tokenizer, `gelu_new`, no attention-score
-scaling, tied embeddings and eight layers. Generation prefills the prompt,
-caches K/V per layer, then runs one forward step per new token and takes the
-argmax. The KV-cache path is tested to produce exactly the same logits as a
-full forward pass, and the Q16.16 greedy tokens match the float reference on
-the committed parity prompts (32 tokens on 8 prompts for the real model).
+scaling, tied embeddings and eight layers. `distilgpt2` is an 81.9M-parameter
+GPT-2 decoder with 1,024-token context, imported from the Apache-2.0 checkpoint
+into a 328 MB binary `.vnnw` file. Generation prefills the prompt, caches K/V
+per layer, then runs one forward step per new token and either takes the argmax
+or samples with temperature/top-k/top-p from a seeded SplitMix64 RNG. The
+KV-cache path is tested to produce exactly the same logits as a full forward
+pass; Q16.16 greedy tokens match the float reference on the committed parity
+prompts (32 tokens on 8 prompts for TinyStories, 16 tokens on 3 prompts for
+DistilGPT-2).
 
 ## Importing ONNX
 
@@ -250,13 +260,13 @@ and refuses to write the file if the predicted class ever changes;
 
 ## Not supported
 
-* Production LLM checkpoints: LLaMA/SentencePiece tokenizers, long context,
-  sampling, batching, streaming, safety layers, large-model serving and ONNX
-  attention graphs. The decoder runtime supports GPT-2 BPE and a real 3.75M
-  GPT-Neo demo, but that is not production LLM support.
+* Production LLM serving: LLaMA/SentencePiece tokenizers, beyond-1,024-token
+  tested context, batching, streaming, safety layers, GPU/large-model serving
+  and ONNX attention graphs. The decoder runtime supports GPT-2/GPT-Neo shapes,
+  deterministic sampling and an 81.9M DistilGPT-2 import, but that is not a
+  production LLM service.
 * Graph ops outside the list above: attention, convolutions, embedding lookups,
   arbitrary tokenizers. GGUF support is limited to extracting dense classifier
   layers.
-* Sampling — the runtime returns scores and an argmax label, not generated text.
 * Float weights — parameters are signed integers; conversion happens offline so
   the on-chain path never touches floating point.

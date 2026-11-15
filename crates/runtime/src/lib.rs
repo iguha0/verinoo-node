@@ -31,6 +31,7 @@
 pub mod attention;
 pub mod gpt;
 pub mod transformer;
+pub mod weights;
 pub use gpt::{GptModel, GptRegistry};
 pub use transformer::{TransformerModel, TransformerRegistry};
 

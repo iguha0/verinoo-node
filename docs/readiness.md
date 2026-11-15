@@ -1,6 +1,6 @@
 # Go-to-market readiness
 
-Assessment date: 2026-11-10. Scope: the Rust node in this repository.
+Assessment date: 2026-11-15. Scope: the Rust node in this repository.
 
 ## Verdict
 
@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (109 tests) |
+| Test suite | green | `cargo test --workspace --locked` (124 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -45,19 +45,24 @@ claims a technical buyer will test in the first diligence call.
 | Transformer encoder | works (experimental) | `intent-transformer-v1`, 5 508 params, Q16.16 attention, 80/80 label parity |
 | GPT decoder | works (demonstration) | `tiny-gpt-v1`, 110 400 params, char-BPE, KV cache, greedy, token parity on 8 prompts |
 | Real pretrained decoder | works (experimental) | `tiny-stories-1m`, 3.75M-param GPT-Neo, GPT-2 BPE, 32-token parity on 8 prompts |
+| Binary decoder weights | works | `.vnnw` header + SHA-256 payload, tamper test; DistilGPT-2 328 MB |
+| Deterministic sampling | works | temperature/top-k/top-p + SplitMix64 seed; cold sampling equals greedy |
+| Licensed large decoder import | works (local) | Apache-2.0 DistilGPT-2, 81.9M params, 1,024 context, 16-token parity on 3 prompts; not public |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
 
-1. **No production LLM runtime.** A real pretrained 3.75M-parameter GPT-Neo
-   decoder (`tiny-stories-1m`) now runs in consensus with the GPT-2 byte-level
-   BPE tokenizer, causal attention, a KV cache and greedy decoding. It matches
-   its float reference token-for-token for 32 tokens on 8 prompts. A synthetic
-   decoder (`tiny-gpt-v1`) and a transformer encoder also run. What is missing
-   is production LLM support: 128-token context, one GPT-2 tokenizer, no
-   sampling, batching, streaming, safety filters or large-model serving, and
-   the TinyStories weights have no explicit license. Dense classifiers from
-   ONNX/GGUF continue to work. This is the main product gap.
+1. **No production LLM serving.** A real pretrained 3.75M-parameter GPT-Neo
+   decoder (`tiny-stories-1m`) runs in consensus with the GPT-2 byte-level BPE
+   tokenizer, causal attention, a KV cache and greedy decoding. The runtime now
+   also has deterministic temperature/top-k/top-p sampling and a SHA-256-bound
+   binary `.vnnw` weight format, and a licensed 81.9M-parameter DistilGPT-2 with
+   1,024-token context is imported and matches its float reference locally. What
+   is missing is serving: GPU execution, batching, streaming, safety filters, a
+   request queue, arbitrary-checkpoint import (LLaMA/SentencePiece) and 7B+
+   models. On the 1-CPU VPS DistilGPT-2 is slower than a 1 s consensus block, so
+   the public node still serves the small demo. Dense classifiers from ONNX/GGUF
+   continue to work. This is the main product gap.
 2. **No finality.** `RoundRobin` selects producers; there are no prevote /
    precommit rounds, so a block is only as final as the single producer's
    signature. No equivocation slashing in the live path.
@@ -140,11 +145,15 @@ claims a technical buyer will test in the first diligence call.
   all 80 corpus examples. See [`docs/transformer.md`](transformer.md).
 - A deterministic GPT-style decoder runtime (`crates/runtime/src/gpt.rs`) with
   char-BPE and GPT-2 byte-level BPE tokenizers, causal attention, a per-layer
-  KV cache and greedy decoding. `tiny-gpt-v1` is a 110,400-parameter synthetic
-  demo; `tiny-stories-1m` is a real 3.75M-parameter pretrained GPT-Neo decoder
-  that matches its float reference token-for-token for 32 tokens on 8 prompts.
-  See [`docs/decoder.md`](decoder.md). The real weights are downloaded locally
-  and are not redistributed (no license on the model card).
+  KV cache, greedy or seeded sampling and binary `.vnnw` weights (48-byte
+  header, SHA-256 payload, tamper detection). `tiny-gpt-v1` is a
+  110,400-parameter synthetic demo; `tiny-stories-1m` is a real 3.75M-parameter
+  GPT-Neo decoder matching its float reference for 32 tokens on 8 prompts. An
+  Apache-2.0 81.9M-parameter DistilGPT-2 with 1,024-token context is imported
+  locally and matches its float reference for 16 greedy tokens on 3 prompts.
+  See [`docs/decoder.md`](decoder.md). DistilGPT-2 and TinyStories weights are
+  downloaded locally and are not redistributed; TinyStories has no stated
+  license, DistilGPT-2 is Apache 2.0 per its model card.
 - A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
 
 ## Verified end-to-end (2-node product run)
@@ -267,16 +276,18 @@ domain still belong to the older reference node.
 ## Do not claim
 
 - "Trustless" — there is one operator and no BFT.
-- "Verified inference for any model" — only the committed model set executes
+- "Verified inference for any model" — only the supported runtimes execute
   deterministically: dense/relu/softmax graphs, a transformer encoder
-  classifier, and a tiny synthetic GPT-style decoder. A customer LLM checkpoint
-  still cannot be imported.
+  classifier, and GPT-2/GPT-Neo decoders including an imported 81.9M
+  DistilGPT-2. Arbitrary checkpoints and LLaMA/SentencePiece tokenizers are not
+  supported.
 - "ZK-proven" — attention disputes fall back to hash equality.
 - "Inputs are private from the operator" — inputs are encrypted to the
   validator set; every validator, including the operator, can decrypt. Pre-
   encryption tasks remain public.
-- "LLM support" — a real 3.75M-parameter GPT-Neo demo runs with GPT-2 BPE,
-  greedy decoding and a 128-token context, plus a synthetic 110k decoder. There
-  is no long context, sampling, batching, streaming, safety layer, large-model
-  serving or clear model license. "BFT" — the finality design is not
-  implemented.
+- "LLM support" — a 3.75M GPT-Neo demo runs in consensus with GPT-2 BPE and a
+  128-token context; a licensed 81.9M DistilGPT-2 with 1,024-token context,
+  binary weights and deterministic sampling runs locally. It is not deployed or
+  benchmarked as a service, and there is no GPU executor, batching, streaming,
+  safety layer, 7B+ serving or arbitrary-checkpoint import. "BFT" — the finality
+  design is not implemented.

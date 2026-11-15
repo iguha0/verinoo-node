@@ -73,8 +73,10 @@ compatible model.
 - **Not trustless.** One operator runs the validator set; no BFT finality.
 - **Not operator-blind.** Inputs are encrypted to the validators, but the
   operator can decrypt.
-- **Not an LLM.** Dense/relu/softmax classifiers and the transformer encoder
-  only; the generative decoder is a separate demo.
+- **Not a production LLM host.** The pilot uses a classifier and the
+  transformer encoder. A licensed 81.9M DistilGPT-2 decoder with 1,024-token
+  context, sampling and binary weights runs locally as a decoder demo, but it is
+  not deployed or offered as a service in this pilot.
 - **Not a general model host.** The model must be in the supported runtime set.
 
 ## Pilot shape

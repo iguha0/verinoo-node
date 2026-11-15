@@ -1,16 +1,19 @@
 # Generative decoder runtime
 
-Status: **two decoder slices implemented and running in consensus.** This is not
-production LLM support.
+Status: **three decoder slices, binary weights and deterministic sampling.**
+`DistilGPT-2` is a licensed 82M-parameter model with 1,024-token context. It is
+imported and parity-tested locally, but is **not served on the public
+`verinoo.com` node** and is not yet a production LLM service.
 
 | Model | What it is | Source |
 |---|---|---|
 | `tiny-gpt-v1` | synthetic two-layer GPT-style decoder, char-BPE, 110,400 params | trained by `scripts/train_gpt.py` |
 | `tiny-stories-1m` | real pretrained GPT-Neo decoder, GPT-2 byte-level BPE, 3.75M params | `roneneldan/TinyStories-1M` |
+| `distilgpt2` | real pretrained GPT-2 decoder, GPT-2 byte-level BPE, 81.9M params, 1,024 context | `distilgpt2` (Apache 2.0) |
 
-Both use causal attention, a per-layer KV cache and greedy decoding. Every op
-is integer or Q16.16, so two nodes generate the same token ids from the same
-prompt.
+All use causal attention, a per-layer KV cache and greedy or seeded sampling.
+Every op is integer or Q16.16, so two nodes with the same model file and seed
+generate the same token ids from the same prompt.
 
 ## What runs
 
@@ -39,13 +42,29 @@ prompt.
 | attention | no score scaling (GPT-Neo), tied embeddings, LN epsilon 1e-5 |
 | local attention | 8 layers alternate global/local with window 256; context 128 means the window never matters |
 
+### `distilgpt2` (real pretrained, licensed)
+
+| Field | Value |
+|---|---|
+| architecture | `gpt2-6x768-12h` |
+| parameters | 81,912,576 (tied embeddings) |
+| hidden / heads / head_dim | 768 / 12 / 64 |
+| decoder layers | 6 (pre-norm, causal attention, `gelu_new` FFN width 3,072) |
+| vocabulary | 50,257 GPT-2 byte-level BPE tokens |
+| context / generation | 1,024 tokens / 16 new tokens by default |
+| attention | GPT-2-style sqrt scaling, tied embeddings, LN epsilon 1e-5 |
+| weights file | `models/distilgpt2.vnnw`, 327.7 MB binary (gitignored) |
+| license | Apache 2.0 per the model card; weights downloaded, not redistributed |
+| deployment | local/GPU path only; not served on the public 1-CPU node |
+
 Generation:
 
 ```text
 ids = [BOS if configured] + tokenize(prompt)
 logits = prefill(ids, cache)
 repeat up to maxNewTokens:
-  next = argmax(logits)
+  next = argmax(logits) if temperatureMilli == 0
+         else sample(logits, temperature, topK, topP, seeded RNG)
   append next
   if next == EOS: stop
   logits = step(next, cache)
@@ -57,6 +76,68 @@ and returns the last position's logits. Each `step` embeds one token, projects
 Q/K/V, appends K/V to the cache, attends only to cached keys (causal), and runs
 the FFN. No full-sequence recomputation per token.
 
+## Sampling
+
+Sampling is part of the model spec and is deterministic across nodes:
+
+```json
+"sampling": {
+  "temperatureMilli": 800,
+  "topK": 40,
+  "topPMilli": 900,
+  "seed": 7
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `temperatureMilli` | `0` = greedy; otherwise logits are divided by `temperatureMilli / 1000` in Q16.16 |
+| `topK` | keep the `K` highest-scoring tokens; `0` keeps all |
+| `topPMilli` | nucleus cutoff; `0` or `1000` disables it |
+| `seed` | SplitMix64 seed; the same prompt, weights and seed give the same token ids |
+
+The sampler scales logits in fixed point, applies top-k, truncates the nucleus,
+quantises the softmax to Q16.16 and draws with a SplitMix64 integer PRNG. There
+is no floating-point random number generation. Temperature `0` keeps the old
+greedy path, so existing models and fixtures are unchanged.
+
+Sampling is fixed in the model JSON; the HTTP API does not yet accept a
+per-task sampling override or bind one in the receipt. Every node and verifier
+must load the same model file. If you change sampling for a published model,
+treat it as a new model version.
+
+## Binary weights (`.vnnw`)
+
+Large models are not practical as inline JSON. A model JSON may point at a
+binary tensor file:
+
+```json
+"weightsFile": "distilgpt2.vnnw",
+"weightsSha256": "…64 hex characters…"
+```
+
+The file layout is:
+
+| Offset | Size | Meaning |
+|---|---|---|
+| 0 | 4 | magic `VNNW` |
+| 4 | 4 | format version (`1`), little-endian `u32` |
+| 8 | 8 | payload length in bytes, little-endian `u64` |
+| 16 | 32 | SHA-256 of the payload |
+| 48 | n | Q16.16 tensors as little-endian `i32` |
+
+Tensors are stored in the same order as the JSON fields: embedding,
+positional, then each decoder layer (layernorm, Q/K/V/O, FFN), then the final
+layernorm and optional untied head. The loader verifies the magic, version,
+length, payload hash and declared `weightsSha256` before using any tensor; a
+single tampered byte is rejected. A model may use either inline tensors or
+`weightsFile`, not both.
+
+The current loader reads the payload into memory and copies it into
+`Vec<i32>`; peak memory is roughly twice the file size. Zero-copy `mmap` is the
+next optimization, not implemented. This matters for the 328 MB DistilGPT-2
+file, but not for the tiny demo models.
+
 ## Tokenizers
 
 ### Char-BPE (synthetic model)
@@ -66,7 +147,7 @@ the FFN. No full-sequence recomputation per token.
 - Encoding applies the learned merges in order.
 - The Python trainer and Rust runtime use the same merge order.
 
-### GPT-2 byte-level BPE (real model)
+### GPT-2 byte-level BPE (real models)
 
 - `vocab.json` and `merges.txt` come from the checkpoint.
 - The standard GPT-2 ByteLevel regex pre-tokenizes the prompt.
@@ -74,7 +155,7 @@ the FFN. No full-sequence recomputation per token.
 - Adjacent pairs are merged by rank (lowest rank first).
 - Decoding reverses the byte mapping and skips special tokens.
 - The Python exporter and Rust runtime produce the same token ids; the parity
-  test checks all eight reference prompts.
+  tests check the reference prompts.
 
 The byte-level tokenizer is GPT-2 only. There is no LLaMA/SentencePiece support
 and no arbitrary tokenizer file format.
@@ -85,15 +166,28 @@ and no arbitrary tokenizer file format.
   8 prompts; KV cache equals full forward.
 - **`tiny-stories-1m`:** prompt tokenizer parity on 8 prompts, **32-token greedy
   parity on all 8 prompts**, and KV cache equals full forward.
+- **`distilgpt2`:** binary-weight load, prompt tokenizer parity and **16-token
+  greedy parity on 3 prompts** against the official float checkpoint, exercised
+  at 1,024-token context. The opt-in test is:
+  `VNN_TEST_DISTILGPT2=1 cargo test -p verinoo-runtime distilgpt2_binary`.
+- **Sampling:** deterministic across repeated runs; temperature `0` equals
+  greedy, and top-k `1` with a positive temperature equals greedy.
 - Repeated generation is byte-identical.
-- The real model required four runtime details to match GPT-Neo:
-  1. no attention-score scaling (`attentionScale: "none"`);
+- The real models required four runtime details to match their references:
+  1. GPT-2 sqrt attention scaling, or none for GPT-Neo;
   2. `gelu_new` (tanh approximation), not ReLU;
   3. layer-norm epsilon 1e-5 and rounded normalization;
   4. dense layers that accumulate in Q32.32 and round once at the end.
 - The synthetic model remains a small demo; its output is often template-like
-  or garbled. `tiny-stories-1m` generates simple, mostly coherent children's
-  stories.
+  or garbled. `tiny-stories-1m` generates simple children's stories.
+  `distilgpt2` generates recognisably fluent English, but it is still a small
+  2019-era model.
+
+**Performance caveat:** on the development Mac, release mode loads the 328 MB
+binary and generates 48 tokens in 2.62 s (about 40 ms/token, including load).
+The public 1-CPU VPS is materially slower. A 32-token generation can exceed a
+1 s consensus block, so DistilGPT-2 is not enabled on the live node. GPU
+execution or an optimistic-execution path is required before serving it.
 
 ## Model format
 
@@ -110,13 +204,15 @@ and no arbitrary tokenizer file format.
 | `tieWordEmbeddings` | reuse the token embedding as the output head |
 | `prependBos` | whether to prepend `bosId` |
 | `bosId`, `eosId`, `padId`, `unkId` | special token ids |
-| `embedding`, `positional` | Q16.16 token and position embeddings |
+| `sampling` | temperature, top-k, top-p and seed |
+| `weightsFile`, `weightsSha256` | optional binary tensor file and its payload hash |
+| `embedding`, `positional` | Q16.16 token and position embeddings (inline mode) |
 | `decoder[]` | per layer: layernorm, Q/K/V/O, FFN |
 | `lnfGamma`, `lnfBeta` | final layernorm |
 | `headWeights`, `headBias` | output head (empty when tied) |
 
 The runtime validates every tensor length, special-token mapping, vocabulary
-uniqueness, head dimension and context limit.
+uniqueness, head dimension, context limit and sampling range.
 
 `result_json` returns:
 
@@ -132,11 +228,17 @@ uniqueness, head dimension and context limit.
 ```
 
 The receipt binds `modelId` and `weightsHash`; `/v1/verify` regenerates the
-text and compares the output hash.
+text and compares the output hash. Sampling configuration is part of the model
+file, so a verifier must load the same file.
 
 ## Import or train
 
 ```bash
+# Apache 2.0 DistilGPT-2: 81.9M params, 1024 context, binary weights
+python3 scripts/import_distilgpt2.py
+# models/distilgpt2.json (1.7 MB), models/distilgpt2.vnnw (328 MB),
+# models/distilgpt2.test.json
+
 # real TinyStories-1M checkpoint (downloads weights, not redistributed)
 python3 scripts/import_tiny_stories.py
 # models/tiny-stories-1m.json (25 MB), models/tiny-stories-1m.test.json
@@ -146,30 +248,40 @@ python3 scripts/train_gpt.py
 # models/tiny-gpt-v1.json, models/tiny-gpt-v1.test.json
 ```
 
-**Licensing:** the TinyStories-1M model card does not state a license for the
-weights. They are not committed or included in release artifacts. The import
-script downloads them from Hugging Face; review the model card and dataset
-terms before use. See `models/NOTICE-tiny-stories-1m.txt`.
+Both large-model outputs are gitignored. The DistilGPT-2 importer quantises
+the official checkpoint to Q16.16, writes the `.vnnw` header and SHA-256,
+extracts the GPT-2 tokenizer and records float-reference greedy vectors.
+
+**Licensing:** DistilGPT-2 is Apache 2.0 according to its model card; verify the
+card before redistribution. The model files are downloaded locally and are not
+committed or included in release artifacts. The TinyStories-1M model card does
+not state a license for the weights; they are also downloaded locally, not
+redistributed, and `models/NOTICE-tiny-stories-1m.txt` records the caveat.
 
 ## What is still missing
 
-- **Production LLM support.** 3.75M parameters, 128-token context, one GPT-2
-  tokenizer, no sampling, batching, streaming, safety filters or long context.
-- **Local attention beyond the window.** GPT-Neo's local layers are treated as
-  global because the runtime context is 128 and the window is 256.
-- **Tokenizers beyond GPT-2.** No LLaMA/SentencePiece, byte fallback or
-  arbitrary tokenizer formats.
-- **Sampling.** Greedy only. No temperature, top-k, top-p, beam search,
-  repetition penalty or stop sequences.
-- **Model quality and licensing.** The real demo is a small children's-story
-  model with unresolved license metadata.
-- **Continuation parity for very long generations.** Parity is measured on 32
-  tokens; small numerical differences may flip an argmax later.
+- **Production LLM serving.** 82M parameters and 1,024-token context are a
+  foundation, not a service. There is no GPU executor, batching, streaming,
+  safety layer, request queue or large-model (7B+) support, and DistilGPT-2 is
+  not on the public node.
+- **Zero-copy weights.** The binary loader copies into `Vec<i32>`; `mmap` and a
+  slice-backed tensor view are not implemented.
+- **Per-task generation controls.** Sampling is fixed in the model file. There
+  is no API override, stop sequence, repetition penalty or beam search, and
+  sampling config is not separately bound in the receipt.
+- **Arbitrary checkpoints.** Only GPT-2/GPT-Neo shapes and the GPT-2 byte-BPE
+  tokenizer are supported. No LLaMA/SentencePiece, no arbitrary tokenizer
+  formats, no ONNX LLM import.
+- **Long-context quality.** The runtime supports up to 8,192 positions of
+  validation, but only DistilGPT-2's 1,024 positions are tested; local attention
+  beyond GPT-Neo's window is not implemented.
+- **Continuation parity for very long generations.** Parity is measured on
+  16–32 tokens; small numerical differences may flip an argmax later.
 
 ## Why this matters
 
-The chain executes a real pretrained 3.75M-parameter GPT-Neo decoder with the
-GPT-2 byte-level BPE tokenizer, causal attention, a KV cache and greedy
-generation during block application. Inputs are encrypted, the result is
-consensus state, and the receipt binds the exact weights. That is the runtime
-shape an LLM needs. It is not an LLM product yet.
+The chain executes a real pretrained 82M-parameter GPT-2 decoder with a
+1,024-token context, the GPT-2 byte-level BPE tokenizer, causal attention, a KV
+cache, deterministic sampling and a SHA-256-bound binary weight file. Inputs are
+encrypted, the result is consensus state, and the receipt binds the exact
+weights. That is the runtime shape an LLM needs. It is not an LLM product yet.

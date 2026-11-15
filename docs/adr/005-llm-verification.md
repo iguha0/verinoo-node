@@ -2,10 +2,12 @@
 
 ## Status
 
-**Proposed — not implemented.** This document describes a target design and
-the integration work required. No code in this repository implements an
-optimistic LLM executor, a bonded challenger, a TEE attestation path, or
-integer sampling. Nothing here may be cited as shipped behavior.
+**Proposed — partially implemented.** The deterministic decoder now has
+integer temperature/top-k/top-p sampling with a seeded SplitMix64 RNG, a
+SHA-256-bound binary weight format, and a locally imported 81.9M DistilGPT-2
+with 1,024-token context. Not implemented: an optimistic LLM executor, a bonded
+challenger, a TEE attestation path, per-task sampling commitment and repetition
+penalties. Nothing else here may be cited as shipped behavior.
 
 Date: 2026-11-15
 Scope: `crates/exec`, `crates/runtime`, `crates/node`, `crates/network`,
@@ -310,8 +312,12 @@ derive to its address using `public_key_to_address`
 
 ### Sampling commitment and determinism
 
-The current decoder is greedy only (`docs/decoder.md:161-166`). Sampling must
-be integer and reproducible before any claim is meaningful.
+Sampling is now integer and reproducible (`Sampling` in
+`crates/runtime/src/gpt.rs`; see `docs/decoder.md`). The current parameters are
+`temperatureMilli` (`0` = greedy), `topK`, `topPMilli` and a `seed`, fixed in
+the model JSON. A per-task sampling commitment and `repetitionPenaltyMilli` are
+still design work; until they exist, a claim must use the model's fixed
+sampling configuration and the verifier must load the same model file.
 
 **Sampling parameters.** Encode all parameters as integers in canonical JSON:
 

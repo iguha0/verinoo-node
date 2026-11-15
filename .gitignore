@@ -18,3 +18,8 @@ models/tiny-stories-1m.test.json
 
 # Generated pilot reports
 reports/
+
+# DistilGPT-2 weights are downloaded locally, not redistributed
+models/distilgpt2.json
+models/distilgpt2.vnnw
+models/distilgpt2.test.json

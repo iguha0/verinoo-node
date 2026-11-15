@@ -25,24 +25,40 @@ const MAX_HIDDEN: usize = 2048;
 const MAX_CONTEXT: usize = 8192;
 const MAX_VOCAB: usize = 1_000_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GptLayer {
+    #[serde(default)]
     pub ln1_gamma: Vec<i32>,
+    #[serde(default)]
     pub ln1_beta: Vec<i32>,
+    #[serde(default)]
     pub q_weights: Vec<i32>,
+    #[serde(default)]
     pub q_bias: Vec<i32>,
+    #[serde(default)]
     pub k_weights: Vec<i32>,
+    #[serde(default)]
     pub k_bias: Vec<i32>,
+    #[serde(default)]
     pub v_weights: Vec<i32>,
+    #[serde(default)]
     pub v_bias: Vec<i32>,
+    #[serde(default)]
     pub o_weights: Vec<i32>,
+    #[serde(default)]
     pub o_bias: Vec<i32>,
+    #[serde(default)]
     pub ln2_gamma: Vec<i32>,
+    #[serde(default)]
     pub ln2_beta: Vec<i32>,
+    #[serde(default)]
     pub ff1_weights: Vec<i32>,
+    #[serde(default)]
     pub ff1_bias: Vec<i32>,
+    #[serde(default)]
     pub ff2_weights: Vec<i32>,
+    #[serde(default)]
     pub ff2_bias: Vec<i32>,
 }
 
@@ -66,8 +82,17 @@ pub struct GptSpec {
     pub layer_norm_epsilon: i64,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Binary weight file, relative to this model file. When set, the weight
+    /// arrays below must be empty; the loader fills them from the binary.
+    #[serde(default)]
+    pub weights_file: String,
+    /// SHA-256 of the binary weight payload. Required when weightsFile is set.
+    #[serde(default)]
+    pub weights_sha256: String,
     #[serde(default = "default_prepend_bos")]
     pub prepend_bos: bool,
+    #[serde(default)]
+    pub sampling: Sampling,
     pub vocab: Vec<String>,
     pub merges: Vec<[String; 2]>,
     pub max_context: usize,
@@ -80,10 +105,15 @@ pub struct GptSpec {
     pub eos_id: usize,
     pub pad_id: usize,
     pub unk_id: usize,
+    #[serde(default)]
     pub embedding: Vec<i32>,
+    #[serde(default)]
     pub positional: Vec<i32>,
+    #[serde(default)]
     pub decoder: Vec<GptLayer>,
+    #[serde(default)]
     pub lnf_gamma: Vec<i32>,
+    #[serde(default)]
     pub lnf_beta: Vec<i32>,
     #[serde(default)]
     pub head_weights: Vec<i32>,
@@ -105,6 +135,22 @@ fn default_attention_scale() -> String {
 
 fn default_prepend_bos() -> bool {
     true
+}
+
+/// Deterministic sampling parameters. `temperatureMilli: 0` means greedy.
+/// `topK: 0` and `topPMilli: 0` disable those filters. `seed` makes the
+/// sequence reproducible across nodes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sampling {
+    #[serde(default)]
+    pub temperature_milli: u32,
+    #[serde(default)]
+    pub top_k: usize,
+    #[serde(default)]
+    pub top_p_milli: u32,
+    #[serde(default)]
+    pub seed: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -449,18 +495,62 @@ impl GptModel {
         Self::from_value(&value)
     }
 
+    /// Load a decoder from its JSON metadata. When `weightsFile` is set, the
+    /// binary file is resolved relative to the JSON file and its payload is
+    /// verified against `weightsSha256` before the model is constructed.
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+        let mut spec: GptSpec =
+            serde_json::from_value(value).map_err(|e| format!("invalid decoder: {e}"))?;
+        if spec.weights_file.is_empty() {
+            return Self::from_spec(spec, None);
+        }
+        if !spec.embedding.is_empty()
+            || !spec.positional.is_empty()
+            || spec.decoder.iter().any(|layer| !layer.q_weights.is_empty())
+        {
+            return Err("weightsFile is set but the JSON also contains weight arrays".into());
+        }
+        let metadata =
+            serde_json::to_string(&spec).map_err(|e| format!("cannot hash model metadata: {e}"))?;
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let weights_path = dir.join(&spec.weights_file);
+        let (weights, payload_sha) = crate::weights::read(&weights_path)?;
+        if !spec.weights_sha256.is_empty() && spec.weights_sha256 != payload_sha {
+            return Err(format!(
+                "{}: weightsSha256 does not match the binary payload",
+                path.display()
+            ));
+        }
+        fill_weights(&mut spec, &weights)?;
+        let identity = format!("{metadata}:{payload_sha}");
+        Self::from_spec(spec, Some(sha256_hex(&identity)))
+    }
+
     pub fn from_value(value: &serde_json::Value) -> Result<Self, String> {
         let spec: GptSpec =
             serde_json::from_value(value.clone()).map_err(|e| format!("invalid decoder: {e}"))?;
+        if !spec.weights_file.is_empty() {
+            return Err("model has weightsFile; load it with from_file".into());
+        }
+        Self::from_spec(spec, None)
+    }
+
+    fn from_spec(spec: GptSpec, weights_hash: Option<String>) -> Result<Self, String> {
         validate_spec(&spec)?;
         let tokenizer = match spec.tokenizer_kind.as_str() {
             "char-bpe" => Tokenizer::Char(Box::new(BpeTokenizer::new(&spec)?)),
             "byte-bpe" => Tokenizer::Byte(Box::new(ByteBpeTokenizer::new(&spec)?)),
             other => return Err(format!("unknown tokenizerKind `{other}`")),
         };
-        let weights_hash = sha256_hex(
-            &serde_json::to_string(&spec).map_err(|e| format!("cannot hash model: {e}"))?,
-        );
+        let weights_hash = match weights_hash {
+            Some(hash) => hash,
+            None => sha256_hex(
+                &serde_json::to_string(&spec).map_err(|e| format!("cannot hash model: {e}"))?,
+            ),
+        };
         Ok(Self {
             head_dim: spec.hidden / spec.heads,
             spec,
@@ -616,6 +706,17 @@ impl GptModel {
     }
 
     pub fn generate(&self, prompt: &str) -> Result<Generated, String> {
+        self.generate_with_sampling(prompt, &Sampling::default())
+    }
+
+    /// Generate with explicit sampling. `temperature_milli: 0` is greedy.
+    /// The RNG is seeded by `sampling.seed`, so the same prompt, weights and
+    /// seed produce the same token ids on every node.
+    pub fn generate_with_sampling(
+        &self,
+        prompt: &str,
+        sampling: &Sampling,
+    ) -> Result<Generated, String> {
         let mut prompt_ids = self.tokenizer.encode(prompt)?;
         let reserve = if self.spec.prepend_bos { 1 } else { 0 };
         let max_prompt = self.spec.max_context.saturating_sub(reserve);
@@ -633,12 +734,15 @@ impl GptModel {
 
         let mut cache = KVCache::new(self.spec.layers, self.spec.hidden);
         let mut logits = self.forward_sequence(&ids, &mut cache)?;
+        let mut rng = SplitMix64::new(sampling.seed);
         let mut generated = Vec::new();
         for _ in 0..self.spec.max_new_tokens {
             if ids.len() >= self.spec.max_context {
                 break;
             }
-            let next = argmax_index(&logits).ok_or_else(|| "empty logits".to_string())?;
+            let next = self
+                .sample_token(&logits, sampling, &mut rng)
+                .ok_or_else(|| "empty logits".to_string())?;
             ids.push(next);
             generated.push(next);
             if next == self.spec.eos_id {
@@ -655,8 +759,70 @@ impl GptModel {
         })
     }
 
+    fn sample_token(
+        &self,
+        logits: &[i32],
+        sampling: &Sampling,
+        rng: &mut SplitMix64,
+    ) -> Option<usize> {
+        if logits.is_empty() {
+            return None;
+        }
+        if sampling.temperature_milli == 0 {
+            return argmax_index(logits);
+        }
+        let temperature = sampling.temperature_milli.max(1) as i64;
+        let scale = ((ONE as i64 * 1000) / temperature).max(1);
+        let scaled: Vec<i32> = logits
+            .iter()
+            .map(|value| {
+                ((*value as i64 * scale) >> 16).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+            })
+            .collect();
+
+        let mut indices: Vec<usize> = (0..scaled.len()).collect();
+        if sampling.top_k > 0 && sampling.top_k < indices.len() {
+            indices.sort_by_key(|index| std::cmp::Reverse(scaled[*index]));
+            indices.truncate(sampling.top_k);
+        }
+        if sampling.top_p_milli > 0
+            && sampling.top_p_milli < 1000
+            && (sampling.top_k == 0 || sampling.top_k >= indices.len())
+        {
+            indices.sort_by_key(|index| std::cmp::Reverse(scaled[*index]));
+        }
+        let scores: Vec<i32> = indices.iter().map(|index| scaled[*index]).collect();
+        let mut probs = softmax_exp(&scores);
+        if sampling.top_p_milli > 0 && sampling.top_p_milli < 1000 {
+            let threshold = (sampling.top_p_milli as i64 * ONE as i64) / 1000;
+            let mut cumulative = 0i64;
+            let mut keep = 0usize;
+            for (i, probability) in probs.iter().enumerate() {
+                cumulative += *probability as i64;
+                keep = i + 1;
+                if cumulative >= threshold {
+                    break;
+                }
+            }
+            indices.truncate(keep);
+            probs.truncate(keep);
+        }
+        let total: u64 = probs.iter().map(|p| *p as u64).sum();
+        if total == 0 {
+            return indices.first().copied();
+        }
+        let mut pick = rng.next_u64() % total;
+        for (index, probability) in indices.iter().zip(probs.iter()) {
+            if pick < *probability as u64 {
+                return Some(*index);
+            }
+            pick -= *probability as u64;
+        }
+        indices.last().copied()
+    }
+
     pub fn result_json(&self, prompt: &str) -> Result<String, String> {
-        let generated = self.generate(prompt)?;
+        let generated = self.generate_with_sampling(prompt, &self.spec.sampling)?;
         Ok(serde_json::json!({
             "generatedText": generated.text,
             "prompt": generated.prompt,
@@ -679,10 +845,27 @@ impl GptModel {
             "hidden": self.spec.hidden,
             "heads": self.spec.heads,
             "layers": self.spec.layers,
+            "sampling": self.spec.sampling,
             "parameterCount": self.parameter_count(),
             "runtime": "q16.16-gpt-decoder",
             "weightsHash": self.weights_hash,
         })
+    }
+}
+
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
 
@@ -783,6 +966,66 @@ fn causal_attention(
     Ok(out)
 }
 
+fn fill_weights(spec: &mut GptSpec, weights: &[i32]) -> Result<(), String> {
+    let h = spec.hidden;
+    let ff = spec.ff;
+    let vocab = spec.vocab.len();
+    if spec.decoder.is_empty() && spec.layers > 0 {
+        spec.decoder = vec![GptLayer::default(); spec.layers];
+    }
+    if spec.decoder.len() != spec.layers {
+        return Err("decoder layer count does not match layers".into());
+    }
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, len: usize, name: &str| -> Result<Vec<i32>, String> {
+        let end = pos
+            .checked_add(len)
+            .ok_or_else(|| format!("{name}: length overflow"))?;
+        if end > weights.len() {
+            return Err(format!(
+                "{name}: need {len} values at {pos}, binary has {}",
+                weights.len()
+            ));
+        }
+        let out = weights[*pos..end].to_vec();
+        *pos = end;
+        Ok(out)
+    };
+    spec.embedding = take(&mut pos, vocab * h, "embedding")?;
+    spec.positional = take(&mut pos, spec.max_context * h, "positional")?;
+    for (i, layer) in spec.decoder.iter_mut().enumerate() {
+        layer.ln1_gamma = take(&mut pos, h, &format!("layer {i} ln1Gamma"))?;
+        layer.ln1_beta = take(&mut pos, h, &format!("layer {i} ln1Beta"))?;
+        layer.q_weights = take(&mut pos, h * h, &format!("layer {i} qWeights"))?;
+        layer.q_bias = take(&mut pos, h, &format!("layer {i} qBias"))?;
+        layer.k_weights = take(&mut pos, h * h, &format!("layer {i} kWeights"))?;
+        layer.k_bias = take(&mut pos, h, &format!("layer {i} kBias"))?;
+        layer.v_weights = take(&mut pos, h * h, &format!("layer {i} vWeights"))?;
+        layer.v_bias = take(&mut pos, h, &format!("layer {i} vBias"))?;
+        layer.o_weights = take(&mut pos, h * h, &format!("layer {i} oWeights"))?;
+        layer.o_bias = take(&mut pos, h, &format!("layer {i} oBias"))?;
+        layer.ln2_gamma = take(&mut pos, h, &format!("layer {i} ln2Gamma"))?;
+        layer.ln2_beta = take(&mut pos, h, &format!("layer {i} ln2Beta"))?;
+        layer.ff1_weights = take(&mut pos, ff * h, &format!("layer {i} ff1Weights"))?;
+        layer.ff1_bias = take(&mut pos, ff, &format!("layer {i} ff1Bias"))?;
+        layer.ff2_weights = take(&mut pos, h * ff, &format!("layer {i} ff2Weights"))?;
+        layer.ff2_bias = take(&mut pos, h, &format!("layer {i} ff2Bias"))?;
+    }
+    spec.lnf_gamma = take(&mut pos, h, "lnfGamma")?;
+    spec.lnf_beta = take(&mut pos, h, "lnfBeta")?;
+    if !spec.tie_word_embeddings {
+        spec.head_weights = take(&mut pos, vocab * h, "headWeights")?;
+        spec.head_bias = take(&mut pos, vocab, "headBias")?;
+    }
+    if pos != weights.len() {
+        return Err(format!(
+            "binary has {} trailing weight(s) after the canonical tensor order",
+            weights.len() - pos
+        ));
+    }
+    Ok(())
+}
+
 fn validate_spec(spec: &GptSpec) -> Result<(), String> {
     if spec.kind != "gpt-decoder" {
         return Err(format!("kind must be `gpt-decoder`, got `{}`", spec.kind));
@@ -810,6 +1053,15 @@ fn validate_spec(spec: &GptSpec) -> Result<(), String> {
     }
     if spec.layer_norm_epsilon < 0 {
         return Err("layerNormEpsilon must not be negative".into());
+    }
+    if spec.sampling.temperature_milli > 100_000 {
+        return Err("sampling.temperatureMilli is out of range".into());
+    }
+    if spec.sampling.top_p_milli > 1000 {
+        return Err("sampling.topPMilli must be at most 1000".into());
+    }
+    if spec.sampling.top_k > spec.vocab.len() {
+        return Err("sampling.topK exceeds the vocabulary".into());
     }
     if spec.vocab.is_empty() || spec.vocab.len() > MAX_VOCAB {
         return Err("vocab size is invalid".into());
@@ -959,7 +1211,7 @@ impl GptRegistry {
             if !is_decoder {
                 continue;
             }
-            match GptModel::from_bytes(&bytes) {
+            match GptModel::from_file(&path) {
                 Ok(model) => {
                     if let Err(e) = reg.insert(model) {
                         problems.push(format!("{}: {e}", path.display()));
@@ -1267,6 +1519,201 @@ mod tests {
                 (got - want).abs() < 0.02,
                 "gelu_new({x}) = {got}, want {want}"
             );
+        }
+    }
+
+    fn collect_weights(spec: &GptSpec) -> Vec<i32> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&spec.embedding);
+        out.extend_from_slice(&spec.positional);
+        for layer in &spec.decoder {
+            for field in [
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
+                &layer.q_weights,
+                &layer.q_bias,
+                &layer.k_weights,
+                &layer.k_bias,
+                &layer.v_weights,
+                &layer.v_bias,
+                &layer.o_weights,
+                &layer.o_bias,
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
+                &layer.ff1_weights,
+                &layer.ff1_bias,
+                &layer.ff2_weights,
+                &layer.ff2_bias,
+            ] {
+                out.extend_from_slice(field);
+            }
+        }
+        out.extend_from_slice(&spec.lnf_gamma);
+        out.extend_from_slice(&spec.lnf_beta);
+        if !spec.tie_word_embeddings {
+            out.extend_from_slice(&spec.head_weights);
+            out.extend_from_slice(&spec.head_bias);
+        }
+        out
+    }
+
+    fn clear_weights(spec: &mut GptSpec) {
+        spec.embedding.clear();
+        spec.positional.clear();
+        for layer in &mut spec.decoder {
+            layer.ln1_gamma.clear();
+            layer.ln1_beta.clear();
+            layer.q_weights.clear();
+            layer.q_bias.clear();
+            layer.k_weights.clear();
+            layer.k_bias.clear();
+            layer.v_weights.clear();
+            layer.v_bias.clear();
+            layer.o_weights.clear();
+            layer.o_bias.clear();
+            layer.ln2_gamma.clear();
+            layer.ln2_beta.clear();
+            layer.ff1_weights.clear();
+            layer.ff1_bias.clear();
+            layer.ff2_weights.clear();
+            layer.ff2_bias.clear();
+        }
+        spec.lnf_gamma.clear();
+        spec.lnf_beta.clear();
+        spec.head_weights.clear();
+        spec.head_bias.clear();
+    }
+
+    #[test]
+    fn binary_weights_roundtrip_and_tamper_detection() {
+        let original = load();
+        let weights = collect_weights(&original.spec);
+        let dir = std::env::temp_dir().join(format!(
+            "verinoo-gpt-binary-{}-{}",
+            std::process::id(),
+            original.parameter_count()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let weights_path = dir.join("tiny.vnnw");
+        let sha = crate::weights::write(&weights_path, &weights).unwrap();
+        let metadata_path = dir.join("tiny.json");
+        let mut metadata = original.spec.clone();
+        clear_weights(&mut metadata);
+        metadata.weights_file = "tiny.vnnw".into();
+        metadata.weights_sha256 = sha;
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+
+        let loaded = GptModel::from_file(&metadata_path).unwrap();
+        assert_eq!(loaded.parameter_count(), original.parameter_count());
+        assert_eq!(loaded.weights_hash().len(), 64);
+        let a = original.generate("please cancel").unwrap();
+        let b = loaded.generate("please cancel").unwrap();
+        assert_eq!(a.generated_ids, b.generated_ids);
+        assert_eq!(a.text, b.text);
+
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&weights_path, &bytes).unwrap();
+        let err = GptModel::from_file(&metadata_path).unwrap_err();
+        assert!(err.contains("hash mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sampling_is_deterministic_and_greedy_when_cold() {
+        let model = load();
+        let greedy = model.generate("please cancel").unwrap();
+        let zero = model
+            .generate_with_sampling(
+                "please cancel",
+                &Sampling {
+                    temperature_milli: 0,
+                    top_k: 0,
+                    top_p_milli: 0,
+                    seed: 99,
+                },
+            )
+            .unwrap();
+        assert_eq!(greedy.generated_ids, zero.generated_ids);
+
+        let sampling = Sampling {
+            temperature_milli: 800,
+            top_k: 40,
+            top_p_milli: 900,
+            seed: 7,
+        };
+        let a = model
+            .generate_with_sampling("please cancel", &sampling)
+            .unwrap();
+        let b = model
+            .generate_with_sampling("please cancel", &sampling)
+            .unwrap();
+        assert_eq!(a.generated_ids, b.generated_ids);
+        assert_eq!(a.text, b.text);
+        assert!(!a.generated_ids.is_empty());
+
+        let top_one = model
+            .generate_with_sampling(
+                "please cancel",
+                &Sampling {
+                    temperature_milli: 1000,
+                    top_k: 1,
+                    top_p_milli: 0,
+                    seed: 3,
+                },
+            )
+            .unwrap();
+        assert_eq!(greedy.generated_ids, top_one.generated_ids);
+    }
+
+    fn distilgpt2_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/distilgpt2.json")
+    }
+
+    fn distilgpt2_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/distilgpt2.test.json")
+    }
+
+    fn distilgpt2_enabled() -> bool {
+        std::env::var("VNN_TEST_DISTILGPT2")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            && distilgpt2_path().exists()
+            && distilgpt2_fixture_path().exists()
+    }
+
+    #[test]
+    fn distilgpt2_binary_model_matches_float_greedy_if_enabled() {
+        if !distilgpt2_enabled() {
+            eprintln!("skip: run scripts/import_distilgpt2.py and set VNN_TEST_DISTILGPT2=1");
+            return;
+        }
+        let model = GptModel::from_file(&distilgpt2_path()).expect("valid DistilGPT-2");
+        assert_eq!(model.spec.max_context, 1024);
+        assert_eq!(model.spec.hidden, 768);
+        assert_eq!(model.spec.heads, 12);
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(distilgpt2_fixture_path()).expect("DistilGPT-2 fixture"),
+        )
+        .expect("fixture JSON");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let prompt = case["prompt"].as_str().unwrap();
+            let prompt_ids: Vec<usize> = case["promptTokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let expected: Vec<usize> = case["tokenIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            assert_eq!(model.encode(prompt).unwrap(), prompt_ids, "{prompt}");
+            let generated = model.generate(prompt).unwrap();
+            assert_eq!(generated.generated_ids, expected, "{prompt}");
         }
     }
 }
