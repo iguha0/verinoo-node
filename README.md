@@ -46,7 +46,7 @@ test-suite exports the golden fixtures this workspace reproduces exactly. See
 ## Live testnet
 
 Prebuilt `x86_64` Linux binary:
-<https://github.com/iguha0/verinoo-node/releases/tag/v0.6.0-testnet>
+<https://github.com/iguha0/verinoo-node/releases/tag/v0.7.0-testnet>
 
 The `/v1` API is deployed behind **https://verinoo.com** (single validator,
 testnet, no SLA):
