@@ -461,3 +461,74 @@ fn transformer_task_runs_by_consensus_and_receipt_binds_weights() {
         verinoo_model::sha256_hex(&output)
     );
 }
+
+fn install_decoder_model() -> serde_json::Value {
+    let model_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-gpt-v1.json");
+    let bytes = std::fs::read(model_path).expect("committed decoder model");
+    let model = verinoo_runtime::GptModel::from_bytes(&bytes).expect("valid decoder");
+    let mut registry = verinoo_runtime::GptRegistry::empty();
+    registry.insert(model).unwrap();
+    verinoo_runtime::gpt::install_gpt_once(registry);
+    let fixture_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-gpt-v1.test.json");
+    serde_json::from_slice(&std::fs::read(fixture_path).expect("decoder fixture"))
+        .expect("fixture JSON")
+}
+
+#[test]
+fn decoder_task_runs_by_consensus_and_matches_the_float_generation() {
+    let fixture = install_decoder_model();
+    let case = &fixture["cases"][0];
+    let prompt = case["prompt"].as_str().unwrap();
+    let expected_text = case["text"].as_str().unwrap();
+
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-decoder", 7);
+    let user = keypair("decoder-requester");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": "tiny-gpt-v1",
+            "input": prompt,
+            "inputCommitment": verinoo_model::sha256_hex(prompt),
+            "maxFee": 100,
+            "deadline": 1_000,
+        }),
+        1,
+    );
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let head = current_head(&store).unwrap();
+    verinoo_exec::engine::validate_block(
+        &block,
+        &head.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .unwrap();
+    set_head(&store, &block);
+
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, "completed");
+    let output: serde_json::Value =
+        serde_json::from_str(task.result_output.as_deref().unwrap()).unwrap();
+    assert_eq!(output["generatedText"], expected_text);
+    assert_eq!(output["modelId"], "tiny-gpt-v1");
+    assert!(!output["tokenIds"].as_array().unwrap().is_empty());
+
+    let receipt = verinoo_exec::engine::receipt_for(&store, &task.task_id).unwrap();
+    assert_eq!(receipt["modelId"], "tiny-gpt-v1");
+    assert_eq!(
+        receipt["weightsHash"].as_str().unwrap().len(),
+        64,
+        "receipt must bind the decoder weights"
+    );
+}

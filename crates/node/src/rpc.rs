@@ -435,6 +435,7 @@ async fn v1_models() -> Json<serde_json::Value> {
         "models": verinoo_exec::engine::execute_models(),
         "modelSetHash": verinoo_runtime::global().hash(),
         "transformerSetHash": verinoo_runtime::transformer::transformer_global().hash(),
+        "gptSetHash": verinoo_runtime::gpt::gpt_global().hash(),
         "runtime": "deterministic-q16.16",
         "verification": "recompute",
     }))

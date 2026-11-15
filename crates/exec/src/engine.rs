@@ -1070,6 +1070,7 @@ pub enum ExecModel {
     Builtin,
     Runtime(std::sync::Arc<verinoo_runtime::Model>),
     Transformer(std::sync::Arc<verinoo_runtime::TransformerModel>),
+    Decoder(std::sync::Arc<verinoo_runtime::GptModel>),
 }
 
 impl ExecModel {
@@ -1082,10 +1083,13 @@ impl ExecModel {
         if let Some(model) = verinoo_runtime::global().get(model_id) {
             return Some(ExecModel::Runtime(model.clone()));
         }
-        verinoo_runtime::transformer::transformer_global()
+        if let Some(model) = verinoo_runtime::transformer::transformer_global().get(model_id) {
+            return Some(ExecModel::Transformer(model.clone()));
+        }
+        verinoo_runtime::gpt::gpt_global()
             .get(model_id)
             .cloned()
-            .map(ExecModel::Transformer)
+            .map(ExecModel::Decoder)
     }
 
     pub fn model_id(&self) -> &str {
@@ -1093,6 +1097,7 @@ impl ExecModel {
             ExecModel::Builtin => verinoo_model::MODEL_ID,
             ExecModel::Runtime(m) => m.model_id(),
             ExecModel::Transformer(m) => m.model_id(),
+            ExecModel::Decoder(m) => m.model_id(),
         }
     }
 
@@ -1102,6 +1107,7 @@ impl ExecModel {
             ExecModel::Builtin => verinoo_model::weights_hash(),
             ExecModel::Runtime(m) => m.weights_hash().to_string(),
             ExecModel::Transformer(m) => m.weights_hash().to_string(),
+            ExecModel::Decoder(m) => m.weights_hash().to_string(),
         }
     }
 
@@ -1111,6 +1117,7 @@ impl ExecModel {
             ExecModel::Builtin => Ok(verinoo_model::result_json(input)),
             ExecModel::Runtime(m) => Ok(m.result_json(input)),
             ExecModel::Transformer(m) => m.result_json(input),
+            ExecModel::Decoder(m) => m.result_json(input),
         }
     }
 }
@@ -1120,6 +1127,7 @@ pub fn execute_models() -> Vec<serde_json::Value> {
     let mut out = vec![verinoo_model::descriptor()];
     out.extend(verinoo_runtime::global().descriptors());
     out.extend(verinoo_runtime::transformer::transformer_global().descriptors());
+    out.extend(verinoo_runtime::gpt::gpt_global().descriptors());
     out
 }
 

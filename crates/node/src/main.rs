@@ -418,6 +418,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     verinoo_runtime::transformer::install_transformers_once(transformers);
 
+    // Generative decoder models: BPE tokenizer, causal attention, KV cache and
+    // greedy decoding. Same consensus rule: every validator loads the same set.
+    let (decoders, decoder_problems) = verinoo_runtime::gpt::GptRegistry::load_dir(&model_dir);
+    for problem in &decoder_problems {
+        tracing::warn!("decoder set: {problem}");
+    }
+    if !decoders.is_empty() {
+        for id in decoders.ids() {
+            tracing::info!("decoder loaded | {id}");
+        }
+        tracing::info!(
+            "decoder set: {} model(s) | hash {}",
+            decoders.len(),
+            &decoders.hash()[..16.min(decoders.hash().len())]
+        );
+    }
+    verinoo_runtime::gpt::install_gpt_once(decoders);
+
     let shared = Arc::new(Shared {
         store,
         params: cfg.genesis.clone(),
