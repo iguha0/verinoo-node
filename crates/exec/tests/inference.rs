@@ -56,6 +56,36 @@ fn make_tx(
     }
 }
 
+static INSTALL_MODELS: std::sync::Once = std::sync::Once::new();
+
+/// Install one process-wide model set for every test. `Once` serialises the
+/// installs so test order cannot change which registry wins.
+fn install_test_models() {
+    INSTALL_MODELS.call_once(|| {
+        let spec = verinoo_model::export_graph("acme-support-v1");
+        let model = verinoo_runtime::Model::from_value(&spec).expect("exported graph is valid");
+        let mut graph = verinoo_runtime::Registry::empty();
+        graph.insert(model).expect("unique graph model");
+        verinoo_runtime::install_once(graph);
+
+        let transformer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/intent-transformer-v1.json");
+        let bytes = std::fs::read(transformer_path).expect("committed transformer model");
+        let model = verinoo_runtime::TransformerModel::from_bytes(&bytes).expect("valid model");
+        let mut transformers = verinoo_runtime::TransformerRegistry::empty();
+        transformers.insert(model).unwrap();
+        verinoo_runtime::transformer::install_transformers_once(transformers);
+
+        let decoder_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-gpt-v1.json");
+        let bytes = std::fs::read(decoder_path).expect("committed decoder model");
+        let model = verinoo_runtime::GptModel::from_bytes(&bytes).expect("valid decoder");
+        let mut decoders = verinoo_runtime::GptRegistry::empty();
+        decoders.insert(model).unwrap();
+        verinoo_runtime::gpt::install_gpt_once(decoders);
+    });
+}
+
 fn fresh_chain() -> StateStore {
     let store = StateStore::open_temp().unwrap();
     let genesis = Block {
@@ -200,13 +230,10 @@ fn fee_is_settled_to_the_executor() {
 /// classifier it was exported from.
 #[test]
 fn operator_model_runs_through_the_generic_runtime() {
-    let input = "my parcel was never delivered";
+    install_test_models();
     let spec = verinoo_model::export_graph("acme-support-v1");
     let model = verinoo_runtime::Model::from_value(&spec).expect("exported graph is valid");
-    let mut registry = verinoo_runtime::Registry::empty();
-    registry.insert(model.clone()).expect("unique model id");
-    verinoo_runtime::install_once(registry);
-
+    let input = "my parcel was never delivered";
     let store = fresh_chain();
     let producer = ProducerKey::deterministic("validator-a", 1);
     let user = keypair("graph-requester");
@@ -259,13 +286,8 @@ fn operator_model_runs_through_the_generic_runtime() {
 /// now commits to every executed output.
 #[test]
 fn runtime_results_are_part_of_the_state_root() {
+    install_test_models();
     let input = "please cancel my subscription";
-    let spec = verinoo_model::export_graph("acme-support-v1");
-    let model = verinoo_runtime::Model::from_value(&spec).unwrap();
-    let mut registry = verinoo_runtime::Registry::empty();
-    registry.insert(model).unwrap();
-    verinoo_runtime::install_once(registry);
-
     let mut roots = Vec::new();
     for _ in 0..2 {
         let store = fresh_chain();
@@ -398,19 +420,9 @@ fn an_encrypted_task_with_a_wrong_commitment_does_not_execute() {
     }
 }
 
-fn install_transformer_model() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../models/intent-transformer-v1.json");
-    let bytes = std::fs::read(path).expect("committed transformer model");
-    let model = verinoo_runtime::TransformerModel::from_bytes(&bytes).expect("valid model");
-    let mut registry = verinoo_runtime::TransformerRegistry::empty();
-    registry.insert(model).unwrap();
-    verinoo_runtime::transformer::install_transformers_once(registry);
-}
-
 #[test]
 fn transformer_task_runs_by_consensus_and_receipt_binds_weights() {
-    install_transformer_model();
+    install_test_models();
     let store = fresh_chain();
     let producer = ProducerKey::deterministic("validator-transformer", 6);
     let user = keypair("transformer-requester");
@@ -462,14 +474,7 @@ fn transformer_task_runs_by_consensus_and_receipt_binds_weights() {
     );
 }
 
-fn install_decoder_model() -> serde_json::Value {
-    let model_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-gpt-v1.json");
-    let bytes = std::fs::read(model_path).expect("committed decoder model");
-    let model = verinoo_runtime::GptModel::from_bytes(&bytes).expect("valid decoder");
-    let mut registry = verinoo_runtime::GptRegistry::empty();
-    registry.insert(model).unwrap();
-    verinoo_runtime::gpt::install_gpt_once(registry);
+fn decoder_fixture() -> serde_json::Value {
     let fixture_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-gpt-v1.test.json");
     serde_json::from_slice(&std::fs::read(fixture_path).expect("decoder fixture"))
@@ -478,7 +483,8 @@ fn install_decoder_model() -> serde_json::Value {
 
 #[test]
 fn decoder_task_runs_by_consensus_and_matches_the_float_generation() {
-    let fixture = install_decoder_model();
+    install_test_models();
+    let fixture = decoder_fixture();
     let case = &fixture["cases"][0];
     let prompt = case["prompt"].as_str().unwrap();
     let expected_text = case["text"].as_str().unwrap();
