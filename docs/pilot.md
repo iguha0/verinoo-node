@@ -95,9 +95,11 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
   `VNN_SYNC_URLS`; there is no state snapshot transfer yet, so a very long
   chain takes proportionally longer to join.
 - **Auth is gateway-local.** API keys are address-bound and enforce a daily
-  quota, but quotas are billing/abuse control, not a consensus rule. Keys are
-  issued by the operator (`verinoo-node apikey`); there is no public signup yet.
-  The public demo runs without keys; paid deployments enable `VNN_API_KEYS_FILE`.
+  quota, but quotas are billing/abuse control, not a consensus rule. Keys can be
+  issued self-serve with `POST /v1/keys` when `VNN_SELF_SERVE_KEYS=1` (one key
+  per address, default 1000 tasks/day), or by the operator with
+  `verinoo-node apikey`. The public demo runs without keys; paid deployments
+  enable `VNN_API_KEYS_FILE` and/or self-serve issuance.
 - **Input privacy is validator-confidential, not operator-blind.** Inputs are
   encrypted to a network X25519 key, so API/block readers see only ciphertext
   (`docs/privacy.md`). Every validator, including the operator, can decrypt.
@@ -141,7 +143,7 @@ state root and peers reject the block instead of forking.
 - **Design partner: $5,000 / 8 weeks.** Dedicated validator set, your classifier
   wired in, a joint verification run, and a weekly sync. Billed in fiat; usage
   reported from the CSV export.
-- **Usage: $0.50 per 1,000 tasks** on a self-serve key with a daily quota.
+- **Usage: $5 per 1,000 tasks** on a self-serve key with a daily quota.
 - **Enterprise: from $60k / year** for a private network and custom runtime work.
 
 Charge for the receipt, not the token count: the buyer is paying to prove what a
@@ -155,7 +157,8 @@ model returned.
    import are not implemented (`docs/decoder.md`). 4–8 weeks.
 2. Byzantine finality. `docs/adr/004-bft-finality.md` is a design only; no
    prevote/precommit, certificate or slashing code exists. 5.5–7 weeks.
-3. Self-serve key signup; keys are issued manually today.
+3. Self-serve key signup exists behind `VNN_SELF_SERVE_KEYS=1`, but there is
+   no automated billing/payment or key-revocation UI yet.
 4. Automatic HA/failover and on-chain validator removal (2–3 weeks). Manual
    replica promotion and coordinated key rotation are documented in
    [`docs/operations.md`](operations.md).

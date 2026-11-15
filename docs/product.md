@@ -167,7 +167,7 @@ the full readiness matrix.
 
 | Plan | Price | Includes |
 |---|---|---|
-| Usage | **$0.50 per 1,000 tasks** | metered from `/v1/usage`, invoiced monthly from the CSV export |
+| Usage | **$5 per 1,000 tasks** | metered from `/v1/usage`, invoiced monthly from the CSV export |
 | Design partner | **$5,000 / 8 weeks** | dedicated node, your model wired in, joint verification run, weekly sync |
 | Enterprise | from **$60k / year** | private network, custom model runtime, audit support |
 
