@@ -9,14 +9,17 @@
 //! greedy loop are all deterministic, so two nodes derive the same generated
 //! token ids from the same prompt and weights.
 
-use crate::attention::softmax_exp;
+use crate::attention::{exp_neg, softmax_exp};
 use crate::sha256_hex;
-use crate::transformer::{add_in_place, argmax_index, dense, dense_rows, isqrt, layer_norm};
+use crate::transformer::{
+    add_in_place, argmax_index, dense_accurate, dense_rows_accurate, isqrt, layer_norm_eps,
+};
 use crate::ONE;
+use fancy_regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 const MAX_HIDDEN: usize = 2048;
 const MAX_CONTEXT: usize = 8192;
@@ -52,6 +55,19 @@ pub struct GptSpec {
     pub architecture: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_tokenizer_kind")]
+    pub tokenizer_kind: String,
+    #[serde(default = "default_activation")]
+    pub activation: String,
+    #[serde(default = "default_attention_scale")]
+    pub attention_scale: String,
+    /// Q32.32 epsilon added to the layer-norm variance.
+    #[serde(default)]
+    pub layer_norm_epsilon: i64,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default = "default_prepend_bos")]
+    pub prepend_bos: bool,
     pub vocab: Vec<String>,
     pub merges: Vec<[String; 2]>,
     pub max_context: usize,
@@ -69,8 +85,26 @@ pub struct GptSpec {
     pub decoder: Vec<GptLayer>,
     pub lnf_gamma: Vec<i32>,
     pub lnf_beta: Vec<i32>,
+    #[serde(default)]
     pub head_weights: Vec<i32>,
+    #[serde(default)]
     pub head_bias: Vec<i32>,
+}
+
+fn default_tokenizer_kind() -> String {
+    "char-bpe".into()
+}
+
+fn default_activation() -> String {
+    "relu".into()
+}
+
+fn default_attention_scale() -> String {
+    "sqrt".into()
+}
+
+fn default_prepend_bos() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +203,188 @@ impl BpeTokenizer {
     }
 }
 
+#[derive(Debug, Clone)]
+enum Tokenizer {
+    Char(Box<BpeTokenizer>),
+    Byte(Box<ByteBpeTokenizer>),
+}
+
+impl Tokenizer {
+    fn encode(&self, text: &str) -> Result<Vec<usize>, String> {
+        match self {
+            Tokenizer::Char(tokenizer) => Ok(tokenizer.encode(text)),
+            Tokenizer::Byte(tokenizer) => tokenizer.encode(text),
+        }
+    }
+
+    fn decode(&self, ids: &[usize]) -> String {
+        match self {
+            Tokenizer::Char(tokenizer) => tokenizer.decode(ids),
+            Tokenizer::Byte(tokenizer) => tokenizer.decode(ids),
+        }
+    }
+}
+
+/// GPT-2 byte-level BPE. The vocabulary and merge ranks come from the
+/// checkpoint's `vocab.json` and `merges.txt`; the pre-tokenizer is the
+/// standard GPT-2 ByteLevel regex.
+#[derive(Debug, Clone)]
+struct ByteBpeTokenizer {
+    vocab: Vec<String>,
+    token_to_id: BTreeMap<String, usize>,
+    ranks: BTreeMap<(String, String), usize>,
+    byte_to_unicode: [String; 256],
+    unicode_to_byte: BTreeMap<char, u8>,
+    bos_id: usize,
+    eos_id: usize,
+    pad_id: usize,
+    unk_id: usize,
+}
+
+static GPT2_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+        .expect("GPT-2 tokenizer regex")
+});
+
+impl ByteBpeTokenizer {
+    fn new(spec: &GptSpec) -> Result<Self, String> {
+        let mut token_to_id = BTreeMap::new();
+        for (i, token) in spec.vocab.iter().enumerate() {
+            if token_to_id.insert(token.clone(), i).is_some() {
+                return Err(format!("duplicate vocabulary token `{token}`"));
+            }
+        }
+        for (name, id) in [
+            ("bosId", spec.bos_id),
+            ("eosId", spec.eos_id),
+            ("padId", spec.pad_id),
+            ("unkId", spec.unk_id),
+        ] {
+            if id >= spec.vocab.len() {
+                return Err(format!("{name} is outside the vocabulary"));
+            }
+        }
+        let mut ranks = BTreeMap::new();
+        for (i, pair) in spec.merges.iter().enumerate() {
+            if pair[0].is_empty() || pair[1].is_empty() {
+                return Err("BPE merge contains an empty token".into());
+            }
+            if ranks
+                .insert((pair[0].clone(), pair[1].clone()), i)
+                .is_some()
+            {
+                return Err("duplicate BPE merge".into());
+            }
+        }
+        let (byte_to_unicode, unicode_to_byte) = bytes_to_unicode();
+        Ok(Self {
+            vocab: spec.vocab.clone(),
+            token_to_id,
+            ranks,
+            byte_to_unicode,
+            unicode_to_byte,
+            bos_id: spec.bos_id,
+            eos_id: spec.eos_id,
+            pad_id: spec.pad_id,
+            unk_id: spec.unk_id,
+        })
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<usize>, String> {
+        let mut out = Vec::new();
+        for found in GPT2_RE.find_iter(text) {
+            let matched = found.map_err(|e| format!("tokenizer regex: {e}"))?;
+            out.extend(self.encode_piece(matched.as_str())?);
+        }
+        Ok(out)
+    }
+
+    fn encode_piece(&self, piece: &str) -> Result<Vec<usize>, String> {
+        let mapped: String = piece
+            .bytes()
+            .map(|byte| self.byte_to_unicode[byte as usize].as_str())
+            .collect();
+        let mut parts: Vec<String> = mapped.chars().map(|ch| ch.to_string()).collect();
+        loop {
+            let mut best: Option<(usize, (String, String))> = None;
+            for i in 0..parts.len().saturating_sub(1) {
+                let pair = (parts[i].clone(), parts[i + 1].clone());
+                if let Some(rank) = self.ranks.get(&pair) {
+                    if best.as_ref().is_none_or(|(best_rank, _)| rank < best_rank) {
+                        best = Some((*rank, pair));
+                    }
+                }
+            }
+            let Some((_, (a, b))) = best else {
+                break;
+            };
+            let mut merged = Vec::with_capacity(parts.len());
+            let mut i = 0;
+            while i < parts.len() {
+                if i + 1 < parts.len() && parts[i] == a && parts[i + 1] == b {
+                    merged.push(format!("{a}{b}"));
+                    i += 2;
+                } else {
+                    merged.push(parts[i].clone());
+                    i += 1;
+                }
+            }
+            parts = merged;
+        }
+        parts
+            .iter()
+            .map(|part| {
+                self.token_to_id
+                    .get(part)
+                    .copied()
+                    .ok_or_else(|| format!("BPE token `{part}` is missing from the vocabulary"))
+            })
+            .collect()
+    }
+
+    fn decode(&self, ids: &[usize]) -> String {
+        let mut bytes = Vec::new();
+        for id in ids {
+            if *id == self.pad_id || *id == self.bos_id || *id == self.eos_id || *id == self.unk_id
+            {
+                continue;
+            }
+            if let Some(token) = self.vocab.get(*id) {
+                for ch in token.chars() {
+                    if let Some(byte) = self.unicode_to_byte.get(&ch) {
+                        bytes.push(*byte);
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+fn bytes_to_unicode() -> ([String; 256], BTreeMap<char, u8>) {
+    let mut bs: Vec<u8> = Vec::new();
+    bs.extend(b'!'..=b'~');
+    bs.extend(0xA1..=0xAC);
+    bs.extend(0xAE..=0xFF);
+    let mut cs: Vec<u32> = bs.iter().map(|b| *b as u32).collect();
+    let mut n = 0u32;
+    for b in 0..=255u8 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    let mut table: [String; 256] = std::array::from_fn(|_| String::new());
+    let mut inverse = BTreeMap::new();
+    for (byte, code) in bs.iter().zip(cs) {
+        let ch = char::from_u32(code).expect("valid byte-level code point");
+        table[*byte as usize] = ch.to_string();
+        inverse.insert(ch, *byte);
+    }
+    (table, inverse)
+}
+
 #[derive(Debug, Clone, Default)]
 struct LayerCache {
     k: Vec<i32>,
@@ -222,7 +438,7 @@ impl KVCache {
 pub struct GptModel {
     spec: GptSpec,
     weights_hash: String,
-    tokenizer: BpeTokenizer,
+    tokenizer: Tokenizer,
     head_dim: usize,
 }
 
@@ -237,7 +453,11 @@ impl GptModel {
         let spec: GptSpec =
             serde_json::from_value(value.clone()).map_err(|e| format!("invalid decoder: {e}"))?;
         validate_spec(&spec)?;
-        let tokenizer = BpeTokenizer::new(&spec)?;
+        let tokenizer = match spec.tokenizer_kind.as_str() {
+            "char-bpe" => Tokenizer::Char(Box::new(BpeTokenizer::new(&spec)?)),
+            "byte-bpe" => Tokenizer::Byte(Box::new(ByteBpeTokenizer::new(&spec)?)),
+            other => return Err(format!("unknown tokenizerKind `{other}`")),
+        };
         let weights_hash = sha256_hex(
             &serde_json::to_string(&spec).map_err(|e| format!("cannot hash model: {e}"))?,
         );
@@ -269,7 +489,7 @@ impl GptModel {
         parameter_count(&self.spec)
     }
 
-    pub fn encode(&self, text: &str) -> Vec<usize> {
+    pub fn encode(&self, text: &str) -> Result<Vec<usize>, String> {
         self.tokenizer.encode(text)
     }
 
@@ -312,10 +532,20 @@ impl GptModel {
         }
 
         for (layer_index, layer) in self.spec.decoder.iter().enumerate() {
-            let norm = layer_norm(&x, &layer.ln1_gamma, &layer.ln1_beta, rows, hidden);
-            let q = dense_rows(&norm, &layer.q_weights, &layer.q_bias, hidden, hidden, rows)?;
-            let k = dense_rows(&norm, &layer.k_weights, &layer.k_bias, hidden, hidden, rows)?;
-            let v = dense_rows(&norm, &layer.v_weights, &layer.v_bias, hidden, hidden, rows)?;
+            let norm = layer_norm_eps(
+                &x,
+                &layer.ln1_gamma,
+                &layer.ln1_beta,
+                rows,
+                hidden,
+                self.spec.layer_norm_epsilon,
+            );
+            let q =
+                dense_rows_accurate(&norm, &layer.q_weights, &layer.q_bias, hidden, hidden, rows)?;
+            let k =
+                dense_rows_accurate(&norm, &layer.k_weights, &layer.k_bias, hidden, hidden, rows)?;
+            let v =
+                dense_rows_accurate(&norm, &layer.v_weights, &layer.v_bias, hidden, hidden, rows)?;
             cache.append(layer_index, &k, &v)?;
             let attn = causal_attention(
                 &q,
@@ -325,13 +555,21 @@ impl GptModel {
                 past,
                 self.spec.heads,
                 self.head_dim,
+                self.spec.attention_scale == "sqrt",
             )?;
             let projected =
-                dense_rows(&attn, &layer.o_weights, &layer.o_bias, hidden, hidden, rows)?;
+                dense_rows_accurate(&attn, &layer.o_weights, &layer.o_bias, hidden, hidden, rows)?;
             add_in_place(&mut x, &projected);
 
-            let norm = layer_norm(&x, &layer.ln2_gamma, &layer.ln2_beta, rows, hidden);
-            let mut ff = dense_rows(
+            let norm = layer_norm_eps(
+                &x,
+                &layer.ln2_gamma,
+                &layer.ln2_beta,
+                rows,
+                hidden,
+                self.spec.layer_norm_epsilon,
+            );
+            let mut ff = dense_rows_accurate(
                 &norm,
                 &layer.ff1_weights,
                 &layer.ff1_bias,
@@ -340,9 +578,9 @@ impl GptModel {
                 rows,
             )?;
             for value in ff.iter_mut() {
-                *value = (*value).max(0);
+                *value = self.activate(*value);
             }
-            let ff = dense_rows(
+            let ff = dense_rows_accurate(
                 &ff,
                 &layer.ff2_weights,
                 &layer.ff2_bias,
@@ -353,26 +591,45 @@ impl GptModel {
             add_in_place(&mut x, &ff);
         }
 
-        let x = layer_norm(&x, &self.spec.lnf_gamma, &self.spec.lnf_beta, rows, hidden);
-        let last = &x[(rows - 1) * hidden..rows * hidden];
-        dense(
-            last,
-            &self.spec.head_weights,
-            &self.spec.head_bias,
+        let x = layer_norm_eps(
+            &x,
+            &self.spec.lnf_gamma,
+            &self.spec.lnf_beta,
+            rows,
             hidden,
-            self.spec.vocab.len(),
-        )
+            self.spec.layer_norm_epsilon,
+        );
+        let last = &x[(rows - 1) * hidden..rows * hidden];
+        let (head_weights, head_bias): (&[i32], &[i32]) = if self.spec.tie_word_embeddings {
+            (&self.spec.embedding, &[])
+        } else {
+            (&self.spec.head_weights, &self.spec.head_bias)
+        };
+        dense_accurate(last, head_weights, head_bias, hidden, self.spec.vocab.len())
+    }
+
+    fn activate(&self, value: i32) -> i32 {
+        match self.spec.activation.as_str() {
+            "gelu_new" => gelu_new(value as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+            _ => value.max(0),
+        }
     }
 
     pub fn generate(&self, prompt: &str) -> Result<Generated, String> {
-        let mut prompt_ids = self.tokenizer.encode(prompt);
-        let max_prompt = self.spec.max_context.saturating_sub(1);
+        let mut prompt_ids = self.tokenizer.encode(prompt)?;
+        let reserve = if self.spec.prepend_bos { 1 } else { 0 };
+        let max_prompt = self.spec.max_context.saturating_sub(reserve);
         if prompt_ids.len() > max_prompt {
             prompt_ids = prompt_ids[prompt_ids.len() - max_prompt..].to_vec();
         }
         let mut ids = Vec::with_capacity(self.spec.max_context);
-        ids.push(self.spec.bos_id);
+        if self.spec.prepend_bos {
+            ids.push(self.spec.bos_id);
+        }
         ids.extend_from_slice(&prompt_ids);
+        if ids.is_empty() {
+            ids.push(self.spec.bos_id);
+        }
 
         let mut cache = KVCache::new(self.spec.layers, self.spec.hidden);
         let mut logits = self.forward_sequence(&ids, &mut cache)?;
@@ -429,6 +686,36 @@ impl GptModel {
     }
 }
 
+/// NewGELU, the tanh approximation used by GPT-2/GPT-Neo:
+/// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
+fn gelu_new(x: i64) -> i64 {
+    let x2 = qmul(x, x);
+    let x3 = qmul(x2, x);
+    let inner = qmul(52_293, x.saturating_add(qmul(2_931, x3)));
+    let t = tanh_q(inner);
+    qmul(x, (ONE as i64 + t) / 2)
+}
+
+fn tanh_q(x: i64) -> i64 {
+    let x = x.clamp(-8 * ONE as i64, 8 * ONE as i64);
+    let e = exp_q(x.saturating_mul(2));
+    ((e - ONE as i64) * ONE as i64) / (e + ONE as i64)
+}
+
+fn exp_q(x: i64) -> i64 {
+    if x >= 0 {
+        let x = x.min(10 * ONE as i64);
+        (ONE as i64 * ONE as i64) / exp_neg(x).max(1)
+    } else {
+        exp_neg(-x)
+    }
+}
+
+fn qmul(a: i64, b: i64) -> i64 {
+    ((a as i128 * b as i128) >> 16).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+#[allow(clippy::too_many_arguments)]
 fn causal_attention(
     q: &[i32],
     k: &[i32],
@@ -437,6 +724,7 @@ fn causal_attention(
     past: usize,
     heads: usize,
     head_dim: usize,
+    scale_attention: bool,
 ) -> Result<Vec<i32>, String> {
     let hidden = heads
         .checked_mul(head_dim)
@@ -459,7 +747,11 @@ fn causal_attention(
             v.len()
         ));
     }
-    let scale = isqrt((ONE as u64 * ONE as u64) / head_dim as u64) as i64;
+    let scale = if scale_attention {
+        isqrt((ONE as u64 * ONE as u64) / head_dim as u64) as i64
+    } else {
+        ONE as i64
+    };
     let mut out = vec![0i32; q_len * hidden];
     for h in 0..heads {
         let offset = h * head_dim;
@@ -498,6 +790,27 @@ fn validate_spec(spec: &GptSpec) -> Result<(), String> {
     if spec.model_id.trim().is_empty() {
         return Err("modelId must not be empty".into());
     }
+    if !matches!(spec.tokenizer_kind.as_str(), "char-bpe" | "byte-bpe") {
+        return Err(format!(
+            "tokenizerKind must be `char-bpe` or `byte-bpe`, got `{}`",
+            spec.tokenizer_kind
+        ));
+    }
+    if !matches!(spec.activation.as_str(), "relu" | "gelu_new") {
+        return Err(format!(
+            "activation must be `relu` or `gelu_new`, got `{}`",
+            spec.activation
+        ));
+    }
+    if !matches!(spec.attention_scale.as_str(), "sqrt" | "none") {
+        return Err(format!(
+            "attentionScale must be `sqrt` or `none`, got `{}`",
+            spec.attention_scale
+        ));
+    }
+    if spec.layer_norm_epsilon < 0 {
+        return Err("layerNormEpsilon must not be negative".into());
+    }
     if spec.vocab.is_empty() || spec.vocab.len() > MAX_VOCAB {
         return Err("vocab size is invalid".into());
     }
@@ -525,8 +838,14 @@ fn validate_spec(spec: &GptSpec) -> Result<(), String> {
     expect_len("positional", spec.positional.len(), spec.max_context * h)?;
     expect_len("lnfGamma", spec.lnf_gamma.len(), h)?;
     expect_len("lnfBeta", spec.lnf_beta.len(), h)?;
-    expect_len("headWeights", spec.head_weights.len(), spec.vocab.len() * h)?;
-    expect_len("headBias", spec.head_bias.len(), spec.vocab.len())?;
+    if spec.tie_word_embeddings {
+        if !spec.head_weights.is_empty() || !spec.head_bias.is_empty() {
+            return Err("tied embeddings must not include headWeights or headBias".into());
+        }
+    } else {
+        expect_len("headWeights", spec.head_weights.len(), spec.vocab.len() * h)?;
+        expect_len("headBias", spec.head_bias.len(), spec.vocab.len())?;
+    }
     let matrix = h * h;
     for (i, layer) in spec.decoder.iter().enumerate() {
         for (name, len) in [
@@ -574,12 +893,12 @@ fn expect_len(name: &str, got: usize, want: usize) -> Result<(), String> {
 }
 
 fn parameter_count(spec: &GptSpec) -> u64 {
-    let mut total = (spec.embedding.len()
-        + spec.positional.len()
-        + spec.lnf_gamma.len()
-        + spec.lnf_beta.len()
-        + spec.head_weights.len()
-        + spec.head_bias.len()) as u64;
+    let mut total =
+        (spec.embedding.len() + spec.positional.len() + spec.lnf_gamma.len() + spec.lnf_beta.len())
+            as u64;
+    if !spec.tie_word_embeddings {
+        total += (spec.head_weights.len() + spec.head_bias.len()) as u64;
+    }
     for layer in &spec.decoder {
         total += (layer.ln1_gamma.len()
             + layer.ln1_beta.len()
@@ -723,7 +1042,7 @@ mod tests {
     fn bpe_matches_the_training_script() {
         let model = load();
         let text = "please cancel order 2064";
-        let ids = model.encode(text);
+        let ids = model.encode(text).unwrap();
         assert_eq!(model.decode(&ids), text);
         let fixture: serde_json::Value =
             serde_json::from_slice(&std::fs::read(fixture_path()).expect("fixture"))
@@ -736,13 +1055,13 @@ mod tests {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect();
-        assert_eq!(model.encode(prompt), expected);
+        assert_eq!(model.encode(prompt).unwrap(), expected);
     }
 
     #[test]
     fn kv_cache_matches_full_forward() {
         let model = load();
-        let ids = model.encode("please cancel order 2064");
+        let ids = model.encode("please cancel order 2064").unwrap();
         let full = model.forward_logits(&ids).unwrap();
         let mut cache = KVCache::new(model.spec.layers, model.spec.hidden);
         let prefill = model.forward_sequence(&ids, &mut cache).unwrap();
@@ -818,5 +1137,136 @@ mod tests {
         registry.insert(model).unwrap();
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.hash().len(), 64);
+    }
+
+    static STORIES: OnceLock<GptModel> = OnceLock::new();
+
+    fn stories_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-stories-1m.json")
+    }
+
+    fn stories_fixture_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-stories-1m.test.json")
+    }
+
+    fn stories_available() -> bool {
+        stories_path().exists() && stories_fixture_path().exists()
+    }
+
+    fn skip_without_stories() -> bool {
+        if stories_available() {
+            false
+        } else {
+            eprintln!("skip: run scripts/import_tiny_stories.py to create the TinyStories model");
+            true
+        }
+    }
+
+    fn stories() -> &'static GptModel {
+        STORIES.get_or_init(|| {
+            let bytes = std::fs::read(stories_path()).expect("committed TinyStories model");
+            GptModel::from_bytes(&bytes).expect("valid TinyStories model")
+        })
+    }
+
+    fn stories_fixture() -> serde_json::Value {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/tiny-stories-1m.test.json");
+        serde_json::from_slice(&std::fs::read(path).expect("TinyStories fixture"))
+            .expect("fixture JSON")
+    }
+
+    #[test]
+    fn gpt2_tokenizer_matches_the_reference() {
+        if skip_without_stories() {
+            return;
+        }
+        let model = stories();
+        let fixture = stories_fixture();
+        for case in fixture["cases"].as_array().unwrap() {
+            let prompt = case["prompt"].as_str().unwrap();
+            let expected: Vec<usize> = case["promptTokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            assert_eq!(model.encode(prompt).unwrap(), expected, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn tiny_stories_greedy_tokens_match_the_reference() {
+        if skip_without_stories() {
+            return;
+        }
+        let model = stories();
+        let fixture = stories_fixture();
+        let mut mismatches = Vec::new();
+        for case in fixture["cases"].as_array().unwrap() {
+            let prompt = case["prompt"].as_str().unwrap();
+            let expected: Vec<usize> = case["tokenIds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let got = model.generate(prompt).unwrap();
+            if got.generated_ids != expected {
+                let first_diff = got
+                    .generated_ids
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b);
+                mismatches.push(format!(
+                    "{prompt}: first diff {:?}, got len {}, expected len {}",
+                    first_diff,
+                    got.generated_ids.len(),
+                    expected.len()
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "token parity failed on {} prompts: {:?}",
+            mismatches.len(),
+            mismatches
+        );
+    }
+
+    #[test]
+    fn tiny_stories_kv_cache_matches_full_forward() {
+        if skip_without_stories() {
+            return;
+        }
+        let model = stories();
+        let ids = model.encode("Once upon a time").unwrap();
+        let full = model.forward_logits(&ids).unwrap();
+        let mut cache = KVCache::new(model.spec.layers, model.spec.hidden);
+        let prefill = model.forward_sequence(&ids, &mut cache).unwrap();
+        assert_eq!(prefill, full);
+        let next = argmax_index(&full).unwrap();
+        let mut extended = ids.clone();
+        extended.push(next);
+        let full_next = model.forward_logits(&extended).unwrap();
+        let step = model.forward_sequence(&[next], &mut cache).unwrap();
+        assert_eq!(step, full_next);
+    }
+
+    #[test]
+    fn gelu_new_matches_the_reference() {
+        for (x, want) in [
+            (-3.0f64, -0.003637392),
+            (-1.0, -0.158808009),
+            (0.0, 0.0),
+            (1.0, 0.841191991),
+            (3.0, 2.996362608),
+        ] {
+            let got = gelu_new((x * ONE as f64) as i64) as f64 / ONE as f64;
+            assert!(
+                (got - want).abs() < 0.02,
+                "gelu_new({x}) = {got}, want {want}"
+            );
+        }
     }
 }

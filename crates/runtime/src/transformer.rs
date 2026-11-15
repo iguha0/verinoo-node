@@ -487,17 +487,85 @@ pub(crate) fn dense(
             weights.len()
         ));
     }
-    if bias.len() != output {
+    if !bias.is_empty() && bias.len() != output {
         return Err(format!("dense bias: expected {output}, got {}", bias.len()));
     }
     let mut out = vec![0i32; output];
     for (j, slot) in out.iter_mut().enumerate() {
-        let mut acc = bias[j] as i64;
+        let mut acc = if bias.is_empty() { 0 } else { bias[j] as i64 };
         let row = j * input;
         for (f, &xv) in x.iter().enumerate() {
             acc += ((xv as i64) * (weights[row + f] as i64)) >> 16;
         }
         *slot = acc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    Ok(out)
+}
+
+/// Dense layer with one final shift (instead of a shift per product) and
+/// round-to-nearest. This is the high-precision variant used by the GPT
+/// decoder, where small errors accumulate over many autoregressive steps.
+pub(crate) fn dense_accurate(
+    x: &[i32],
+    weights: &[i32],
+    bias: &[i32],
+    input: usize,
+    output: usize,
+) -> Result<Vec<i32>, String> {
+    if x.len() != input {
+        return Err(format!("dense input: expected {input}, got {}", x.len()));
+    }
+    if weights.len() != output * input {
+        return Err(format!(
+            "dense weights: expected {}, got {}",
+            output * input,
+            weights.len()
+        ));
+    }
+    if !bias.is_empty() && bias.len() != output {
+        return Err(format!("dense bias: expected {output}, got {}", bias.len()));
+    }
+    let mut out = vec![0i32; output];
+    for (j, slot) in out.iter_mut().enumerate() {
+        let mut acc = if bias.is_empty() {
+            0
+        } else {
+            (bias[j] as i64) << 16
+        };
+        let row = j * input;
+        for (f, &xv) in x.iter().enumerate() {
+            acc += (xv as i64) * (weights[row + f] as i64);
+        }
+        *slot = div_round(acc, ONE as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
+    Ok(out)
+}
+
+pub(crate) fn dense_rows_accurate(
+    x: &[i32],
+    weights: &[i32],
+    bias: &[i32],
+    input: usize,
+    output: usize,
+    rows: usize,
+) -> Result<Vec<i32>, String> {
+    if x.len() != rows * input {
+        return Err(format!(
+            "dense rows input: expected {}, got {}",
+            rows * input,
+            x.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(rows * output);
+    for row in 0..rows {
+        let values = dense_accurate(
+            &x[row * input..(row + 1) * input],
+            weights,
+            bias,
+            input,
+            output,
+        )?;
+        out.extend_from_slice(&values);
     }
     Ok(out)
 }
@@ -544,6 +612,17 @@ pub(crate) fn layer_norm(
     rows: usize,
     hidden: usize,
 ) -> Vec<i32> {
+    layer_norm_eps(x, gamma, beta, rows, hidden, 0)
+}
+
+pub(crate) fn layer_norm_eps(
+    x: &[i32],
+    gamma: &[i32],
+    beta: &[i32],
+    rows: usize,
+    hidden: usize,
+    epsilon_q32: i64,
+) -> Vec<i32> {
     let mut out = vec![0i32; rows * hidden];
     for row in 0..rows {
         let values = &x[row * hidden..(row + 1) * hidden];
@@ -554,16 +633,16 @@ pub(crate) fn layer_norm(
             let d = *value as i64 - mean;
             variance += d * d;
         }
-        variance = div_round(variance, hidden as i64);
+        variance = div_round(variance, hidden as i64).saturating_add(epsilon_q32);
         let mut std = isqrt(variance.max(0) as u64) as i64;
         if std < 1 {
             std = 1;
         }
-        let inv = ((ONE as i64 * ONE as i64) / std).clamp(0, 8 * ONE as i64);
+        let inv = ((ONE as i64 * ONE as i64) / std).clamp(0, ONE as i64 * ONE as i64);
         for j in 0..hidden {
             let d = values[j] as i64 - mean;
-            let norm = (d * inv) >> 16;
-            let y = ((norm * gamma[j] as i64) >> 16) + beta[j] as i64;
+            let norm = div_round(d * inv, ONE as i64);
+            let y = div_round(norm * gamma[j] as i64, ONE as i64) + beta[j] as i64;
             out[row * hidden + j] = y.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
         }
     }

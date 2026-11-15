@@ -1,0 +1,16 @@
+TinyStories-1M
+==============
+
+Source:   https://huggingface.co/roneneldan/TinyStories-1M
+Paper:    https://arxiv.org/abs/2305.07759
+Dataset:  roneneldan/TinyStories (CDLA-Sharing-1.0)
+
+The model card does not state a license for the model weights. They are
+therefore NOT redistributed in this repository or its release artifacts.
+
+To run the demonstration decoder locally, download and convert the weights:
+
+    python3 scripts/import_tiny_stories.py
+
+Review the model card and the dataset terms before using the weights.
+The tokenizer files come from the same model repository.

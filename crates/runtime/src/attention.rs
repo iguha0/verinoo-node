@@ -158,7 +158,7 @@ pub fn softmax_exp(x: &[i32]) -> Vec<i32> {
 /// ln(2) in Q16.16.
 const LN2_Q: i64 = 45_426;
 
-fn exp_neg(z: i64) -> i64 {
+pub(crate) fn exp_neg(z: i64) -> i64 {
     let n = (z / LN2_Q).clamp(0, 15);
     let r = z - n * LN2_Q;
     let r2 = (r * r) >> 16;
