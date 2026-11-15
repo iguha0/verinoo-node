@@ -82,6 +82,13 @@ fn install_test_models() {
         let model = verinoo_runtime::GptModel::from_bytes(&bytes).expect("valid decoder");
         let mut decoders = verinoo_runtime::GptRegistry::empty();
         decoders.insert(model).unwrap();
+        let stories_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/tiny-stories-1m.json");
+        if stories_path.exists() {
+            let bytes = std::fs::read(stories_path).expect("TinyStories model");
+            let model = verinoo_runtime::GptModel::from_bytes(&bytes).expect("valid TinyStories");
+            decoders.insert(model).unwrap();
+        }
         verinoo_runtime::gpt::install_gpt_once(decoders);
     });
 }
@@ -537,4 +544,81 @@ fn decoder_task_runs_by_consensus_and_matches_the_float_generation() {
         64,
         "receipt must bind the decoder weights"
     );
+}
+
+#[test]
+fn real_decoder_task_runs_by_consensus_and_matches_the_float_generation() {
+    install_test_models();
+    if verinoo_runtime::gpt::gpt_global()
+        .get("tiny-stories-1m")
+        .is_none()
+    {
+        eprintln!("skip: run scripts/import_tiny_stories.py to create the TinyStories model");
+        return;
+    }
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models/tiny-stories-1m.test.json");
+    let fixture: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture_path).expect("TinyStories fixture"))
+            .expect("fixture JSON");
+    let case = &fixture["cases"][0];
+    let prompt = case["prompt"].as_str().unwrap();
+    let expected_text = case["text"].as_str().unwrap();
+    let expected_tokens: Vec<u64> = case["tokenIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-stories", 8);
+    let user = keypair("stories-requester");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": "tiny-stories-1m",
+            "input": prompt,
+            "inputCommitment": verinoo_model::sha256_hex(prompt),
+            "maxFee": 100,
+            "deadline": 1_000,
+        }),
+        1,
+    );
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let head = current_head(&store).unwrap();
+    verinoo_exec::engine::validate_block(
+        &block,
+        &head.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .unwrap();
+    set_head(&store, &block);
+
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, "completed");
+    let output: serde_json::Value =
+        serde_json::from_str(task.result_output.as_deref().unwrap()).unwrap();
+    assert_eq!(output["generatedText"], expected_text);
+    assert_eq!(output["modelId"], "tiny-stories-1m");
+    let tokens: Vec<u64> = output["tokenIds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    assert_eq!(tokens, expected_tokens);
+
+    let receipt = verinoo_exec::engine::receipt_for(&store, &task.task_id).unwrap();
+    assert_eq!(receipt["modelId"], "tiny-stories-1m");
+    assert_eq!(receipt["weightsHash"].as_str().unwrap().len(), 64);
 }
