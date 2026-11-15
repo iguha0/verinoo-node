@@ -1,0 +1,308 @@
+{
+  "modelId": "claims-triage-v1",
+  "note": "Q16.16 reference labels and scores from the exported graph.",
+  "testAccuracy": 0.9875,
+  "parityWithFloat": 1.0,
+  "cases": [
+    {
+      "text": "the neighbor says our contractor damaged their fence reference 3986",
+      "label": "liability",
+      "predicted": "liability",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the claimant used a repair shop owned by a relative for about 8900 euros",
+      "label": "fraud_review",
+      "predicted": "fraud_review",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        65536,
+        0
+      ]
+    },
+    {
+      "text": "the kitchen fire spread smoke damage through the house in paris",
+      "label": "property_damage",
+      "predicted": "property_damage",
+      "scores": [
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "a worker cut a hand on the exposed metal edge reference 9977",
+      "label": "medical_injury",
+      "predicted": "medical_injury",
+      "scores": [
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "a guest says the hotel valet scratched their car reference 7960",
+      "label": "liability",
+      "predicted": "liability",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the manufacturer recalled the part and should cover our payout for about 8600 euros",
+      "label": "subrogation",
+      "predicted": "subrogation",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        65536
+      ]
+    },
+    {
+      "text": "a tornado lifted the shed and dropped it in the field in hamburg",
+      "label": "weather",
+      "predicted": "property_damage",
+      "scores": [
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the guest burned an arm on the hot serving tray claim 1027",
+      "label": "medical_injury",
+      "predicted": "medical_injury",
+      "scores": [
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "a pipe burst in the basement and flooded the floor in milan",
+      "label": "property_damage",
+      "predicted": "property_damage",
+      "scores": [
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the shipment was opened and the phone was missing policy 22209",
+      "label": "theft",
+      "predicted": "theft",
+      "scores": [
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "a parcel was left in the lobby and never reached me in london",
+      "label": "theft",
+      "predicted": "theft",
+      "scores": [
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "storm water backed up through the drains into the shop for about 6200 euros",
+      "label": "weather",
+      "predicted": "weather",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "a taxi merged into my lane and scraped the whole side in prague",
+      "label": "auto_collision",
+      "predicted": "auto_collision",
+      "scores": [
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the landlord says the upstairs tenant caused the leak for about 8800 euros",
+      "label": "subrogation",
+      "predicted": "weather",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the medical report was altered before submission in warsaw",
+      "label": "fraud_review",
+      "predicted": "fraud_review",
+      "scores": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        65536,
+        0
+      ]
+    },
+    {
+      "text": "my laptop was stolen from the hotel room in leeds",
+      "label": "theft",
+      "predicted": "theft",
+      "scores": [
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "my bicycle was taken from the garage overnight for about 7600 euros",
+      "label": "theft",
+      "predicted": "theft",
+      "scores": [
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the tools were stolen from the locked site container policy 84607",
+      "label": "theft",
+      "predicted": "theft",
+      "scores": [
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "i twisted my knee on the uneven pavement outside in vienna",
+      "label": "medical_injury",
+      "predicted": "medical_injury",
+      "scores": [
+        0,
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "text": "the tools were stolen from the locked site container in prague",
+      "label": "theft",
+      "predicted": "theft",
+      "scores": [
+        0,
+        0,
+        65536,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

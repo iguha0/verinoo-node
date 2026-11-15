@@ -66,6 +66,11 @@ fn install_test_models() {
         let model = verinoo_runtime::Model::from_value(&spec).expect("exported graph is valid");
         let mut graph = verinoo_runtime::Registry::empty();
         graph.insert(model).expect("unique graph model");
+        let claims_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/claims-triage-v1.graph.json");
+        let bytes = std::fs::read(claims_path).expect("committed claims model");
+        let model = verinoo_runtime::Model::from_bytes(&bytes).expect("valid claims model");
+        graph.insert(model).expect("unique claims model");
         verinoo_runtime::install_once(graph);
 
         let transformer_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -621,4 +626,55 @@ fn real_decoder_task_runs_by_consensus_and_matches_the_float_generation() {
     let receipt = verinoo_exec::engine::receipt_for(&store, &task.task_id).unwrap();
     assert_eq!(receipt["modelId"], "tiny-stories-1m");
     assert_eq!(receipt["weightsHash"].as_str().unwrap().len(), 64);
+}
+
+#[test]
+fn claims_triage_task_runs_by_consensus() {
+    install_test_models();
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-claims", 9);
+    let user = keypair("claims-requester");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let input = "a tree fell on the roof and broke two windows";
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": "claims-triage-v1",
+            "input": input,
+            "inputCommitment": verinoo_model::sha256_hex(input),
+            "maxFee": 100,
+            "deadline": 1_000,
+        }),
+        1,
+    );
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let head = current_head(&store).unwrap();
+    verinoo_exec::engine::validate_block(
+        &block,
+        &head.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .unwrap();
+    set_head(&store, &block);
+
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, "completed");
+    let output: serde_json::Value =
+        serde_json::from_str(task.result_output.as_deref().unwrap()).unwrap();
+    assert_eq!(output["label"], "property_damage");
+    assert_eq!(output["modelId"], "claims-triage-v1");
+    let receipt = verinoo_exec::engine::receipt_for(&store, &task.task_id).unwrap();
+    assert_eq!(receipt["modelId"], "claims-triage-v1");
+    assert_eq!(
+        receipt["outputHash"].as_str().unwrap(),
+        verinoo_model::sha256_hex(task.result_output.as_deref().unwrap())
+    );
 }

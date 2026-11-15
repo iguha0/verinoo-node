@@ -410,15 +410,19 @@ impl Registry {
         for path in paths {
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    let is_transformer = serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("kind")
+                    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+                    let skip = value
+                        .as_ref()
+                        .map(|v| {
+                            let other_runtime = v
+                                .get("kind")
                                 .and_then(|k| k.as_str())
                                 .map(|s| s == "transformer-classifier" || s == "gpt-decoder")
+                                .unwrap_or(false);
+                            other_runtime || v.get("cases").is_some()
                         })
                         .unwrap_or(false);
-                    if is_transformer {
+                    if skip {
                         continue;
                     }
                     match Model::from_bytes(&bytes) {
@@ -605,5 +609,42 @@ mod tests {
             reg.get("unit-graph").unwrap().parameter_count(),
             6 + 3 + 6 + 2
         );
+    }
+
+    #[test]
+    fn claims_triage_matches_the_exported_fixture() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        let model = Model::from_bytes(
+            &std::fs::read(base.join("claims-triage-v1.graph.json")).expect("claims model"),
+        )
+        .expect("valid claims graph");
+        let fixture: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(base.join("claims-triage-v1.test.json")).expect("claims fixture"),
+        )
+        .expect("fixture JSON");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let text = case["text"].as_str().unwrap();
+            let expected_label = case["predicted"].as_str().unwrap();
+            let expected_scores: Vec<i32> = case["scores"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as i32)
+                .collect();
+            let prediction = model.infer(text);
+            assert_eq!(prediction.label, expected_label, "{text}");
+            assert_eq!(prediction.scores, expected_scores, "{text}");
+        }
+    }
+
+    #[test]
+    fn model_dir_skips_other_runtimes_and_fixtures() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        let (registry, problems) = Registry::load_dir(&dir);
+        assert!(registry.get("acme-support-v1").is_some());
+        assert!(registry.get("claims-triage-v1").is_some());
+        assert!(registry.get("intent-transformer-v1").is_none());
+        assert!(registry.get("tiny-gpt-v1").is_none());
+        assert!(problems.is_empty(), "{problems:?}");
     }
 }

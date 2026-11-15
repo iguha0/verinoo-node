@@ -185,6 +185,20 @@ python3 scripts/import_tiny_stories.py
 verinoo-node infer --model tiny-stories-1m --input "Once upon a time"
 ```
 
+## Claims-triage pilot demo
+
+The vertical demo for the design-partner profile is a realistic claims
+classifier over the production hashed-unigram featuriser:
+
+```bash
+./scripts/demo-claims.sh
+# or against the live testnet
+CLAIMS_NODE=https://verinoo.com ./scripts/demo-claims.sh
+```
+
+It submits three claim notes, verifies each receipt and writes a pilot report to
+`reports/`. See [`docs/claims-pilot.md`](docs/claims-pilot.md).
+
 ## Wallet and API keys
 
 ```bash

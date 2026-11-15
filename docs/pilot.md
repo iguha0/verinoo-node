@@ -103,6 +103,17 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
   (`docs/privacy.md`). Every validator, including the operator, can decrypt.
   Pre-encryption tasks remain public; start a fresh chain for a pilot.
 
+## Vertical demo: claims triage
+
+A concrete example of the design-partner shape is in
+[`docs/claims-pilot.md`](claims-pilot.md): an eight-queue claims classifier with
+98.75% held-out accuracy, 100% integer parity, a one-command receipt demo and a
+pilot report you can send to a model-risk team.
+
+```bash
+./scripts/demo-claims.sh
+```
+
 ## Wire in your own classifier
 
 The model must score the hashed-unigram feature vector (2048 by default) and

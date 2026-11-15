@@ -1,0 +1,800 @@
+{"text": "the manufacturer recalled the part and should cover our payout for about 8600 euros", "label": "subrogation"}
+{"text": "a pipe burst in the basement and flooded the floor for about 2900 euros", "label": "property_damage"}
+{"text": "flood water entered the ground floor after the hurricane reference 2859", "label": "weather"}
+{"text": "the claimant needed stitches after the dog bite claim 1005", "label": "medical_injury"}
+{"text": "the other car ran the stop sign and hit the driver side for about 3500 euros", "label": "auto_collision"}
+{"text": "my bicycle was taken from the garage overnight claim 1053", "label": "theft"}
+{"text": "a parcel was left in the lobby and never reached me for about 3300 euros", "label": "theft"}
+{"text": "the other carrier has accepted 100 percent liability in madrid", "label": "subrogation"}
+{"text": "the claimant needed stitches after the dog bite claim 1065", "label": "medical_injury"}
+{"text": "a parcel was left in the lobby and never reached me for about 3700 euros", "label": "theft"}
+{"text": "another driver hit my parked car in the lot in hamburg", "label": "auto_collision"}
+{"text": "the claimant changed the date of loss three times in berlin", "label": "fraud_review"}
+{"text": "my camera bag disappeared from the train luggage rack policy 56007", "label": "theft"}
+{"text": "a tornado lifted the shed and dropped it in the field for about 4200 euros", "label": "weather"}
+{"text": "a guest says the hotel valet scratched their car reference 7960", "label": "liability"}
+{"text": "the other carrier has accepted 100 percent liability policy 25827", "label": "subrogation"}
+{"text": "a truck backed into my front fender at the depot claim 1064", "label": "auto_collision"}
+{"text": "the contractor caused the water damage and should reimburse us policy 31145", "label": "subrogation"}
+{"text": "a pipe burst in the basement and flooded the floor reference 8469", "label": "property_damage"}
+{"text": "flood water entered the ground floor after the hurricane claim 1011", "label": "weather"}
+{"text": "ice dams caused water to stain the upstairs ceiling claim 1018", "label": "weather"}
+{"text": "a falling branch smashed the conservatory glass claim 1079", "label": "property_damage"}
+{"text": "the washing machine overflowed and ruined the hardwood policy 81205", "label": "property_damage"}
+{"text": "the driver suffered whiplash after the collision in lisbon", "label": "medical_injury"}
+{"text": "a falling branch smashed the conservatory glass reference 2522", "label": "property_damage"}
+{"text": "a delivery truck cracked the driveway and the garden wall in berlin", "label": "property_damage"}
+{"text": "the subcontractor caused the injury and their policy should respond reference 6515", "label": "subrogation"}
+{"text": "my laptop was stolen from the hotel room reference 7587", "label": "theft"}
+{"text": "the warehouse pallet was short and the stock is gone reference 5871", "label": "theft"}
+{"text": "the third party admitted the collision and their insurer is liable reference 9340", "label": "subrogation"}
+{"text": "the guest burned an arm on the hot serving tray in paris", "label": "medical_injury"}
+{"text": "high winds tore the awning off the storefront in porto", "label": "weather"}
+{"text": "my camera bag disappeared from the train luggage rack reference 8077", "label": "theft"}
+{"text": "the freeze burst the outdoor pipes for about 2000 euros", "label": "weather"}
+{"text": "the at-fault party has accepted liability please pursue recovery claim 1083", "label": "subrogation"}
+{"text": "the heatwave warped the warehouse roof panels policy 35665", "label": "weather"}
+{"text": "the guest burned an arm on the hot serving tray policy 68892", "label": "medical_injury"}
+{"text": "the other carrier has accepted 100 percent liability reference 3449", "label": "subrogation"}
+{"text": "a delivery truck cracked the driveway and the garden wall in berlin", "label": "property_damage"}
+{"text": "the customer alleges the food made them ill policy 13682", "label": "liability"}
+{"text": "the insured fell from a ladder and broke a wrist claim 1051", "label": "medical_injury"}
+{"text": "our insured was hit by a commercial truck and we paid the claim for about 5500 euros", "label": "subrogation"}
+{"text": "my laptop was stolen from the hotel room claim 1070", "label": "theft"}
+{"text": "the kitchen fire spread smoke damage through the house in paris", "label": "property_damage"}
+{"text": "the driver suffered whiplash after the collision for about 8500 euros", "label": "medical_injury"}
+{"text": "the same invoice was submitted twice with different dates in berlin", "label": "fraud_review"}
+{"text": "a tree fell on the roof and broke two windows claim 1060", "label": "property_damage"}
+{"text": "my car was rear ended at a red light and the bumper is cracked in dublin", "label": "auto_collision"}
+{"text": "a tree fell on the roof and broke two windows reference 4360", "label": "property_damage"}
+{"text": "my passport and wallet were taken from the rental car claim 1065", "label": "theft"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling claim 1091", "label": "property_damage"}
+{"text": "the insured fell from a ladder and broke a wrist for about 6300 euros", "label": "medical_injury"}
+{"text": "the front end was crushed when i hit a stalled car for about 7200 euros", "label": "auto_collision"}
+{"text": "the claimant changed the date of loss three times policy 74999", "label": "fraud_review"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible policy 63097", "label": "subrogation"}
+{"text": "a subcontractor says our equipment damaged their van policy 48615", "label": "liability"}
+{"text": "the washing machine overflowed and ruined the hardwood reference 1746", "label": "property_damage"}
+{"text": "the insured has a concussion after the fall policy 47976", "label": "medical_injury"}
+{"text": "vandals spray painted the shop front and broke the sign for about 1300 euros", "label": "property_damage"}
+{"text": "the claimant used a repair shop owned by a relative for about 8900 euros", "label": "fraud_review"}
+{"text": "the shipment was opened and the phone was missing in paris", "label": "theft"}
+{"text": "the other carrier has accepted 100 percent liability policy 25374", "label": "subrogation"}
+{"text": "the guest burned an arm on the hot serving tray claim 1027", "label": "medical_injury"}
+{"text": "my vehicle rolled into a ditch after the tire blew for about 7100 euros", "label": "auto_collision"}
+{"text": "the vehicle was reported stolen after it was sold policy 57602", "label": "fraud_review"}
+{"text": "a visitor tripped on the loose carpet in our lobby in berlin", "label": "liability"}
+{"text": "a visitor tripped on the loose carpet in our lobby for about 6900 euros", "label": "liability"}
+{"text": "the same damage appears in two unrelated claims reference 1572", "label": "fraud_review"}
+{"text": "the kitchen fire spread smoke damage through the house for about 2300 euros", "label": "property_damage"}
+{"text": "the other car ran the stop sign and hit the driver side reference 1320", "label": "auto_collision"}
+{"text": "the driver suffered whiplash after the collision policy 13524", "label": "medical_injury"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder in warsaw", "label": "medical_injury"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible for about 8000 euros", "label": "subrogation"}
+{"text": "a guest says the hotel valet scratched their car in milan", "label": "liability"}
+{"text": "the insured fell from a ladder and broke a wrist for about 4100 euros", "label": "medical_injury"}
+{"text": "the reported theft happened while the policy was lapsed in madrid", "label": "fraud_review"}
+{"text": "another driver hit my parked car in the lot claim 1031", "label": "auto_collision"}
+{"text": "my passport and wallet were taken from the rental car policy 57087", "label": "theft"}
+{"text": "the manufacturer recalled the part and should cover our payout reference 2315", "label": "subrogation"}
+{"text": "someone broke the car window and took my bag for about 3800 euros", "label": "theft"}
+{"text": "a subcontractor says our equipment damaged their van claim 1066", "label": "liability"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder for about 2200 euros", "label": "medical_injury"}
+{"text": "the customer alleges the food made them ill claim 1055", "label": "liability"}
+{"text": "the customer alleges the food made them ill in leeds", "label": "liability"}
+{"text": "our insured was hit by a commercial truck and we paid the claim policy 44155", "label": "subrogation"}
+{"text": "the heatwave warped the warehouse roof panels policy 32119", "label": "weather"}
+{"text": "snow load collapsed the carport roof policy 95180", "label": "weather"}
+{"text": "the same damage appears in two unrelated claims in vienna", "label": "fraud_review"}
+{"text": "i was sideswiped on the highway and the door is dented policy 31617", "label": "auto_collision"}
+{"text": "the repair estimate is much higher than the market value claim 1072", "label": "fraud_review"}
+{"text": "my passport and wallet were taken from the rental car for about 4600 euros", "label": "theft"}
+{"text": "a client claims the product caused a chemical burn for about 2300 euros", "label": "liability"}
+{"text": "my car was rear ended at a red light and the bumper is cracked in leeds", "label": "auto_collision"}
+{"text": "my camera bag disappeared from the train luggage rack claim 1068", "label": "theft"}
+{"text": "the tools were stolen from the locked site container in lyon", "label": "theft"}
+{"text": "the tenant says the repair crew broke their television in madrid", "label": "liability"}
+{"text": "the homeowner claims our drone hit their roof claim 1017", "label": "liability"}
+{"text": "the supplier says our forklift damaged their loading bay policy 16048", "label": "liability"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom claim 1028", "label": "property_damage"}
+{"text": "the shipment was opened and the phone was missing policy 61423", "label": "theft"}
+{"text": "the storm blew off shingles and exposed the attic policy 25178", "label": "property_damage"}
+{"text": "the insured has a concussion after the fall claim 1088", "label": "medical_injury"}
+{"text": "my camera bag disappeared from the train luggage rack for about 7900 euros", "label": "theft"}
+{"text": "the neighbor says our contractor damaged their fence claim 1001", "label": "liability"}
+{"text": "the landlord says the upstairs tenant caused the leak for about 2100 euros", "label": "subrogation"}
+{"text": "my laptop was stolen from the hotel room reference 9455", "label": "theft"}
+{"text": "my passport and wallet were taken from the rental car reference 8684", "label": "theft"}
+{"text": "the insured fell from a ladder and broke a wrist claim 1071", "label": "medical_injury"}
+{"text": "a falling branch smashed the conservatory glass in porto", "label": "property_damage"}
+{"text": "the homeowner claims our drone hit their roof for about 3000 euros", "label": "liability"}
+{"text": "a customer was injured by a falling shelf in the aisle policy 54522", "label": "medical_injury"}
+{"text": "i lost control on ice and struck a lamppost claim 1099", "label": "auto_collision"}
+{"text": "a worker cut a hand on the exposed metal edge policy 53484", "label": "medical_injury"}
+{"text": "a taxi merged into my lane and scraped the whole side policy 37597", "label": "auto_collision"}
+{"text": "my car was rear ended at a red light and the bumper is cracked claim 1090", "label": "auto_collision"}
+{"text": "the medical report was altered before submission for about 8100 euros", "label": "fraud_review"}
+{"text": "the repair estimate is much higher than the market value in prague", "label": "fraud_review"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain policy 38760", "label": "auto_collision"}
+{"text": "the vehicle was reported stolen after it was sold claim 1048", "label": "fraud_review"}
+{"text": "my passport and wallet were taken from the rental car for about 8300 euros", "label": "theft"}
+{"text": "the front end was crushed when i hit a stalled car for about 7900 euros", "label": "auto_collision"}
+{"text": "the front end was crushed when i hit a stalled car in lisbon", "label": "auto_collision"}
+{"text": "the reported theft happened while the policy was lapsed in milan", "label": "fraud_review"}
+{"text": "the third party admitted the collision and their insurer is liable reference 9012", "label": "subrogation"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder for about 8400 euros", "label": "medical_injury"}
+{"text": "the warehouse pallet was short and the stock is gone policy 19806", "label": "theft"}
+{"text": "a customer was injured by a falling shelf in the aisle for about 2200 euros", "label": "medical_injury"}
+{"text": "high winds tore the awning off the storefront reference 8072", "label": "weather"}
+{"text": "a tree fell on the roof and broke two windows claim 1070", "label": "property_damage"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain reference 4621", "label": "auto_collision"}
+{"text": "the claimant has three policies and the same photos appear in all of them in hamburg", "label": "fraud_review"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder in rome", "label": "medical_injury"}
+{"text": "the other carrier has accepted 100 percent liability for about 4700 euros", "label": "subrogation"}
+{"text": "the reported theft happened while the policy was lapsed claim 1063", "label": "fraud_review"}
+{"text": "the contractor caused the water damage and should reimburse us reference 2183", "label": "subrogation"}
+{"text": "the front end was crushed when i hit a stalled car for about 6000 euros", "label": "auto_collision"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling reference 9923", "label": "property_damage"}
+{"text": "a parcel was left in the lobby and never reached me in hamburg", "label": "theft"}
+{"text": "the receipt looks edited and the vendor cannot confirm it policy 62834", "label": "fraud_review"}
+{"text": "storm water backed up through the drains into the shop policy 52689", "label": "weather"}
+{"text": "flood water entered the ground floor after the hurricane policy 15317", "label": "weather"}
+{"text": "my laptop was stolen from the hotel room claim 1030", "label": "theft"}
+{"text": "i twisted my knee on the uneven pavement outside policy 57120", "label": "medical_injury"}
+{"text": "the manufacturer recalled the part and should cover our payout in porto", "label": "subrogation"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder for about 4600 euros", "label": "medical_injury"}
+{"text": "the claimant used a repair shop owned by a relative for about 1100 euros", "label": "fraud_review"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible claim 1066", "label": "subrogation"}
+{"text": "a parcel was left in the lobby and never reached me policy 84762", "label": "theft"}
+{"text": "a taxi merged into my lane and scraped the whole side claim 1047", "label": "auto_collision"}
+{"text": "the guest burned an arm on the hot serving tray claim 1037", "label": "medical_injury"}
+{"text": "the tools were stolen from the locked site container for about 4200 euros", "label": "theft"}
+{"text": "a falling branch smashed the conservatory glass in warsaw", "label": "property_damage"}
+{"text": "a tornado lifted the shed and dropped it in the field policy 16123", "label": "weather"}
+{"text": "the subcontractor caused the injury and their policy should respond claim 1087", "label": "subrogation"}
+{"text": "a subcontractor says our equipment damaged their van in london", "label": "liability"}
+{"text": "my passport and wallet were taken from the rental car for about 900 euros", "label": "theft"}
+{"text": "the claimant has three policies and the same photos appear in all of them in vienna", "label": "fraud_review"}
+{"text": "the other carrier has accepted 100 percent liability in lisbon", "label": "subrogation"}
+{"text": "the heatwave warped the warehouse roof panels for about 6300 euros", "label": "weather"}
+{"text": "a truck backed into my front fender at the depot policy 20790", "label": "auto_collision"}
+{"text": "the claimant used a repair shop owned by a relative for about 8500 euros", "label": "fraud_review"}
+{"text": "the supplier says our forklift damaged their loading bay reference 9277", "label": "liability"}
+{"text": "the other driver was at fault please recover the repair cost policy 13621", "label": "subrogation"}
+{"text": "the landlord says the upstairs tenant caused the leak policy 62459", "label": "subrogation"}
+{"text": "a delivery truck cracked the driveway and the garden wall claim 1025", "label": "property_damage"}
+{"text": "my car was rear ended at a red light and the bumper is cracked in berlin", "label": "auto_collision"}
+{"text": "vandals spray painted the shop front and broke the sign reference 3284", "label": "property_damage"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom for about 4500 euros", "label": "property_damage"}
+{"text": "a pedestrian says our delivery van clipped them reference 1186", "label": "liability"}
+{"text": "a visitor tripped on the loose carpet in our lobby policy 58831", "label": "liability"}
+{"text": "i was sideswiped on the highway and the door is dented for about 4700 euros", "label": "auto_collision"}
+{"text": "the shipment was opened and the phone was missing claim 1072", "label": "theft"}
+{"text": "vandals spray painted the shop front and broke the sign in lyon", "label": "property_damage"}
+{"text": "a taxi merged into my lane and scraped the whole side claim 1067", "label": "auto_collision"}
+{"text": "the claimant changed the date of loss three times in leeds", "label": "fraud_review"}
+{"text": "the tools were stolen from the locked site container reference 6430", "label": "theft"}
+{"text": "the supplier says our forklift damaged their loading bay claim 1099", "label": "liability"}
+{"text": "hail damaged the roof and the siding during the storm for about 4900 euros", "label": "weather"}
+{"text": "the supplier says our forklift damaged their loading bay for about 5600 euros", "label": "liability"}
+{"text": "the guest burned an arm on the hot serving tray claim 1077", "label": "medical_injury"}
+{"text": "the vehicle was reported stolen after it was sold claim 1028", "label": "fraud_review"}
+{"text": "a subcontractor says our equipment damaged their van for about 900 euros", "label": "liability"}
+{"text": "the medical report was altered before submission policy 72678", "label": "fraud_review"}
+{"text": "the claimant needed stitches after the dog bite policy 33260", "label": "medical_injury"}
+{"text": "the tenant says the repair crew broke their television claim 1043", "label": "liability"}
+{"text": "a guest says the hotel valet scratched their car for about 2100 euros", "label": "liability"}
+{"text": "i was sideswiped on the highway and the door is dented claim 1042", "label": "auto_collision"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible in hamburg", "label": "subrogation"}
+{"text": "the tools were stolen from the locked site container in paris", "label": "theft"}
+{"text": "a pipe burst in the basement and flooded the floor in lisbon", "label": "property_damage"}
+{"text": "the insured fell from a ladder and broke a wrist reference 1231", "label": "medical_injury"}
+{"text": "the neighbor says our contractor damaged their fence reference 6644", "label": "liability"}
+{"text": "a truck backed into my front fender at the depot policy 95801", "label": "auto_collision"}
+{"text": "the claimant needed stitches after the dog bite reference 7787", "label": "medical_injury"}
+{"text": "the medical report was altered before submission in warsaw", "label": "fraud_review"}
+{"text": "the reported theft happened while the policy was lapsed policy 72761", "label": "fraud_review"}
+{"text": "the tools were stolen from the locked site container policy 40545", "label": "theft"}
+{"text": "the storm blew off shingles and exposed the attic in warsaw", "label": "property_damage"}
+{"text": "a parcel was left in the lobby and never reached me in london", "label": "theft"}
+{"text": "my vehicle rolled into a ditch after the tire blew reference 3910", "label": "auto_collision"}
+{"text": "someone broke the car window and took my bag policy 56892", "label": "theft"}
+{"text": "my bicycle was taken from the garage overnight reference 2505", "label": "theft"}
+{"text": "the claimant needed stitches after the dog bite reference 4463", "label": "medical_injury"}
+{"text": "the receipt looks edited and the vendor cannot confirm it claim 1077", "label": "fraud_review"}
+{"text": "the at-fault party has accepted liability please pursue recovery in milan", "label": "subrogation"}
+{"text": "our insured was hit by a commercial truck and we paid the claim for about 8600 euros", "label": "subrogation"}
+{"text": "the guest burned an arm on the hot serving tray policy 68672", "label": "medical_injury"}
+{"text": "a customer was injured by a falling shelf in the aisle reference 4288", "label": "medical_injury"}
+{"text": "a tree fell on the roof and broke two windows reference 1578", "label": "property_damage"}
+{"text": "my vehicle rolled into a ditch after the tire blew claim 1006", "label": "auto_collision"}
+{"text": "a parcel was left in the lobby and never reached me for about 6300 euros", "label": "theft"}
+{"text": "storm water backed up through the drains into the shop for about 2300 euros", "label": "weather"}
+{"text": "a tornado lifted the shed and dropped it in the field for about 4300 euros", "label": "weather"}
+{"text": "my vehicle rolled into a ditch after the tire blew claim 1056", "label": "auto_collision"}
+{"text": "hail damaged the roof and the siding during the storm for about 8600 euros", "label": "weather"}
+{"text": "a truck backed into my front fender at the depot in warsaw", "label": "auto_collision"}
+{"text": "the shipment was opened and the phone was missing for about 7200 euros", "label": "theft"}
+{"text": "hail damaged the roof and the siding during the storm claim 1090", "label": "weather"}
+{"text": "our insured was hit by a commercial truck and we paid the claim in london", "label": "subrogation"}
+{"text": "i lost control on ice and struck a lamppost reference 6535", "label": "auto_collision"}
+{"text": "a tornado lifted the shed and dropped it in the field claim 1086", "label": "weather"}
+{"text": "a delivery truck cracked the driveway and the garden wall claim 1005", "label": "property_damage"}
+{"text": "the at-fault party has accepted liability please pursue recovery policy 13797", "label": "subrogation"}
+{"text": "the tenant says the repair crew broke their television policy 22461", "label": "liability"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling reference 3854", "label": "property_damage"}
+{"text": "the claimant used a repair shop owned by a relative policy 80415", "label": "fraud_review"}
+{"text": "the same invoice was submitted twice with different dates reference 5954", "label": "fraud_review"}
+{"text": "the repair estimate is much higher than the market value in paris", "label": "fraud_review"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom claim 1078", "label": "property_damage"}
+{"text": "our insured was hit by a commercial truck and we paid the claim claim 1061", "label": "subrogation"}
+{"text": "the insured fell from a ladder and broke a wrist for about 6300 euros", "label": "medical_injury"}
+{"text": "the kitchen fire spread smoke damage through the house policy 13395", "label": "property_damage"}
+{"text": "a worker cut a hand on the exposed metal edge policy 61164", "label": "medical_injury"}
+{"text": "my camera bag disappeared from the train luggage rack reference 1624", "label": "theft"}
+{"text": "the shipment was opened and the phone was missing claim 1032", "label": "theft"}
+{"text": "the medical report was altered before submission in porto", "label": "fraud_review"}
+{"text": "vandals spray painted the shop front and broke the sign policy 55767", "label": "property_damage"}
+{"text": "vandals spray painted the shop front and broke the sign policy 19729", "label": "property_damage"}
+{"text": "i was sideswiped on the highway and the door is dented for about 2500 euros", "label": "auto_collision"}
+{"text": "the manufacturer recalled the part and should cover our payout reference 4745", "label": "subrogation"}
+{"text": "the office was broken into and two monitors were taken for about 2600 euros", "label": "theft"}
+{"text": "a visitor tripped on the loose carpet in our lobby in leeds", "label": "liability"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible reference 9347", "label": "subrogation"}
+{"text": "the supplier says our forklift damaged their loading bay claim 1029", "label": "liability"}
+{"text": "i twisted my knee on the uneven pavement outside in hamburg", "label": "medical_injury"}
+{"text": "the homeowner claims our drone hit their roof in prague", "label": "liability"}
+{"text": "a pipe burst in the basement and flooded the floor claim 1073", "label": "property_damage"}
+{"text": "snow load collapsed the carport roof claim 1042", "label": "weather"}
+{"text": "flood water entered the ground floor after the hurricane reference 6049", "label": "weather"}
+{"text": "the receipt looks edited and the vendor cannot confirm it policy 83781", "label": "fraud_review"}
+{"text": "the same damage appears in two unrelated claims for about 7400 euros", "label": "fraud_review"}
+{"text": "a taxi merged into my lane and scraped the whole side for about 4900 euros", "label": "auto_collision"}
+{"text": "a truck backed into my front fender at the depot claim 1024", "label": "auto_collision"}
+{"text": "a pedestrian says our delivery van clipped them in rome", "label": "liability"}
+{"text": "the claimant has three policies and the same photos appear in all of them claim 1051", "label": "fraud_review"}
+{"text": "the vehicle was reported stolen after it was sold for about 2900 euros", "label": "fraud_review"}
+{"text": "a pedestrian says our delivery van clipped them in rome", "label": "liability"}
+{"text": "the third party admitted the collision and their insurer is liable claim 1055", "label": "subrogation"}
+{"text": "a delivery truck cracked the driveway and the garden wall claim 1095", "label": "property_damage"}
+{"text": "the heatwave warped the warehouse roof panels for about 5400 euros", "label": "weather"}
+{"text": "flood water entered the ground floor after the hurricane reference 8037", "label": "weather"}
+{"text": "the manufacturer recalled the part and should cover our payout in porto", "label": "subrogation"}
+{"text": "the insured has a concussion after the fall in lisbon", "label": "medical_injury"}
+{"text": "the other carrier has accepted 100 percent liability reference 4381", "label": "subrogation"}
+{"text": "the medical report was altered before submission claim 1014", "label": "fraud_review"}
+{"text": "the washing machine overflowed and ruined the hardwood claim 1086", "label": "property_damage"}
+{"text": "storm water backed up through the drains into the shop for about 7100 euros", "label": "weather"}
+{"text": "my laptop was stolen from the hotel room claim 1010", "label": "theft"}
+{"text": "my passport and wallet were taken from the rental car reference 3110", "label": "theft"}
+{"text": "the customer alleges the food made them ill for about 200 euros", "label": "liability"}
+{"text": "high winds tore the awning off the storefront reference 6180", "label": "weather"}
+{"text": "i was sideswiped on the highway and the door is dented policy 33638", "label": "auto_collision"}
+{"text": "the reported theft happened while the policy was lapsed in madrid", "label": "fraud_review"}
+{"text": "the other driver was at fault please recover the repair cost policy 54135", "label": "subrogation"}
+{"text": "the subcontractor caused the injury and their policy should respond reference 4938", "label": "subrogation"}
+{"text": "another driver hit my parked car in the lot for about 4600 euros", "label": "auto_collision"}
+{"text": "vandals spray painted the shop front and broke the sign claim 1007", "label": "property_damage"}
+{"text": "a delivery truck cracked the driveway and the garden wall for about 3800 euros", "label": "property_damage"}
+{"text": "someone broke the car window and took my bag for about 8200 euros", "label": "theft"}
+{"text": "the office was broken into and two monitors were taken claim 1009", "label": "theft"}
+{"text": "a visitor tripped on the loose carpet in our lobby in berlin", "label": "liability"}
+{"text": "my laptop was stolen from the hotel room in berlin", "label": "theft"}
+{"text": "the at-fault party has accepted liability please pursue recovery for about 2300 euros", "label": "subrogation"}
+{"text": "another driver hit my parked car in the lot reference 4645", "label": "auto_collision"}
+{"text": "a subcontractor says our equipment damaged their van policy 10487", "label": "liability"}
+{"text": "the insured has a concussion after the fall claim 1058", "label": "medical_injury"}
+{"text": "the other driver was at fault please recover the repair cost policy 20003", "label": "subrogation"}
+{"text": "the third party admitted the collision and their insurer is liable reference 5957", "label": "subrogation"}
+{"text": "the same invoice was submitted twice with different dates reference 4864", "label": "fraud_review"}
+{"text": "the heatwave warped the warehouse roof panels in porto", "label": "weather"}
+{"text": "the contractor caused the water damage and should reimburse us policy 72447", "label": "subrogation"}
+{"text": "the freeze burst the outdoor pipes reference 9112", "label": "weather"}
+{"text": "the medical report was altered before submission claim 1034", "label": "fraud_review"}
+{"text": "snow load collapsed the carport roof policy 84874", "label": "weather"}
+{"text": "the reported theft happened while the policy was lapsed claim 1043", "label": "fraud_review"}
+{"text": "the freeze burst the outdoor pipes in leeds", "label": "weather"}
+{"text": "the kitchen fire spread smoke damage through the house claim 1032", "label": "property_damage"}
+{"text": "the same invoice was submitted twice with different dates claim 1050", "label": "fraud_review"}
+{"text": "my bicycle was taken from the garage overnight policy 49552", "label": "theft"}
+{"text": "the at-fault party has accepted liability please pursue recovery for about 400 euros", "label": "subrogation"}
+{"text": "the landlord says the upstairs tenant caused the leak policy 83792", "label": "subrogation"}
+{"text": "a pedestrian says our delivery van clipped them in warsaw", "label": "liability"}
+{"text": "the same invoice was submitted twice with different dates claim 1070", "label": "fraud_review"}
+{"text": "my laptop was stolen from the hotel room in leeds", "label": "theft"}
+{"text": "storm water backed up through the drains into the shop reference 7469", "label": "weather"}
+{"text": "a worker cut a hand on the exposed metal edge policy 86279", "label": "medical_injury"}
+{"text": "the claimant has three policies and the same photos appear in all of them claim 1021", "label": "fraud_review"}
+{"text": "the claimant used a repair shop owned by a relative in warsaw", "label": "fraud_review"}
+{"text": "the third party admitted the collision and their insurer is liable policy 44867", "label": "subrogation"}
+{"text": "the subcontractor caused the injury and their policy should respond reference 6685", "label": "subrogation"}
+{"text": "a worker cut a hand on the exposed metal edge for about 6200 euros", "label": "medical_injury"}
+{"text": "lightning struck the chimney and started a fire claim 1003", "label": "weather"}
+{"text": "the subcontractor caused the injury and their policy should respond reference 8154", "label": "subrogation"}
+{"text": "ice dams caused water to stain the upstairs ceiling reference 6055", "label": "weather"}
+{"text": "the heatwave warped the warehouse roof panels for about 8600 euros", "label": "weather"}
+{"text": "i slipped on the wet floor at the store and hurt my back for about 3300 euros", "label": "medical_injury"}
+{"text": "my camera bag disappeared from the train luggage rack for about 400 euros", "label": "theft"}
+{"text": "the repair estimate is much higher than the market value reference 6231", "label": "fraud_review"}
+{"text": "the contractor caused the water damage and should reimburse us for about 1200 euros", "label": "subrogation"}
+{"text": "the tenant says the repair crew broke their television policy 99673", "label": "liability"}
+{"text": "a tornado lifted the shed and dropped it in the field claim 1016", "label": "weather"}
+{"text": "a tornado lifted the shed and dropped it in the field in hamburg", "label": "weather"}
+{"text": "the neighbor says our contractor damaged their fence policy 65651", "label": "liability"}
+{"text": "the guest burned an arm on the hot serving tray policy 11817", "label": "medical_injury"}
+{"text": "my passport and wallet were taken from the rental car for about 4300 euros", "label": "theft"}
+{"text": "a tree fell on the roof and broke two windows policy 97353", "label": "property_damage"}
+{"text": "the neighbor says our contractor damaged their fence reference 3532", "label": "liability"}
+{"text": "the claimant changed the date of loss three times reference 3934", "label": "fraud_review"}
+{"text": "hail damaged the roof and the siding during the storm in dublin", "label": "weather"}
+{"text": "ice dams caused water to stain the upstairs ceiling reference 4303", "label": "weather"}
+{"text": "the office was broken into and two monitors were taken policy 48938", "label": "theft"}
+{"text": "my vehicle rolled into a ditch after the tire blew for about 4000 euros", "label": "auto_collision"}
+{"text": "my bicycle was taken from the garage overnight reference 4193", "label": "theft"}
+{"text": "a visitor tripped on the loose carpet in our lobby for about 5400 euros", "label": "liability"}
+{"text": "the office was broken into and two monitors were taken claim 1059", "label": "theft"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain in madrid", "label": "auto_collision"}
+{"text": "storm water backed up through the drains into the shop reference 1018", "label": "weather"}
+{"text": "our insured was hit by a commercial truck and we paid the claim reference 3068", "label": "subrogation"}
+{"text": "lightning struck the chimney and started a fire reference 1352", "label": "weather"}
+{"text": "a tornado lifted the shed and dropped it in the field for about 7000 euros", "label": "weather"}
+{"text": "the supplier says our forklift damaged their loading bay policy 77865", "label": "liability"}
+{"text": "the driver suffered whiplash after the collision claim 1033", "label": "medical_injury"}
+{"text": "a visitor tripped on the loose carpet in our lobby policy 58678", "label": "liability"}
+{"text": "the same damage appears in two unrelated claims reference 4256", "label": "fraud_review"}
+{"text": "the vehicle was reported stolen after it was sold for about 2800 euros", "label": "fraud_review"}
+{"text": "the same damage appears in two unrelated claims for about 5400 euros", "label": "fraud_review"}
+{"text": "the homeowner claims our drone hit their roof reference 7196", "label": "liability"}
+{"text": "the same invoice was submitted twice with different dates claim 1020", "label": "fraud_review"}
+{"text": "a taxi merged into my lane and scraped the whole side for about 1500 euros", "label": "auto_collision"}
+{"text": "the same invoice was submitted twice with different dates claim 1010", "label": "fraud_review"}
+{"text": "a pedestrian says our delivery van clipped them in porto", "label": "liability"}
+{"text": "the driver suffered whiplash after the collision for about 6600 euros", "label": "medical_injury"}
+{"text": "a taxi merged into my lane and scraped the whole side in prague", "label": "auto_collision"}
+{"text": "the at-fault party has accepted liability please pursue recovery for about 200 euros", "label": "subrogation"}
+{"text": "another driver hit my parked car in the lot reference 3401", "label": "auto_collision"}
+{"text": "hail damaged the roof and the siding during the storm claim 1000", "label": "weather"}
+{"text": "a pipe burst in the basement and flooded the floor policy 90272", "label": "property_damage"}
+{"text": "the neighbor says our contractor damaged their fence policy 97133", "label": "liability"}
+{"text": "the neighbor says our contractor damaged their fence reference 3986", "label": "liability"}
+{"text": "i lost control on ice and struck a lamppost reference 2695", "label": "auto_collision"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder reference 5747", "label": "medical_injury"}
+{"text": "the storm blew off shingles and exposed the attic reference 7500", "label": "property_damage"}
+{"text": "my car was rear ended at a red light and the bumper is cracked policy 38083", "label": "auto_collision"}
+{"text": "i twisted my knee on the uneven pavement outside policy 91774", "label": "medical_injury"}
+{"text": "hail damaged the roof and the siding during the storm for about 4800 euros", "label": "weather"}
+{"text": "the office was broken into and two monitors were taken in rome", "label": "theft"}
+{"text": "the office was broken into and two monitors were taken claim 1079", "label": "theft"}
+{"text": "the warehouse pallet was short and the stock is gone claim 1054", "label": "theft"}
+{"text": "a pedestrian says our delivery van clipped them claim 1034", "label": "liability"}
+{"text": "my vehicle rolled into a ditch after the tire blew claim 1016", "label": "auto_collision"}
+{"text": "my bicycle was taken from the garage overnight in milan", "label": "theft"}
+{"text": "lightning struck the chimney and started a fire for about 6000 euros", "label": "weather"}
+{"text": "lightning struck the chimney and started a fire for about 7100 euros", "label": "weather"}
+{"text": "the kitchen fire spread smoke damage through the house for about 7900 euros", "label": "property_damage"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling reference 5687", "label": "property_damage"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain reference 4417", "label": "auto_collision"}
+{"text": "storm water backed up through the drains into the shop for about 4300 euros", "label": "weather"}
+{"text": "a pedestrian says our delivery van clipped them reference 4925", "label": "liability"}
+{"text": "hail damaged the roof and the siding during the storm in dublin", "label": "weather"}
+{"text": "the guest burned an arm on the hot serving tray policy 77872", "label": "medical_injury"}
+{"text": "the shipment was opened and the phone was missing policy 22209", "label": "theft"}
+{"text": "the claimant changed the date of loss three times in leeds", "label": "fraud_review"}
+{"text": "the warehouse pallet was short and the stock is gone reference 4432", "label": "theft"}
+{"text": "flood water entered the ground floor after the hurricane for about 2300 euros", "label": "weather"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder in warsaw", "label": "medical_injury"}
+{"text": "the third party admitted the collision and their insurer is liable reference 2395", "label": "subrogation"}
+{"text": "a falling branch smashed the conservatory glass claim 1069", "label": "property_damage"}
+{"text": "vandals spray painted the shop front and broke the sign reference 5818", "label": "property_damage"}
+{"text": "the shipment was opened and the phone was missing policy 18630", "label": "theft"}
+{"text": "a subcontractor says our equipment damaged their van policy 69096", "label": "liability"}
+{"text": "the neighbor says our contractor damaged their fence claim 1081", "label": "liability"}
+{"text": "a pipe burst in the basement and flooded the floor claim 1093", "label": "property_damage"}
+{"text": "the office was broken into and two monitors were taken claim 1099", "label": "theft"}
+{"text": "the vehicle was reported stolen after it was sold reference 1960", "label": "fraud_review"}
+{"text": "the tools were stolen from the locked site container policy 23950", "label": "theft"}
+{"text": "the same damage appears in two unrelated claims in vienna", "label": "fraud_review"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible reference 7127", "label": "subrogation"}
+{"text": "the front end was crushed when i hit a stalled car policy 18153", "label": "auto_collision"}
+{"text": "the claimant changed the date of loss three times in dublin", "label": "fraud_review"}
+{"text": "a visitor tripped on the loose carpet in our lobby reference 7388", "label": "liability"}
+{"text": "vandals spray painted the shop front and broke the sign policy 33311", "label": "property_damage"}
+{"text": "the driver suffered whiplash after the collision policy 17259", "label": "medical_injury"}
+{"text": "someone broke the car window and took my bag reference 5692", "label": "theft"}
+{"text": "the subcontractor caused the injury and their policy should respond for about 5700 euros", "label": "subrogation"}
+{"text": "a customer was injured by a falling shelf in the aisle in lyon", "label": "medical_injury"}
+{"text": "the freeze burst the outdoor pipes reference 4982", "label": "weather"}
+{"text": "a pipe burst in the basement and flooded the floor for about 4400 euros", "label": "property_damage"}
+{"text": "the washing machine overflowed and ruined the hardwood in london", "label": "property_damage"}
+{"text": "flood water entered the ground floor after the hurricane policy 69670", "label": "weather"}
+{"text": "someone broke the car window and took my bag for about 5200 euros", "label": "theft"}
+{"text": "the medical report was altered before submission in warsaw", "label": "fraud_review"}
+{"text": "the washing machine overflowed and ruined the hardwood in hamburg", "label": "property_damage"}
+{"text": "the storm blew off shingles and exposed the attic in warsaw", "label": "property_damage"}
+{"text": "the storm blew off shingles and exposed the attic for about 6900 euros", "label": "property_damage"}
+{"text": "a customer was injured by a falling shelf in the aisle reference 9205", "label": "medical_injury"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom policy 84976", "label": "property_damage"}
+{"text": "the third party admitted the collision and their insurer is liable for about 2100 euros", "label": "subrogation"}
+{"text": "the office was broken into and two monitors were taken claim 1049", "label": "theft"}
+{"text": "the claimant changed the date of loss three times claim 1045", "label": "fraud_review"}
+{"text": "someone broke the car window and took my bag for about 5400 euros", "label": "theft"}
+{"text": "i was sideswiped on the highway and the door is dented policy 14427", "label": "auto_collision"}
+{"text": "a subcontractor says our equipment damaged their van reference 7710", "label": "liability"}
+{"text": "the guest burned an arm on the hot serving tray in lyon", "label": "medical_injury"}
+{"text": "the reported theft happened while the policy was lapsed reference 3040", "label": "fraud_review"}
+{"text": "a worker cut a hand on the exposed metal edge policy 48228", "label": "medical_injury"}
+{"text": "the other driver was at fault please recover the repair cost reference 5090", "label": "subrogation"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain in lisbon", "label": "auto_collision"}
+{"text": "someone broke the car window and took my bag claim 1011", "label": "theft"}
+{"text": "the tenant says the repair crew broke their television in lisbon", "label": "liability"}
+{"text": "the contractor caused the water damage and should reimburse us policy 69502", "label": "subrogation"}
+{"text": "my laptop was stolen from the hotel room reference 6646", "label": "theft"}
+{"text": "a pedestrian says our delivery van clipped them policy 91310", "label": "liability"}
+{"text": "the kitchen fire spread smoke damage through the house policy 84381", "label": "property_damage"}
+{"text": "the washing machine overflowed and ruined the hardwood reference 9794", "label": "property_damage"}
+{"text": "someone broke the car window and took my bag claim 1031", "label": "theft"}
+{"text": "the vehicle was reported stolen after it was sold claim 1078", "label": "fraud_review"}
+{"text": "the freeze burst the outdoor pipes reference 7592", "label": "weather"}
+{"text": "my bicycle was taken from the garage overnight for about 7600 euros", "label": "theft"}
+{"text": "a subcontractor says our equipment damaged their van policy 77471", "label": "liability"}
+{"text": "our insured was hit by a commercial truck and we paid the claim reference 9102", "label": "subrogation"}
+{"text": "the same invoice was submitted twice with different dates claim 1000", "label": "fraud_review"}
+{"text": "the tenant says the repair crew broke their television in milan", "label": "liability"}
+{"text": "my vehicle rolled into a ditch after the tire blew in hamburg", "label": "auto_collision"}
+{"text": "the landlord says the upstairs tenant caused the leak claim 1034", "label": "subrogation"}
+{"text": "a client claims the product caused a chemical burn reference 4560", "label": "liability"}
+{"text": "storm water backed up through the drains into the shop reference 7664", "label": "weather"}
+{"text": "a client claims the product caused a chemical burn reference 1951", "label": "liability"}
+{"text": "a delivery truck cracked the driveway and the garden wall in berlin", "label": "property_damage"}
+{"text": "i slipped on the wet floor at the store and hurt my back for about 5200 euros", "label": "medical_injury"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling in vienna", "label": "property_damage"}
+{"text": "the repair estimate is much higher than the market value in paris", "label": "fraud_review"}
+{"text": "the warehouse pallet was short and the stock is gone for about 6600 euros", "label": "theft"}
+{"text": "a pedestrian says our delivery van clipped them reference 3878", "label": "liability"}
+{"text": "our insured was hit by a commercial truck and we paid the claim for about 8000 euros", "label": "subrogation"}
+{"text": "i was sideswiped on the highway and the door is dented reference 7018", "label": "auto_collision"}
+{"text": "my vehicle rolled into a ditch after the tire blew for about 8000 euros", "label": "auto_collision"}
+{"text": "my camera bag disappeared from the train luggage rack claim 1078", "label": "theft"}
+{"text": "the same invoice was submitted twice with different dates for about 1500 euros", "label": "fraud_review"}
+{"text": "the other car ran the stop sign and hit the driver side policy 50680", "label": "auto_collision"}
+{"text": "lightning struck the chimney and started a fire policy 18587", "label": "weather"}
+{"text": "the landlord says the upstairs tenant caused the leak for about 7100 euros", "label": "subrogation"}
+{"text": "i slipped on the wet floor at the store and hurt my back claim 1020", "label": "medical_injury"}
+{"text": "lightning struck the chimney and started a fire policy 99525", "label": "weather"}
+{"text": "the claimant used a repair shop owned by a relative in warsaw", "label": "fraud_review"}
+{"text": "my car was rear ended at a red light and the bumper is cracked reference 3780", "label": "auto_collision"}
+{"text": "my laptop was stolen from the hotel room policy 68712", "label": "theft"}
+{"text": "the other driver was at fault please recover the repair cost for about 1900 euros", "label": "subrogation"}
+{"text": "a falling branch smashed the conservatory glass claim 1049", "label": "property_damage"}
+{"text": "the other carrier has accepted 100 percent liability in milan", "label": "subrogation"}
+{"text": "the receipt looks edited and the vendor cannot confirm it reference 9368", "label": "fraud_review"}
+{"text": "the claimant has three policies and the same photos appear in all of them for about 8500 euros", "label": "fraud_review"}
+{"text": "the heatwave warped the warehouse roof panels for about 600 euros", "label": "weather"}
+{"text": "the repair estimate is much higher than the market value reference 3441", "label": "fraud_review"}
+{"text": "our insured was hit by a commercial truck and we paid the claim policy 97233", "label": "subrogation"}
+{"text": "snow load collapsed the carport roof reference 3850", "label": "weather"}
+{"text": "i slipped on the wet floor at the store and hurt my back claim 1010", "label": "medical_injury"}
+{"text": "the insured has a concussion after the fall policy 58170", "label": "medical_injury"}
+{"text": "high winds tore the awning off the storefront for about 7600 euros", "label": "weather"}
+{"text": "the claimant changed the date of loss three times for about 1600 euros", "label": "fraud_review"}
+{"text": "the neighbor says our contractor damaged their fence reference 6612", "label": "liability"}
+{"text": "a worker cut a hand on the exposed metal edge reference 9977", "label": "medical_injury"}
+{"text": "a taxi merged into my lane and scraped the whole side claim 1097", "label": "auto_collision"}
+{"text": "the kitchen fire spread smoke damage through the house for about 1600 euros", "label": "property_damage"}
+{"text": "the landlord says the upstairs tenant caused the leak policy 64603", "label": "subrogation"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder policy 38002", "label": "medical_injury"}
+{"text": "my camera bag disappeared from the train luggage rack for about 1500 euros", "label": "theft"}
+{"text": "the insured fell from a ladder and broke a wrist reference 7335", "label": "medical_injury"}
+{"text": "the landlord says the upstairs tenant caused the leak for about 8800 euros", "label": "subrogation"}
+{"text": "the homeowner claims our drone hit their roof in prague", "label": "liability"}
+{"text": "the freeze burst the outdoor pipes policy 44602", "label": "weather"}
+{"text": "a falling branch smashed the conservatory glass policy 72916", "label": "property_damage"}
+{"text": "a customer was injured by a falling shelf in the aisle reference 7763", "label": "medical_injury"}
+{"text": "the subcontractor caused the injury and their policy should respond policy 58906", "label": "subrogation"}
+{"text": "a tree fell on the roof and broke two windows policy 55992", "label": "property_damage"}
+{"text": "the insured has a concussion after the fall for about 8800 euros", "label": "medical_injury"}
+{"text": "the claimant used a repair shop owned by a relative in porto", "label": "fraud_review"}
+{"text": "a guest says the hotel valet scratched their car claim 1098", "label": "liability"}
+{"text": "i twisted my knee on the uneven pavement outside for about 4300 euros", "label": "medical_injury"}
+{"text": "a subcontractor says our equipment damaged their van policy 36673", "label": "liability"}
+{"text": "i twisted my knee on the uneven pavement outside claim 1046", "label": "medical_injury"}
+{"text": "the other car ran the stop sign and hit the driver side policy 48699", "label": "auto_collision"}
+{"text": "the receipt looks edited and the vendor cannot confirm it in lyon", "label": "fraud_review"}
+{"text": "i was sideswiped on the highway and the door is dented reference 6929", "label": "auto_collision"}
+{"text": "the other car ran the stop sign and hit the driver side policy 47267", "label": "auto_collision"}
+{"text": "a customer was injured by a falling shelf in the aisle policy 38661", "label": "medical_injury"}
+{"text": "the other carrier has accepted 100 percent liability in madrid", "label": "subrogation"}
+{"text": "the claimant has three policies and the same photos appear in all of them policy 14395", "label": "fraud_review"}
+{"text": "a pipe burst in the basement and flooded the floor reference 2535", "label": "property_damage"}
+{"text": "the receipt looks edited and the vendor cannot confirm it reference 3402", "label": "fraud_review"}
+{"text": "storm water backed up through the drains into the shop for about 6200 euros", "label": "weather"}
+{"text": "ice dams caused water to stain the upstairs ceiling policy 22211", "label": "weather"}
+{"text": "the tenant says the repair crew broke their television in lisbon", "label": "liability"}
+{"text": "my camera bag disappeared from the train luggage rack policy 59198", "label": "theft"}
+{"text": "the reported theft happened while the policy was lapsed claim 1003", "label": "fraud_review"}
+{"text": "a guest says the hotel valet scratched their car in lisbon", "label": "liability"}
+{"text": "snow load collapsed the carport roof for about 6800 euros", "label": "weather"}
+{"text": "a customer was injured by a falling shelf in the aisle reference 5352", "label": "medical_injury"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom in lisbon", "label": "property_damage"}
+{"text": "the supplier says our forklift damaged their loading bay in warsaw", "label": "liability"}
+{"text": "snow load collapsed the carport roof policy 50270", "label": "weather"}
+{"text": "i was sideswiped on the highway and the door is dented reference 2922", "label": "auto_collision"}
+{"text": "the subcontractor caused the injury and their policy should respond reference 1913", "label": "subrogation"}
+{"text": "the tools were stolen from the locked site container policy 81168", "label": "theft"}
+{"text": "the insured fell from a ladder and broke a wrist claim 1041", "label": "medical_injury"}
+{"text": "the homeowner claims our drone hit their roof for about 3800 euros", "label": "liability"}
+{"text": "the manufacturer recalled the part and should cover our payout in rome", "label": "subrogation"}
+{"text": "the front end was crushed when i hit a stalled car for about 5600 euros", "label": "auto_collision"}
+{"text": "our insured was hit by a commercial truck and we paid the claim claim 1051", "label": "subrogation"}
+{"text": "a guest says the hotel valet scratched their car reference 2297", "label": "liability"}
+{"text": "the contractor caused the water damage and should reimburse us for about 6000 euros", "label": "subrogation"}
+{"text": "the tenant says the repair crew broke their television for about 6600 euros", "label": "liability"}
+{"text": "a parcel was left in the lobby and never reached me policy 80189", "label": "theft"}
+{"text": "a tree fell on the roof and broke two windows claim 1010", "label": "property_damage"}
+{"text": "the repair estimate is much higher than the market value policy 22987", "label": "fraud_review"}
+{"text": "a guest says the hotel valet scratched their car claim 1058", "label": "liability"}
+{"text": "another driver hit my parked car in the lot reference 7212", "label": "auto_collision"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible in vienna", "label": "subrogation"}
+{"text": "the receipt looks edited and the vendor cannot confirm it claim 1017", "label": "fraud_review"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling for about 4100 euros", "label": "property_damage"}
+{"text": "the claimant needed stitches after the dog bite for about 4200 euros", "label": "medical_injury"}
+{"text": "i lost control on ice and struck a lamppost claim 1059", "label": "auto_collision"}
+{"text": "the claimant needed stitches after the dog bite in leeds", "label": "medical_injury"}
+{"text": "the insured has a concussion after the fall reference 9274", "label": "medical_injury"}
+{"text": "ice dams caused water to stain the upstairs ceiling claim 1048", "label": "weather"}
+{"text": "a falling branch smashed the conservatory glass policy 25091", "label": "property_damage"}
+{"text": "i slipped on the wet floor at the store and hurt my back for about 5600 euros", "label": "medical_injury"}
+{"text": "the insured has a concussion after the fall reference 4792", "label": "medical_injury"}
+{"text": "a visitor tripped on the loose carpet in our lobby for about 7900 euros", "label": "liability"}
+{"text": "the insured has a concussion after the fall in lisbon", "label": "medical_injury"}
+{"text": "the washing machine overflowed and ruined the hardwood in vienna", "label": "property_damage"}
+{"text": "the claimant has three policies and the same photos appear in all of them for about 1000 euros", "label": "fraud_review"}
+{"text": "the shipment was opened and the phone was missing for about 6600 euros", "label": "theft"}
+{"text": "the claimant changed the date of loss three times claim 1035", "label": "fraud_review"}
+{"text": "the driver suffered whiplash after the collision claim 1063", "label": "medical_injury"}
+{"text": "the manufacturer recalled the part and should cover our payout claim 1049", "label": "subrogation"}
+{"text": "a pipe burst in the basement and flooded the floor in milan", "label": "property_damage"}
+{"text": "a subcontractor says our equipment damaged their van in hamburg", "label": "liability"}
+{"text": "snow load collapsed the carport roof in paris", "label": "weather"}
+{"text": "a tornado lifted the shed and dropped it in the field reference 8264", "label": "weather"}
+{"text": "hail damaged the roof and the siding during the storm reference 3924", "label": "weather"}
+{"text": "another driver hit my parked car in the lot for about 7300 euros", "label": "auto_collision"}
+{"text": "a taxi merged into my lane and scraped the whole side policy 19945", "label": "auto_collision"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder claim 1099", "label": "medical_injury"}
+{"text": "the claimant used a repair shop owned by a relative in porto", "label": "fraud_review"}
+{"text": "snow load collapsed the carport roof claim 1002", "label": "weather"}
+{"text": "the same damage appears in two unrelated claims for about 1800 euros", "label": "fraud_review"}
+{"text": "the repair estimate is much higher than the market value claim 1022", "label": "fraud_review"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling claim 1071", "label": "property_damage"}
+{"text": "the other carrier has accepted 100 percent liability claim 1088", "label": "subrogation"}
+{"text": "a truck backed into my front fender at the depot in rome", "label": "auto_collision"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom policy 11752", "label": "property_damage"}
+{"text": "the other driver was at fault please recover the repair cost for about 2200 euros", "label": "subrogation"}
+{"text": "the claimant needed stitches after the dog bite for about 1000 euros", "label": "medical_injury"}
+{"text": "a guest says the hotel valet scratched their car in lisbon", "label": "liability"}
+{"text": "the medical report was altered before submission in warsaw", "label": "fraud_review"}
+{"text": "the contractor caused the water damage and should reimburse us for about 7300 euros", "label": "subrogation"}
+{"text": "the medical report was altered before submission for about 3800 euros", "label": "fraud_review"}
+{"text": "i slipped on the wet floor at the store and hurt my back for about 6700 euros", "label": "medical_injury"}
+{"text": "the warehouse pallet was short and the stock is gone reference 5072", "label": "theft"}
+{"text": "another driver hit my parked car in the lot in vienna", "label": "auto_collision"}
+{"text": "the homeowner claims our drone hit their roof for about 4600 euros", "label": "liability"}
+{"text": "the manufacturer recalled the part and should cover our payout in rome", "label": "subrogation"}
+{"text": "the supplier says our forklift damaged their loading bay policy 12114", "label": "liability"}
+{"text": "a tree fell on the roof and broke two windows claim 1050", "label": "property_damage"}
+{"text": "the front end was crushed when i hit a stalled car for about 9000 euros", "label": "auto_collision"}
+{"text": "a worker cut a hand on the exposed metal edge in warsaw", "label": "medical_injury"}
+{"text": "vandals spray painted the shop front and broke the sign reference 4626", "label": "property_damage"}
+{"text": "lightning struck the chimney and started a fire claim 1013", "label": "weather"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom in lisbon", "label": "property_damage"}
+{"text": "the same damage appears in two unrelated claims in london", "label": "fraud_review"}
+{"text": "the insured fell from a ladder and broke a wrist policy 12247", "label": "medical_injury"}
+{"text": "the heatwave warped the warehouse roof panels policy 54999", "label": "weather"}
+{"text": "the vehicle was reported stolen after it was sold for about 800 euros", "label": "fraud_review"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom for about 5600 euros", "label": "property_damage"}
+{"text": "i twisted my knee on the uneven pavement outside claim 1066", "label": "medical_injury"}
+{"text": "the third party admitted the collision and their insurer is liable for about 8500 euros", "label": "subrogation"}
+{"text": "the tenant says the repair crew broke their television in milan", "label": "liability"}
+{"text": "a worker cut a hand on the exposed metal edge reference 2367", "label": "medical_injury"}
+{"text": "the customer alleges the food made them ill in dublin", "label": "liability"}
+{"text": "the washing machine overflowed and ruined the hardwood policy 31350", "label": "property_damage"}
+{"text": "a worker cut a hand on the exposed metal edge in warsaw", "label": "medical_injury"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain claim 1043", "label": "auto_collision"}
+{"text": "hail damaged the roof and the siding during the storm for about 1700 euros", "label": "weather"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling in hamburg", "label": "property_damage"}
+{"text": "the manufacturer recalled the part and should cover our payout policy 31172", "label": "subrogation"}
+{"text": "a falling branch smashed the conservatory glass policy 81909", "label": "property_damage"}
+{"text": "a tree fell on the roof and broke two windows claim 1080", "label": "property_damage"}
+{"text": "my car was rear ended at a red light and the bumper is cracked in leeds", "label": "auto_collision"}
+{"text": "the repair estimate is much higher than the market value in prague", "label": "fraud_review"}
+{"text": "high winds tore the awning off the storefront claim 1084", "label": "weather"}
+{"text": "storm water backed up through the drains into the shop for about 4900 euros", "label": "weather"}
+{"text": "the freeze burst the outdoor pipes reference 5557", "label": "weather"}
+{"text": "a pedestrian says our delivery van clipped them in porto", "label": "liability"}
+{"text": "my bicycle was taken from the garage overnight reference 1274", "label": "theft"}
+{"text": "the homeowner claims our drone hit their roof in lyon", "label": "liability"}
+{"text": "lightning struck the chimney and started a fire in madrid", "label": "weather"}
+{"text": "i lost control on ice and struck a lamppost claim 1069", "label": "auto_collision"}
+{"text": "the subcontractor caused the injury and their policy should respond claim 1067", "label": "subrogation"}
+{"text": "i lost control on ice and struck a lamppost reference 3626", "label": "auto_collision"}
+{"text": "a truck backed into my front fender at the depot for about 8600 euros", "label": "auto_collision"}
+{"text": "the neighbor says our contractor damaged their fence reference 2189", "label": "liability"}
+{"text": "i slipped on the wet floor at the store and hurt my back for about 1100 euros", "label": "medical_injury"}
+{"text": "high winds tore the awning off the storefront in porto", "label": "weather"}
+{"text": "my passport and wallet were taken from the rental car in leeds", "label": "theft"}
+{"text": "the tools were stolen from the locked site container in prague", "label": "theft"}
+{"text": "the customer alleges the food made them ill policy 67973", "label": "liability"}
+{"text": "the kitchen fire spread smoke damage through the house policy 58452", "label": "property_damage"}
+{"text": "the office was broken into and two monitors were taken in porto", "label": "theft"}
+{"text": "the at-fault party has accepted liability please pursue recovery policy 78134", "label": "subrogation"}
+{"text": "a client claims the product caused a chemical burn in paris", "label": "liability"}
+{"text": "a falling branch smashed the conservatory glass reference 9395", "label": "property_damage"}
+{"text": "the other car ran the stop sign and hit the driver side reference 5514", "label": "auto_collision"}
+{"text": "i lost control on ice and struck a lamppost policy 24041", "label": "auto_collision"}
+{"text": "the driver suffered whiplash after the collision reference 9262", "label": "medical_injury"}
+{"text": "a client claims the product caused a chemical burn reference 9355", "label": "liability"}
+{"text": "the receipt looks edited and the vendor cannot confirm it for about 8400 euros", "label": "fraud_review"}
+{"text": "the customer alleges the food made them ill policy 23982", "label": "liability"}
+{"text": "the neighbor says our contractor damaged their fence claim 1061", "label": "liability"}
+{"text": "a taxi merged into my lane and scraped the whole side claim 1057", "label": "auto_collision"}
+{"text": "the third party admitted the collision and their insurer is liable claim 1005", "label": "subrogation"}
+{"text": "the medical report was altered before submission claim 1094", "label": "fraud_review"}
+{"text": "the contractor caused the water damage and should reimburse us in lyon", "label": "subrogation"}
+{"text": "the storm blew off shingles and exposed the attic claim 1004", "label": "property_damage"}
+{"text": "a tornado lifted the shed and dropped it in the field claim 1006", "label": "weather"}
+{"text": "the other driver was at fault please recover the repair cost in berlin", "label": "subrogation"}
+{"text": "a client claims the product caused a chemical burn reference 2553", "label": "liability"}
+{"text": "i twisted my knee on the uneven pavement outside claim 1076", "label": "medical_injury"}
+{"text": "a visitor tripped on the loose carpet in our lobby for about 800 euros", "label": "liability"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom for about 1900 euros", "label": "property_damage"}
+{"text": "the at-fault party has accepted liability please pursue recovery claim 1093", "label": "subrogation"}
+{"text": "the storm blew off shingles and exposed the attic in porto", "label": "property_damage"}
+{"text": "the front end was crushed when i hit a stalled car in milan", "label": "auto_collision"}
+{"text": "the customer alleges the food made them ill policy 34166", "label": "liability"}
+{"text": "the receipt looks edited and the vendor cannot confirm it reference 8959", "label": "fraud_review"}
+{"text": "the claimant used a repair shop owned by a relative in rome", "label": "fraud_review"}
+{"text": "the heatwave warped the warehouse roof panels for about 2000 euros", "label": "weather"}
+{"text": "the reported theft happened while the policy was lapsed in milan", "label": "fraud_review"}
+{"text": "the driver suffered whiplash after the collision in madrid", "label": "medical_injury"}
+{"text": "the warehouse pallet was short and the stock is gone in porto", "label": "theft"}
+{"text": "a client claims the product caused a chemical burn in prague", "label": "liability"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible claim 1086", "label": "subrogation"}
+{"text": "a worker cut a hand on the exposed metal edge claim 1034", "label": "medical_injury"}
+{"text": "a parcel was left in the lobby and never reached me in hamburg", "label": "theft"}
+{"text": "hail damaged the roof and the siding during the storm for about 2400 euros", "label": "weather"}
+{"text": "the receipt looks edited and the vendor cannot confirm it claim 1047", "label": "fraud_review"}
+{"text": "the office was broken into and two monitors were taken for about 2100 euros", "label": "theft"}
+{"text": "the other car ran the stop sign and hit the driver side for about 7000 euros", "label": "auto_collision"}
+{"text": "high winds tore the awning off the storefront in warsaw", "label": "weather"}
+{"text": "the insured has a concussion after the fall reference 9947", "label": "medical_injury"}
+{"text": "flood water entered the ground floor after the hurricane in vienna", "label": "weather"}
+{"text": "a truck backed into my front fender at the depot for about 8400 euros", "label": "auto_collision"}
+{"text": "the homeowner claims our drone hit their roof reference 8116", "label": "liability"}
+{"text": "my bicycle was taken from the garage overnight for about 2200 euros", "label": "theft"}
+{"text": "my bicycle was taken from the garage overnight in milan", "label": "theft"}
+{"text": "the claimant changed the date of loss three times reference 9324", "label": "fraud_review"}
+{"text": "my bicycle was taken from the garage overnight reference 8375", "label": "theft"}
+{"text": "the other car ran the stop sign and hit the driver side policy 65046", "label": "auto_collision"}
+{"text": "my camera bag disappeared from the train luggage rack claim 1038", "label": "theft"}
+{"text": "the other driver was at fault please recover the repair cost policy 73574", "label": "subrogation"}
+{"text": "another driver hit my parked car in the lot policy 97916", "label": "auto_collision"}
+{"text": "storm water backed up through the drains into the shop policy 58646", "label": "weather"}
+{"text": "ice dams caused water to stain the upstairs ceiling claim 1058", "label": "weather"}
+{"text": "the front end was crushed when i hit a stalled car reference 6943", "label": "auto_collision"}
+{"text": "lightning struck the chimney and started a fire in lisbon", "label": "weather"}
+{"text": "vandals spray painted the shop front and broke the sign for about 7800 euros", "label": "property_damage"}
+{"text": "a delivery truck cracked the driveway and the garden wall for about 200 euros", "label": "property_damage"}
+{"text": "the shipment was opened and the phone was missing policy 92070", "label": "theft"}
+{"text": "the claimant has three policies and the same photos appear in all of them for about 7900 euros", "label": "fraud_review"}
+{"text": "i was sideswiped on the highway and the door is dented policy 60796", "label": "auto_collision"}
+{"text": "the same invoice was submitted twice with different dates reference 7805", "label": "fraud_review"}
+{"text": "the landlord says the upstairs tenant caused the leak claim 1084", "label": "subrogation"}
+{"text": "the guest burned an arm on the hot serving tray reference 6720", "label": "medical_injury"}
+{"text": "the warehouse pallet was short and the stock is gone in rome", "label": "theft"}
+{"text": "the at-fault party has accepted liability please pursue recovery claim 1053", "label": "subrogation"}
+{"text": "the landlord says the upstairs tenant caused the leak for about 6800 euros", "label": "subrogation"}
+{"text": "my car was rear ended at a red light and the bumper is cracked policy 48224", "label": "auto_collision"}
+{"text": "i lost control on ice and struck a lamppost for about 4900 euros", "label": "auto_collision"}
+{"text": "a pipe burst in the basement and flooded the floor in madrid", "label": "property_damage"}
+{"text": "the subcontractor caused the injury and their policy should respond policy 96253", "label": "subrogation"}
+{"text": "my car was rear ended at a red light and the bumper is cracked reference 1279", "label": "auto_collision"}
+{"text": "a taxi merged into my lane and scraped the whole side policy 17485", "label": "auto_collision"}
+{"text": "the third party admitted the collision and their insurer is liable in berlin", "label": "subrogation"}
+{"text": "the claimant used a repair shop owned by a relative in warsaw", "label": "fraud_review"}
+{"text": "the insured fell from a ladder and broke a wrist for about 8200 euros", "label": "medical_injury"}
+{"text": "i lost control on ice and struck a lamppost reference 8484", "label": "auto_collision"}
+{"text": "the reported theft happened while the policy was lapsed in lisbon", "label": "fraud_review"}
+{"text": "the contractor caused the water damage and should reimburse us claim 1022", "label": "subrogation"}
+{"text": "the homeowner claims our drone hit their roof in lyon", "label": "liability"}
+{"text": "a customer was injured by a falling shelf in the aisle reference 3711", "label": "medical_injury"}
+{"text": "a customer was injured by a falling shelf in the aisle in paris", "label": "medical_injury"}
+{"text": "the contractor caused the water damage and should reimburse us for about 5800 euros", "label": "subrogation"}
+{"text": "ice dams caused water to stain the upstairs ceiling for about 4200 euros", "label": "weather"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible claim 1046", "label": "subrogation"}
+{"text": "high winds tore the awning off the storefront in rome", "label": "weather"}
+{"text": "my vehicle rolled into a ditch after the tire blew reference 4446", "label": "auto_collision"}
+{"text": "the customer alleges the food made them ill reference 6658", "label": "liability"}
+{"text": "the freeze burst the outdoor pipes reference 1179", "label": "weather"}
+{"text": "snow load collapsed the carport roof reference 6477", "label": "weather"}
+{"text": "the tools were stolen from the locked site container policy 84607", "label": "theft"}
+{"text": "the heatwave warped the warehouse roof panels claim 1069", "label": "weather"}
+{"text": "the freeze burst the outdoor pipes reference 8059", "label": "weather"}
+{"text": "a tree fell on the roof and broke two windows policy 39373", "label": "property_damage"}
+{"text": "the landlord says the upstairs tenant caused the leak policy 98697", "label": "subrogation"}
+{"text": "the shipment was opened and the phone was missing for about 7900 euros", "label": "theft"}
+{"text": "a client claims the product caused a chemical burn in lyon", "label": "liability"}
+{"text": "the tenant says the repair crew broke their television for about 7700 euros", "label": "liability"}
+{"text": "the tools were stolen from the locked site container in prague", "label": "theft"}
+{"text": "the storm blew off shingles and exposed the attic policy 93047", "label": "property_damage"}
+{"text": "a parcel was left in the lobby and never reached me in london", "label": "theft"}
+{"text": "my vehicle rolled into a ditch after the tire blew policy 10413", "label": "auto_collision"}
+{"text": "a delivery truck cracked the driveway and the garden wall for about 4000 euros", "label": "property_damage"}
+{"text": "the supplier says our forklift damaged their loading bay in warsaw", "label": "liability"}
+{"text": "i lost control on ice and struck a lamppost reference 2041", "label": "auto_collision"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain reference 4204", "label": "auto_collision"}
+{"text": "the kitchen fire spread smoke damage through the house for about 600 euros", "label": "property_damage"}
+{"text": "the warehouse pallet was short and the stock is gone claim 1094", "label": "theft"}
+{"text": "the warehouse pallet was short and the stock is gone claim 1064", "label": "theft"}
+{"text": "a guest says the hotel valet scratched their car for about 6500 euros", "label": "liability"}
+{"text": "a parcel was left in the lobby and never reached me in vienna", "label": "theft"}
+{"text": "i slipped on the wet floor at the store and hurt my back claim 1050", "label": "medical_injury"}
+{"text": "the claimant has three policies and the same photos appear in all of them policy 87825", "label": "fraud_review"}
+{"text": "a truck backed into my front fender at the depot policy 66052", "label": "auto_collision"}
+{"text": "flood water entered the ground floor after the hurricane for about 8300 euros", "label": "weather"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling for about 5700 euros", "label": "property_damage"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain reference 9788", "label": "auto_collision"}
+{"text": "a guest says the hotel valet scratched their car claim 1018", "label": "liability"}
+{"text": "the customer alleges the food made them ill policy 98324", "label": "liability"}
+{"text": "the washing machine overflowed and ruined the hardwood in vienna", "label": "property_damage"}
+{"text": "the at-fault party has accepted liability please pursue recovery in milan", "label": "subrogation"}
+{"text": "my passport and wallet were taken from the rental car policy 62468", "label": "theft"}
+{"text": "the storm blew off shingles and exposed the attic reference 2817", "label": "property_damage"}
+{"text": "i twisted my knee on the uneven pavement outside reference 3679", "label": "medical_injury"}
+{"text": "my car was rear ended at a red light and the bumper is cracked for about 5500 euros", "label": "auto_collision"}
+{"text": "the claimant needed stitches after the dog bite in berlin", "label": "medical_injury"}
+{"text": "a client claims the product caused a chemical burn in lyon", "label": "liability"}
+{"text": "the washing machine overflowed and ruined the hardwood for about 6400 euros", "label": "property_damage"}
+{"text": "the freeze burst the outdoor pipes for about 600 euros", "label": "weather"}
+{"text": "i twisted my knee on the uneven pavement outside policy 55101", "label": "medical_injury"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain for about 8000 euros", "label": "auto_collision"}
+{"text": "we paid the fire claim and the faulty appliance maker is responsible for about 4100 euros", "label": "subrogation"}
+{"text": "lightning struck the chimney and started a fire claim 1093", "label": "weather"}
+{"text": "the storm blew off shingles and exposed the attic in porto", "label": "property_damage"}
+{"text": "someone broke the car window and took my bag in vienna", "label": "theft"}
+{"text": "the insured vehicle collided with a guardrail during heavy rain reference 5185", "label": "auto_collision"}
+{"text": "flood water entered the ground floor after the hurricane policy 68647", "label": "weather"}
+{"text": "the repair estimate is much higher than the market value in paris", "label": "fraud_review"}
+{"text": "i slipped on the wet floor at the store and hurt my back policy 85464", "label": "medical_injury"}
+{"text": "the manufacturer recalled the part and should cover our payout claim 1099", "label": "subrogation"}
+{"text": "the kitchen fire spread smoke damage through the house policy 73536", "label": "property_damage"}
+{"text": "the claimant needed stitches after the dog bite for about 2400 euros", "label": "medical_injury"}
+{"text": "someone broke the car window and took my bag for about 3300 euros", "label": "theft"}
+{"text": "water leaked from the upstairs unit and damaged the ceiling for about 7500 euros", "label": "property_damage"}
+{"text": "the other car ran the stop sign and hit the driver side in dublin", "label": "auto_collision"}
+{"text": "the other driver was at fault please recover the repair cost for about 7200 euros", "label": "subrogation"}
+{"text": "the other car ran the stop sign and hit the driver side claim 1085", "label": "auto_collision"}
+{"text": "ice dams caused water to stain the upstairs ceiling for about 8600 euros", "label": "weather"}
+{"text": "the front end was crushed when i hit a stalled car in milan", "label": "auto_collision"}
+{"text": "snow load collapsed the carport roof reference 7440", "label": "weather"}
+{"text": "a tornado lifted the shed and dropped it in the field for about 7600 euros", "label": "weather"}
+{"text": "i slipped on the wet floor at the store and hurt my back reference 1093", "label": "medical_injury"}
+{"text": "the supplier says our forklift damaged their loading bay policy 36963", "label": "liability"}
+{"text": "my laptop was stolen from the hotel room reference 4820", "label": "theft"}
+{"text": "a truck backed into my front fender at the depot claim 1004", "label": "auto_collision"}
+{"text": "the vehicle was reported stolen after it was sold claim 1058", "label": "fraud_review"}
+{"text": "the same damage appears in two unrelated claims for about 5400 euros", "label": "fraud_review"}
+{"text": "a delivery truck cracked the driveway and the garden wall claim 1055", "label": "property_damage"}
+{"text": "a visitor was hit by a swinging door and bruised a shoulder in porto", "label": "medical_injury"}
+{"text": "the ceiling collapsed after a slow leak in the bathroom reference 2621", "label": "property_damage"}
+{"text": "i twisted my knee on the uneven pavement outside in vienna", "label": "medical_injury"}
+{"text": "ice dams caused water to stain the upstairs ceiling policy 56161", "label": "weather"}
+{"text": "the vehicle was reported stolen after it was sold claim 1008", "label": "fraud_review"}
+{"text": "ice dams caused water to stain the upstairs ceiling claim 1028", "label": "weather"}
+{"text": "another driver hit my parked car in the lot in london", "label": "auto_collision"}
+{"text": "the same damage appears in two unrelated claims claim 1056", "label": "fraud_review"}
+{"text": "high winds tore the awning off the storefront reference 5469", "label": "weather"}
+{"text": "the claimant has three policies and the same photos appear in all of them in london", "label": "fraud_review"}
+{"text": "a client claims the product caused a chemical burn for about 7700 euros", "label": "liability"}
+{"text": "the driver suffered whiplash after the collision in lisbon", "label": "medical_injury"}
+{"text": "the other driver was at fault please recover the repair cost policy 41879", "label": "subrogation"}
+{"text": "high winds tore the awning off the storefront for about 4300 euros", "label": "weather"}
