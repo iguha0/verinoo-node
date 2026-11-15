@@ -114,6 +114,8 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `VNN_SEEDS` | *(none)* | `/ip4/<host>/tcp/<port>` peers |
 | `VNN_SYNC_URLS` | *(none)* | peer HTTP APIs for catch-up replay, comma-separated |
 | `VNN_API_KEYS_FILE` | `/etc/verinoo/api-keys.json` if present | tenant keys; absent = public demo mode |
+| `VNN_SELF_SERVE_KEYS` | `false` | enable self-serve key issuance at `POST /v1/keys` |
+| `VNN_SELF_SERVE_QUOTA` | `1000` | daily quota for self-serve keys (`0` = unlimited) |
 | `VNN_INPUT_KEY` | *(none)* | network X25519 secret (64 hex); enables encrypted inputs |
 | `VNN_REQUIRE_ENCRYPTED_INPUT` | `false` | reject plaintext inference submissions |
 | `VNN_BLOCK_TIME_MS` | chain default (10 000) | block interval; identical on every validator |
@@ -137,6 +139,7 @@ Catch-up: a node that starts late or falls behind replays validated blocks from
 | `POST /faucet` | testnet drip (10 000, 60 s per address) |
 | `GET /v1/models` | models this node executes, with weights hash |
 | `GET /v1/input-key` | network X25519 key for encrypted inputs |
+| `POST /v1/keys` | issue a self-serve key (`{"address":"ai_..."}`); 404 unless `VNN_SELF_SERVE_KEYS=1` |
 | `POST /v1/infer` | submit a signed inference transaction (`Authorization: Bearer <key>` when keys are enabled) |
 | `GET /v1/tasks/:id` | task status, output and receipt |
 | `GET /v1/verify/:id` | recompute the output and compare with the chain |
@@ -215,6 +218,19 @@ systemctl kill -s HUP verinoo-node    # reload without downtime
 Keys are stored as hashes and reloaded with SIGHUP. See
 [`docs/operations.md`](docs/operations.md) for backups, restore, rotation,
 replica/HA and incident response.
+
+With `VNN_SELF_SERVE_KEYS=1`, clients can issue their own address-bound key:
+
+```bash
+curl -s -X POST localhost:7100/v1/keys \
+  -H 'content-type: application/json' -d '{"address":"ai_..."}'
+```
+
+The raw key is shown once; only its SHA-256 hash is stored in RocksDB. One
+active key per address (a second request returns `409`), daily quota from
+`VNN_SELF_SERVE_QUOTA`, and issuance is limited to 5 requests/hour per IP.
+Self-serve keys live in the database and are **not** listed by
+`verinoo-node apikey list`, which only reads the operator key file.
 
 ## Test and deploy
 

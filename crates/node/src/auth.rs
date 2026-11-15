@@ -4,7 +4,8 @@
 //! `from` matches that address. That gives tenant isolation without changing
 //! consensus state, and lets the existing per-address metering answer "what did
 //! this tenant use?". Only the SHA-256 of a key is written to disk; the raw key
-//! is printed once when it is created.
+//! is printed or returned once when it is created. Operator keys live in a JSON
+//! file; with `VNN_SELF_SERVE_KEYS=1`, self-serve keys live in RocksDB meta.
 //!
 //! Quotas are enforced at the gateway, not by consensus: they are a billing and
 //! abuse control, not a security invariant. Reload the key file with SIGHUP:
@@ -22,6 +23,11 @@ const KEY_PREFIX: &str = "vnn_";
 const KEY_BYTES: usize = 32;
 const QUOTA_DAY_MS: u64 = 86_400_000;
 const DEFAULT_KEYS_FILE: &str = "/etc/verinoo/api-keys.json";
+const SELF_SERVE_TENANT: &str = "self-serve";
+const SELF_SERVE_KEY_PREFIX: &str = "selfserve:key:";
+const SELF_SERVE_ADDR_PREFIX: &str = "selfserve:addr:";
+const SELF_SERVE_DEFAULT_QUOTA: u64 = 1000;
+const ADDRESS_HEX_LEN: usize = 40;
 
 fn default_enabled() -> bool {
     true
@@ -100,6 +106,124 @@ fn validate_entry(entry: &KeyEntry) -> Result<(), String> {
         return Err("tenant name must not be empty".into());
     }
     Ok(())
+}
+
+/// A self-serve key persisted in RocksDB. Unlike `KeyEntry` it has no
+/// `keyHash` field: the hash is already the meta key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SelfServeKey {
+    tenant: String,
+    address: String,
+    #[serde(rename = "dailyQuota", default)]
+    daily_quota: u64,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(rename = "createdAt", default)]
+    created_at: u64,
+}
+
+/// A newly issued self-serve key. `api_key` is the only time the raw value
+/// exists; callers must return it to the client immediately.
+#[derive(Debug, Clone)]
+pub struct IssuedSelfServeKey {
+    pub api_key: String,
+    pub tenant: String,
+    pub address: String,
+    pub daily_quota: u64,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum SelfServeError {
+    InvalidAddress,
+    AlreadyIssued { tenant: String, address: String },
+}
+
+pub fn self_serve_enabled() -> bool {
+    std::env::var("VNN_SELF_SERVE_KEYS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+pub fn self_serve_default_quota() -> u64 {
+    std::env::var("VNN_SELF_SERVE_QUOTA")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(SELF_SERVE_DEFAULT_QUOTA)
+}
+
+fn valid_self_serve_address(address: &str) -> bool {
+    address.len() == "ai_".len() + ADDRESS_HEX_LEN
+        && address.starts_with("ai_")
+        && address["ai_".len()..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+}
+
+/// Issue a key bound to `address`, storing only its SHA-256 hash. One active
+/// key per address: a second call returns the existing tenant/address, never
+/// the raw key.
+pub fn issue_self_serve_key(
+    store: &StateStore,
+    address: &str,
+    daily_quota: u64,
+    now_ms: u64,
+) -> Result<IssuedSelfServeKey, SelfServeError> {
+    let address = address.trim();
+    if !valid_self_serve_address(address) {
+        return Err(SelfServeError::InvalidAddress);
+    }
+    let addr_key = format!("{SELF_SERVE_ADDR_PREFIX}{address}");
+    if let Some(hash) = store
+        .get_meta(&addr_key)
+        .and_then(|v| v.as_str().map(String::from))
+    {
+        let tenant = store
+            .get_meta(&format!("{SELF_SERVE_KEY_PREFIX}{hash}"))
+            .and_then(|v| serde_json::from_value::<SelfServeKey>(v).ok())
+            .map(|k| k.tenant)
+            .unwrap_or_else(|| SELF_SERVE_TENANT.to_string());
+        return Err(SelfServeError::AlreadyIssued {
+            tenant,
+            address: address.to_string(),
+        });
+    }
+
+    let raw_key = generate_key();
+    let hash = hash_key(&raw_key);
+    let record = SelfServeKey {
+        tenant: SELF_SERVE_TENANT.to_string(),
+        address: address.to_string(),
+        daily_quota,
+        enabled: true,
+        created_at: now_ms,
+    };
+    store.set_meta(
+        &format!("{SELF_SERVE_KEY_PREFIX}{hash}"),
+        &serde_json::to_value(&record).expect("serialize self-serve key"),
+    );
+    store.set_meta(&addr_key, &serde_json::json!(hash));
+    Ok(IssuedSelfServeKey {
+        api_key: raw_key,
+        tenant: record.tenant,
+        address: record.address,
+        daily_quota: record.daily_quota,
+        created_at: record.created_at,
+    })
+}
+
+fn lookup_self_serve(store: &StateStore, raw_key: &str) -> Option<Caller> {
+    let hash = hash_key(raw_key);
+    let record: SelfServeKey =
+        serde_json::from_value(store.get_meta(&format!("{SELF_SERVE_KEY_PREFIX}{hash}"))?).ok()?;
+    if !record.enabled {
+        return None;
+    }
+    Some(Caller {
+        tenant: record.tenant,
+        address: record.address,
+        daily_quota: record.daily_quota,
+    })
 }
 
 pub fn hash_key(raw_key: &str) -> String {
@@ -234,6 +358,9 @@ pub struct Auth {
     inner: Option<Arc<RwLock<ApiKeys>>>,
     path: Option<PathBuf>,
     quota_lock: Arc<std::sync::Mutex<()>>,
+    issue_lock: Arc<std::sync::Mutex<()>>,
+    self_serve: bool,
+    self_serve_quota: u64,
 }
 
 impl Auth {
@@ -242,6 +369,9 @@ impl Auth {
             inner: None,
             path: None,
             quota_lock: Arc::new(std::sync::Mutex::new(())),
+            issue_lock: Arc::new(std::sync::Mutex::new(())),
+            self_serve: false,
+            self_serve_quota: SELF_SERVE_DEFAULT_QUOTA,
         }
     }
 
@@ -251,27 +381,50 @@ impl Auth {
             inner: Some(Arc::new(RwLock::new(keys))),
             path: Some(path.to_path_buf()),
             quota_lock: Arc::new(std::sync::Mutex::new(())),
+            issue_lock: Arc::new(std::sync::Mutex::new(())),
+            self_serve: false,
+            self_serve_quota: SELF_SERVE_DEFAULT_QUOTA,
         })
     }
 
     /// `VNN_API_KEYS_FILE` if set; otherwise the default file if it exists;
-    /// otherwise authentication is disabled.
+    /// otherwise authentication is disabled. Self-serve issuance is gated
+    /// separately by `VNN_SELF_SERVE_KEYS`.
     pub fn from_env() -> Result<Self, String> {
-        if let Ok(raw) = std::env::var("VNN_API_KEYS_FILE") {
-            if !raw.trim().is_empty() {
-                return Self::load(Path::new(raw.trim()));
+        let mut auth = match std::env::var("VNN_API_KEYS_FILE") {
+            Ok(raw) if !raw.trim().is_empty() => Self::load(Path::new(raw.trim()))?,
+            _ => {
+                let default = Path::new(DEFAULT_KEYS_FILE);
+                if default.exists() {
+                    Self::load(default)?
+                } else {
+                    Self::disabled()
+                }
             }
-        }
-        let default = Path::new(DEFAULT_KEYS_FILE);
-        if default.exists() {
-            Self::load(default)
-        } else {
-            Ok(Self::disabled())
-        }
+        };
+        auth.self_serve = self_serve_enabled();
+        auth.self_serve_quota = self_serve_default_quota();
+        Ok(auth)
+    }
+
+    #[cfg(test)]
+    pub fn with_self_serve(mut self, enabled: bool) -> Self {
+        self.self_serve = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_self_serve_quota(mut self, quota: u64) -> Self {
+        self.self_serve_quota = quota;
+        self
+    }
+
+    pub fn self_serve_enabled(&self) -> bool {
+        self.self_serve
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.inner.is_some()
+        self.inner.is_some() || self.self_serve
     }
 
     pub fn len(&self) -> usize {
@@ -285,6 +438,7 @@ impl Auth {
         self.path.as_deref()
     }
 
+    #[cfg(test)]
     pub fn authorize(&self, headers: &HeaderMap) -> Result<Caller, AuthError> {
         let Some(inner) = &self.inner else {
             return Err(AuthError::Invalid);
@@ -297,6 +451,42 @@ impl Auth {
             address: entry.address.clone(),
             daily_quota: entry.daily_quota,
         })
+    }
+
+    /// Authorize against file-based keys first, then self-serve keys stored in
+    /// RocksDB. Self-serve lookups are only attempted when the feature is on.
+    pub fn authorize_with_store(
+        &self,
+        headers: &HeaderMap,
+        store: &StateStore,
+    ) -> Result<Caller, AuthError> {
+        let raw = bearer(headers).ok_or(AuthError::Missing)?;
+        if let Some(inner) = &self.inner {
+            let keys = inner.read().expect("api keys lock");
+            if let Some(entry) = keys.authorize(&raw) {
+                return Ok(Caller {
+                    tenant: entry.tenant.clone(),
+                    address: entry.address.clone(),
+                    daily_quota: entry.daily_quota,
+                });
+            }
+        }
+        if self.self_serve {
+            if let Some(caller) = lookup_self_serve(store, &raw) {
+                return Ok(caller);
+            }
+        }
+        Err(AuthError::Invalid)
+    }
+
+    pub fn issue_self_serve_key(
+        &self,
+        store: &StateStore,
+        address: &str,
+        now_ms: u64,
+    ) -> Result<IssuedSelfServeKey, SelfServeError> {
+        let _guard = self.issue_lock.lock().expect("self-serve issue lock");
+        self::issue_self_serve_key(store, address, self.self_serve_quota, now_ms)
     }
 
     /// Check and consume one inference from today's allowance.
@@ -335,7 +525,7 @@ impl Auth {
 
     /// Reload the key file on SIGHUP so keys can be rotated without downtime.
     pub fn spawn_reload_on_sighup(&self) {
-        if !self.is_enabled() {
+        if self.path.is_none() {
             return;
         }
         let this = self.clone();
@@ -612,5 +802,160 @@ mod tests {
         let path = temp_file("bad-address.json");
         let err = add_key(&path, "acme", "0xdeadbeef", 1).unwrap_err();
         assert!(err.contains("not a verinoo address"), "{err}");
+    }
+
+    #[test]
+    fn self_serve_issue_stores_only_hash_and_is_one_per_address() {
+        let store = StateStore::open_temp().unwrap();
+        let now = 1_700_000_000_000u64;
+        let issued = issue_self_serve_key(&store, ADDR, 25, now).unwrap();
+        assert!(issued.api_key.starts_with(KEY_PREFIX));
+        assert_eq!(issued.api_key.len(), KEY_PREFIX.len() + 64);
+        assert_eq!(issued.tenant, SELF_SERVE_TENANT);
+        assert_eq!(issued.address, ADDR);
+        assert_eq!(issued.daily_quota, 25);
+        assert_eq!(issued.created_at, now);
+
+        let hash = hash_key(&issued.api_key);
+        let record = store
+            .get_meta(&format!("{SELF_SERVE_KEY_PREFIX}{hash}"))
+            .expect("key record stored");
+        assert_eq!(record["tenant"], SELF_SERVE_TENANT);
+        assert_eq!(record["address"], ADDR);
+        assert_eq!(record["dailyQuota"], 25);
+        assert_eq!(record["enabled"], true);
+        assert_eq!(record["createdAt"], now);
+        assert_eq!(
+            store
+                .get_meta(&format!("{SELF_SERVE_ADDR_PREFIX}{ADDR}"))
+                .unwrap(),
+            serde_json::json!(hash)
+        );
+        for value in store.iter_prefix::<serde_json::Value>("meta:selfserve:key:") {
+            assert!(
+                !value.to_string().contains(&issued.api_key),
+                "raw key must never be stored"
+            );
+        }
+
+        match issue_self_serve_key(&store, ADDR, 25, now).unwrap_err() {
+            SelfServeError::AlreadyIssued { tenant, address } => {
+                assert_eq!(tenant, SELF_SERVE_TENANT);
+                assert_eq!(address, ADDR);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_serve_rejects_invalid_addresses() {
+        let store = StateStore::open_temp().unwrap();
+        let bad = [
+            "",
+            "0xdeadbeef",
+            "ai_1234",
+            "ai_0123456789abcdef0123456789abcdef0123456z",
+        ];
+        for address in bad {
+            assert!(
+                matches!(
+                    issue_self_serve_key(&store, address, 1, 0),
+                    Err(SelfServeError::InvalidAddress)
+                ),
+                "expected {address:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn self_serve_authorize_with_store_and_reject_wrong_or_disabled() {
+        let store = StateStore::open_temp().unwrap();
+        let issued = issue_self_serve_key(&store, ADDR, 7, 1).unwrap();
+        let auth = Auth::disabled().with_self_serve(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", issued.api_key).parse().unwrap(),
+        );
+        let caller = auth.authorize_with_store(&headers, &store).unwrap();
+        assert_eq!(caller.tenant, SELF_SERVE_TENANT);
+        assert_eq!(caller.address, ADDR);
+        assert_eq!(caller.daily_quota, 7);
+
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer vnn_deadbeef".parse().unwrap(),
+        );
+        assert!(matches!(
+            auth.authorize_with_store(&headers, &store),
+            Err(AuthError::Invalid)
+        ));
+
+        // Feature off: DB keys are ignored.
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", issued.api_key).parse().unwrap(),
+        );
+        assert!(matches!(
+            Auth::disabled().authorize_with_store(&headers, &store),
+            Err(AuthError::Invalid)
+        ));
+
+        // Disabled record: rejected even when the feature is on.
+        let key = format!("{SELF_SERVE_KEY_PREFIX}{}", hash_key(&issued.api_key));
+        let mut record = store.get_meta(&key).unwrap();
+        record["enabled"] = serde_json::json!(false);
+        store.set_meta(&key, &record);
+        assert!(matches!(
+            auth.authorize_with_store(&headers, &store),
+            Err(AuthError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn authorize_with_store_still_checks_file_keys_first() {
+        let store = StateStore::open_temp().unwrap();
+        let path = temp_file("store-file.json");
+        let raw = add_key(&path, "acme", ADDR, 3).unwrap();
+        let auth = Auth::load(&path).unwrap().with_self_serve(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {raw}").parse().unwrap(),
+        );
+        let caller = auth.authorize_with_store(&headers, &store).unwrap();
+        assert_eq!(caller.tenant, "acme");
+        assert_eq!(caller.address, ADDR);
+        assert_eq!(caller.daily_quota, 3);
+    }
+
+    #[test]
+    fn self_serve_quota_is_still_per_address() {
+        let store = StateStore::open_temp().unwrap();
+        let issued = issue_self_serve_key(&store, ADDR, 2, 1).unwrap();
+        let auth = Auth::disabled().with_self_serve(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", issued.api_key).parse().unwrap(),
+        );
+        let caller = auth.authorize_with_store(&headers, &store).unwrap();
+        let now = 1_700_000_000_000u64;
+        assert_eq!(auth.consume_quota(&store, &caller, now).unwrap(), 1);
+        assert_eq!(auth.consume_quota(&store, &caller, now).unwrap(), 2);
+        assert!(matches!(
+            auth.consume_quota(&store, &caller, now),
+            Err(AuthError::QuotaExceeded { used: 2, quota: 2 })
+        ));
+        // Another key for the same address would share the same allowance.
+        let same_address = Caller {
+            tenant: "self-serve-2".into(),
+            address: ADDR.into(),
+            daily_quota: 2,
+        };
+        assert!(matches!(
+            auth.consume_quota(&store, &same_address, now),
+            Err(AuthError::QuotaExceeded { used: 2, quota: 2 })
+        ));
     }
 }

@@ -79,6 +79,37 @@ systemctl kill -s HUP verinoo-node
 `--quota 0` means unlimited. Quotas are gateway-local and reset per UTC day.
 They are a billing/abuse control, not a consensus rule.
 
+## Self-serve API keys
+
+Set `VNN_SELF_SERVE_KEYS=1` to let clients issue their own address-bound key:
+
+```bash
+curl -s -X POST localhost:7100/v1/keys \
+  -H 'content-type: application/json' -d '{"address":"ai_..."}'
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VNN_SELF_SERVE_KEYS` | unset (`404`) | enable `POST /v1/keys` |
+| `VNN_SELF_SERVE_QUOTA` | `1000` | tasks per UTC day; `0` = unlimited |
+
+- The body must be `{"address":"ai_<40 hex>"}`; anything else is `400`.
+- The response includes the raw `apiKey` **once**. Only its SHA-256 hash is
+  stored, in RocksDB meta `selfserve:key:<sha256hex>`; the address index is
+  `selfserve:addr:<address>`. Nothing is written to `/etc`.
+- One active key per address. A second request returns `409` with the existing
+  tenant (`self-serve`) and address, never the raw key.
+- The key only authorizes API access for a signer that already holds the
+  address's private key: `tx.from` must match the bound address.
+- Quota is per address per UTC day, so keys cannot multiply an allowance.
+- Issuance is rate-limited best-effort to **5 requests per hour per IP**
+  (`429` with `retryAfterSecs`). The window is in memory and resets on restart;
+  behind the proxy the limiter honours `X-Forwarded-For` / `X-Real-IP`.
+- Self-serve keys live in the database and are **not** listed by
+  `verinoo-node apikey list`, which only reads the operator key file. They are
+  included in normal RocksDB backups. Unset `VNN_SELF_SERVE_KEYS` to stop new
+  issuance; existing self-serve keys stop authorizing while it is off.
+
 ## Input encryption key
 
 Inputs are encrypted to one network X25519 key so blocks and API responses carry

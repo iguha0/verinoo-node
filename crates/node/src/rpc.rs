@@ -4,14 +4,17 @@
 //! state directly. Block/tx payloads are canonical JSON.
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Extension, Json, Router,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use crate::auth::{Auth, AuthError};
+use crate::auth::{Auth, AuthError, SelfServeError};
 use crate::Shared;
 
 pub async fn serve(
@@ -34,6 +37,7 @@ pub async fn serve(
         // ---- v1 product surface ----
         .route("/v1/models", get(v1_models))
         .route("/v1/input-key", get(v1_input_key))
+        .route("/v1/keys", post(v1_issue_key))
         .route("/v1/infer", post(submit_tx))
         .route("/v1/tasks/:task_id", get(v1_task))
         .route("/v1/verify/:task_id", get(v1_verify))
@@ -42,14 +46,65 @@ pub async fn serve(
         .layer(axum::middleware::from_fn(cors))
         .with_state(shared)
         .layer(Extension(net))
-        .layer(Extension(auth));
+        .layer(Extension(auth))
+        .layer(Extension(KeyRateLimit::default()));
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| e.to_string())?;
     tracing::info!("rpc listening on {addr}");
-    axum::serve(listener, app).await.map_err(|e| e.to_string())
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+const KEY_RATE_LIMIT: usize = 5;
+const KEY_RATE_WINDOW: Duration = Duration::from_secs(3_600);
+
+/// Best-effort per-IP limiter for self-serve key issuance. State is process
+/// local, so a restart clears it and replicas each keep their own window.
+#[derive(Clone, Default)]
+struct KeyRateLimit {
+    inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+}
+
+impl KeyRateLimit {
+    fn check(&self, key: &str) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut map = self.inner.lock().expect("key rate limit lock");
+        let entries = map.entry(key.to_string()).or_default();
+        entries.retain(|t| now.duration_since(*t) < KEY_RATE_WINDOW);
+        if entries.len() >= KEY_RATE_LIMIT {
+            let wait = KEY_RATE_WINDOW.saturating_sub(now.duration_since(entries[0]));
+            return Err(wait.as_secs().max(1));
+        }
+        entries.push(now);
+        Ok(())
+    }
+}
+
+fn request_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
+    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = forwarded
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return first.to_string();
+        }
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let real = real.trim();
+        if !real.is_empty() {
+            return real.to_string();
+        }
+    }
+    peer.ip().to_string()
 }
 
 /// Liveness/readiness probe for load balancers and systemd.
@@ -299,6 +354,10 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         "headAgeMs": shared.now_ms().saturating_sub(ts),
         "mempoolSize": shared.mempool.lock().await.len(),
         "validatorCount": shared.store.validator_addresses().len(),
+        "selfServeKeys": shared
+            .store
+            .iter_prefix::<serde_json::Value>("meta:selfserve:key:")
+            .len(),
         "chainId": shared.params.chain_id,
         "blockTimeMs": shared.params.block_time_ms,
     }))
@@ -322,7 +381,9 @@ async fn submit_tx(
     // sender (public demo). When keys are configured, a key may only submit for
     // the address it was issued to.
     let caller = if auth.is_enabled() {
-        let caller = auth.authorize(&headers).map_err(auth_error)?;
+        let caller = auth
+            .authorize_with_store(&headers, &shared.store)
+            .map_err(auth_error)?;
         if caller.address != tx.from {
             return Err(auth_error(AuthError::AddressMismatch));
         }
@@ -456,6 +517,62 @@ async fn v1_input_key() -> Json<serde_json::Value> {
         "required": encrypted_input_required(),
         "algorithm": verinoo_crypto::ALGORITHM,
     }))
+}
+
+/// Self-serve API key issuance. Disabled unless `VNN_SELF_SERVE_KEYS=1`.
+/// One active key per address; the raw key is returned exactly once.
+async fn v1_issue_key(
+    State(shared): State<Arc<Shared>>,
+    Extension(auth): Extension<Auth>,
+    Extension(rate): Extension<KeyRateLimit>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !auth.self_serve_enabled() {
+        return Err(not_found("self-serve key issuance is disabled"));
+    }
+    let ip = request_ip(&headers, peer);
+    if let Err(retry_after) = rate.check(&ip) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "self-serve key rate limit exceeded (5 per hour per IP)",
+                "retryAfterSecs": retry_after,
+            })),
+        ));
+    }
+    let address = body["address"].as_str().unwrap_or("").trim();
+    if address.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing address" })),
+        ));
+    }
+    match auth.issue_self_serve_key(&shared.store, address, shared.now_ms()) {
+        Ok(issued) => Ok(Json(serde_json::json!({
+            "apiKey": issued.api_key,
+            "tenant": issued.tenant,
+            "address": issued.address,
+            "dailyQuota": issued.daily_quota,
+            "createdAt": issued.created_at,
+            "note": "store this key; it is shown only once",
+        }))),
+        Err(SelfServeError::InvalidAddress) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "address must be `ai_` followed by 40 hex characters"
+            })),
+        )),
+        Err(SelfServeError::AlreadyIssued { tenant, address }) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "address already has a self-serve key",
+                "tenant": tenant,
+                "address": address,
+            })),
+        )),
+    }
 }
 
 async fn v1_task(
@@ -598,7 +715,9 @@ async fn v1_usage(
     axum::extract::Path(address): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     if auth.is_enabled() {
-        let caller = auth.authorize(&headers).map_err(auth_error)?;
+        let caller = auth
+            .authorize_with_store(&headers, &shared.store)
+            .map_err(auth_error)?;
         if caller.address != address {
             return Err(auth_error(AuthError::AddressMismatch));
         }
@@ -614,7 +733,9 @@ async fn v1_usage_csv(
     axum::extract::Path(address): axum::extract::Path<String>,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     if auth.is_enabled() {
-        let caller = auth.authorize(&headers).map_err(auth_error)?;
+        let caller = auth
+            .authorize_with_store(&headers, &shared.store)
+            .map_err(auth_error)?;
         if caller.address != address {
             return Err(auth_error(AuthError::AddressMismatch));
         }
@@ -631,4 +752,158 @@ async fn v1_usage_csv(
         u["balance"],
     );
     Ok(([(axum::http::header::CONTENT_TYPE, "text/csv")], body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use verinoo_exec::engine::ProducerKey;
+    use verinoo_state::genesis::GenesisParams;
+    use verinoo_state::StateStore;
+
+    const ADDR: &str = "ai_0123456789abcdef0123456789abcdef01234567";
+
+    fn test_shared() -> Arc<Shared> {
+        let store = StateStore::open_temp().unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let address = verinoo_exec::engine::public_key_to_address(&hex::encode(
+            signing.verifying_key().to_bytes(),
+        ))
+        .unwrap();
+        let faucet = ProducerKey::from_parts(address, signing);
+        Arc::new(Shared {
+            store,
+            params: GenesisParams::default(),
+            mempool: tokio::sync::Mutex::new(Vec::new()),
+            faucet,
+            chain_lock: tokio::sync::Mutex::new(()),
+            policy: std::sync::Mutex::new(crate::Policy::default()),
+        })
+    }
+
+    async fn call_issue(
+        shared: &Arc<Shared>,
+        auth: &Auth,
+        rate: &KeyRateLimit,
+        ip: &str,
+        body: serde_json::Value,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", ip.parse().unwrap());
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        v1_issue_key(
+            State(shared.clone()),
+            Extension(auth.clone()),
+            Extension(rate.clone()),
+            ConnectInfo(peer),
+            headers,
+            Json(body),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn self_serve_route_is_404_when_disabled() {
+        let shared = test_shared();
+        let auth = Auth::disabled();
+        let rate = KeyRateLimit::default();
+        let err = call_issue(
+            &shared,
+            &auth,
+            &rate,
+            "203.0.113.1",
+            serde_json::json!({ "address": ADDR }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn self_serve_issue_returns_key_once_and_conflicts_on_second_request() {
+        let shared = test_shared();
+        let auth = Auth::disabled()
+            .with_self_serve(true)
+            .with_self_serve_quota(5);
+        let rate = KeyRateLimit::default();
+        let ok = call_issue(
+            &shared,
+            &auth,
+            &rate,
+            "203.0.113.2",
+            serde_json::json!({ "address": ADDR }),
+        )
+        .await
+        .unwrap();
+        let raw = ok.0["apiKey"].as_str().unwrap();
+        assert!(raw.starts_with("vnn_"));
+        assert_eq!(ok.0["tenant"], "self-serve");
+        assert_eq!(ok.0["address"], ADDR);
+        assert_eq!(ok.0["dailyQuota"], 5);
+
+        let conflict = call_issue(
+            &shared,
+            &auth,
+            &rate,
+            "203.0.113.2",
+            serde_json::json!({ "address": ADDR }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert_eq!(conflict.1 .0["tenant"], "self-serve");
+        assert_eq!(conflict.1 .0["address"], ADDR);
+        assert!(!conflict.1 .0.to_string().contains(raw));
+
+        let bad = call_issue(
+            &shared,
+            &auth,
+            &rate,
+            "203.0.113.2",
+            serde_json::json!({ "address": "ai_nothex" }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bad.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn self_serve_rate_limit_is_five_per_hour_per_ip() {
+        let shared = test_shared();
+        let auth = Auth::disabled().with_self_serve(true);
+        let rate = KeyRateLimit::default();
+        for i in 0..5 {
+            let address = format!("ai_{i:040x}");
+            let res = call_issue(
+                &shared,
+                &auth,
+                &rate,
+                "198.51.100.9",
+                serde_json::json!({ "address": address }),
+            )
+            .await;
+            assert!(res.is_ok(), "request {i} should pass: {res:?}");
+        }
+        let err = call_issue(
+            &shared,
+            &auth,
+            &rate,
+            "198.51.100.9",
+            serde_json::json!({ "address": format!("ai_{:040x}", 99) }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+
+        // A different IP has its own window.
+        let other = call_issue(
+            &shared,
+            &auth,
+            &rate,
+            "198.51.100.10",
+            serde_json::json!({ "address": format!("ai_{:040x}", 100) }),
+        )
+        .await;
+        assert!(other.is_ok());
+    }
 }
