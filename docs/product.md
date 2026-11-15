@@ -39,6 +39,13 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   softmax over Q16.16 integers. `models/acme-support-v1.graph.json` is a second
   model executed that way on two nodes — the reference classifier exported
   through the generic runtime, so its scores match byte-for-byte.
+- **A real transformer encoder now runs in consensus.**
+  `intent-transformer-v1` is a one-layer pre-norm transformer encoder with
+  Q16.16 attention, 5,508 parameters and a word-level vocabulary. It executes
+  through the same block-application path and gets a weights-bound receipt.
+  Train 100%, validation 90%, held-out 80% on a 10-example split; 80/80 label
+  parity with its float reference on the full 80-example corpus. Small corpus,
+  demonstration only.
 - **Deterministic across machines.** Inference is Q16.16 integer arithmetic with
   no floating point and no threading. Two independent nodes produced the same
   result hash for the same task in the verification run below.
@@ -53,12 +60,14 @@ the chain itself is inconsistent — that is the invariant a validator protects.
 - **Not a general model host.** Dense / relu / softmax classifiers over the
   hashed-unigram featuriser convert from ONNX (`onnx-import`) or GGUF
   (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K) — see
-  [`docs/runtime.md`](runtime.md). Transformer graphs — attention, convolutions,
-  arbitrary tokenizers, sampling — are not supported, so a customer's LLM
-  checkpoint cannot run yet. A Q16.16 attention kernel exists as a prototype
-  (`crates/runtime/src/attention.rs`) but is not wired into model loading. Tasks
-  for models a node has not loaded fall back to the manual claim → submit result
-  flow and are **not** verified by the chain.
+  [`docs/runtime.md`](runtime.md). A small transformer **encoder classifier**
+  runs through a separate runtime (`crates/runtime/src/transformer.rs`), with
+  word-level tokenization and CLS pooling. There is no decoder, causal mask,
+  KV cache, sampling, BPE/WordPiece tokenizer or ONNX attention import, so a
+  customer's LLM checkpoint cannot run yet. See
+  [`docs/transformer.md`](transformer.md). Tasks for models a node has not
+  loaded fall back to the manual claim → submit result flow and are **not**
+  verified by the chain.
 - **Not ZK-proven.** The attention/matmul dispute path still falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like. With consensus
   re-execution, verification is recomputation; the dispute game is test-only
@@ -166,6 +175,6 @@ prove what a model returned, which is worth more than the compute.
 The first thing a technical buyer will test is a model they care about. A
 dense classifier converts from ONNX or GGUF in one command, executes in
 consensus, and comes with a measured parity figure against its float reference
-(see [`docs/runtime.md`](runtime.md)); what is missing is transformer support, so
+(see [`docs/runtime.md`](runtime.md)); what is missing is a generative transformer/LLM runtime, so
 an LLM checkpoint still cannot run. Everything around it — receipts,
 verification, metering, settlement — already works.

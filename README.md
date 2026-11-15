@@ -7,10 +7,12 @@ Status: **testnet node with a working verifiable-inference vertical slice.**
 Single- and multi-validator testnets run, and inference tasks are executed by
 consensus against a real (small) model with on-chain receipts and a
 verification endpoint. Consensus is still round-robin with no BFT finality.
-Models come from the compiled-in reference classifier plus operator graph models
-loaded from `VNN_MODEL_DIR`. Dense/relu/softmax classifiers convert from ONNX
-(`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K); transformer
-checkpoints — attention, arbitrary tokenizers, sampling — cannot run yet. See
+Models come from the compiled-in reference classifier, operator graph models
+loaded from `VNN_MODEL_DIR`, and a transformer encoder classifier
+(`intent-transformer-v1`). Dense/relu/softmax classifiers convert from ONNX
+(`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K).
+A transformer encoder runs in consensus; a generative LLM runtime (decoder,
+KV cache, sampling, BPE) does not. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
 [`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary,
@@ -27,7 +29,7 @@ not-yet-wired transformer kernel and BFT design.
 | `exec` | Validation, gas market, block production/application, dispute ops |
 | `network` | libp2p gossipsub block/tx propagation + mDNS |
 | `model` | `intent-classifier-v1`: deterministic Q16.16 inference + trainer |
-| `runtime` | integer-only graph runtime for operator-supplied models |
+| `runtime` | integer-only graph runtime + transformer encoder for operator models |
 | `onnx` | ONNX classifier → runtime graph (`onnx-import`), with float/integer parity |
 | `gguf` | GGUF dense classifier → runtime graph (`gguf-import`), Q4/Q5/Q8 + K-quant dequantisation |
 | `zk` | Q16.16 op vectors and conformance against the WASM runtime |
@@ -167,6 +169,9 @@ node must load the same set — `/v1/models` exposes the set and its hash.
 cargo run -p verinoo-model --bin export -- \
   --model-id acme-support-v1 --out models/acme-support-v1.graph.json
 verinoo-node infer --model acme-support-v1 --input "my parcel was never delivered"
+
+# a real transformer encoder in consensus (5,508 params, 80/80 label parity)
+verinoo-node infer --model intent-transformer-v1 --input "my parcel is delayed again"
 ```
 
 ## Wallet and API keys
@@ -190,7 +195,7 @@ replica/HA and incident response.
 
 ```bash
 cargo build --workspace --locked
-cargo test --workspace --locked        # 89 tests
+cargo test --workspace --locked        # 97 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/demo.sh                      # single node, ~45 s

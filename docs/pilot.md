@@ -71,6 +71,7 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
 | A third party can recheck without trusting us | `/v1/verify` recomputes and compares to the committed hash |
 | Usage is metered for invoicing | `/v1/usage/:addr`, `/v1/usage/:addr/csv` |
 | A customer classifier can run | ONNX (`onnx-import`) and GGUF (`gguf-import`) import to a runtime graph with f32 parity checks |
+| A real transformer runs in consensus | `intent-transformer-v1`: Q16.16 attention encoder, 80/80 label parity, weights-bound receipt |
 | On-chain settlement of fees | signed transfers, gas market, on-chain fee split |
 
 ## What is not claimed
@@ -78,12 +79,11 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
 - **Not trustless.** One operator runs both validators. Round-robin leader
   election with one producer signature per block; no BFT, no finality gadget,
   no equivocation slashing in the live path.
-- **Not an LLM host.** Only dense / relu / softmax classifiers over the
-  hashed-unigram featuriser execute. A deterministic Q16.16 attention kernel
-  exists as a prototype (`crates/runtime/src/attention.rs`) but is not wired
-  into model loading or consensus. Attention, convolutions, arbitrary
-  tokenizers and sampling are not supported, so a Llama-class checkpoint cannot
-  run yet.
+- **Not an LLM host.** A small transformer **encoder classifier** now runs in
+  consensus (`intent-transformer-v1`, 5,508 params, 80/80 label parity). It has
+  a word-level vocabulary and no decoder, causal mask, KV cache, sampling or
+  BPE/WordPiece tokenizer. A Llama-class checkpoint cannot run yet. Dense
+  classifiers over the hashed-unigram featuriser remain the production path.
 - **Not ZK-proven.** The attention/matmul dispute path falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like.
 - **Catch-up, not snapshot sync.** A late node replays blocks from genesis via
@@ -133,9 +133,10 @@ model returned.
 
 ## Known engineering gaps before self-serve
 
-1. Transformer runtime. The Q16.16 attention kernel is a prototype; embeddings,
-   tokenizer, layernorm, FFN, KV cache, sampling and model loading are not
-   implemented (`docs/transformer.md`). 4–8 weeks.
+1. Generative transformer/LLM runtime. A Q16.16 transformer encoder classifier
+   runs end-to-end (`docs/transformer.md`); decoders, causal masks, KV cache,
+   sampling, BPE/WordPiece tokenizers and ONNX attention import are not
+   implemented. 4–8 weeks.
 2. Byzantine finality. `docs/adr/004-bft-finality.md` is a design only; no
    prevote/precommit, certificate or slashing code exists. 5.5–7 weeks.
 3. Self-serve key signup; keys are issued manually today.

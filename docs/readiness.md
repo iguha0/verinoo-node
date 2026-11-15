@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (89 tests) |
+| Test suite | green | `cargo test --workspace --locked` (97 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -42,16 +42,18 @@ claims a technical buyer will test in the first diligence call.
 | Receipts + verification | works | `/v1/verify` recompute, live 2-node run |
 | Metering | works | `/v1/usage`, CSV export |
 | Dispute ops | implemented | `exec/tests/r6_disputes.rs` (in-memory) |
+| Transformer encoder | works (experimental) | `intent-transformer-v1`, 5 508 params, Q16.16 attention, 80/80 label parity |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
 
-1. **No transformer runtime.** Dense / relu / softmax classifiers convert from
-   ONNX (`onnx-import`, parity-checked against f32) or GGUF (`gguf-import`,
-   Q4/Q5/Q8 and Q2_K–Q6_K dequantised), and any model in the node's set
-   (`VNN_MODEL_DIR`) executes deterministically. Graphs with attention,
-   convolutions or arbitrary tokenizers are refused, so a customer's LLM
-   checkpoint cannot run. This is the main product gap.
+1. **No generative transformer or LLM runtime.** A small pre-norm transformer
+   **encoder classifier** now runs in consensus (`intent-transformer-v1`, one
+   layer, 16-wide, 5 508 params, 80/80 label parity against the float
+   reference). It uses a word-level vocabulary and CLS pooling. There is no
+   decoder, causal mask, KV cache, sampling, BPE/WordPiece tokenizer or ONNX
+   attention import, so a customer's LLM checkpoint still cannot run. Dense
+   classifiers from ONNX/GGUF continue to work. This is the main product gap.
 2. **No finality.** `RoundRobin` selects producers; there are no prevote /
    precommit rounds, so a block is only as final as the single producer's
    signature. No equivocation slashing in the live path.
@@ -127,8 +129,11 @@ claims a technical buyer will test in the first diligence call.
   an encrypted node.
 - `VNN_BLOCK_TIME_MS` lets a pilot run 1 s blocks (single validator) for ~1–2 s
   task latency; every validator must use the same value.
-- A deterministic Q16.16 attention kernel prototype (`crates/runtime/src/attention.rs`)
-  and a transformer roadmap (`docs/transformer.md`). Not wired into consensus.
+- A deterministic Q16.16 transformer encoder classifier
+  (`crates/runtime/src/transformer.rs`) running in consensus. It uses a real
+  trained model, fixed-point exponential attention softmax, encrypted inputs
+  and a weights-bound receipt. 80/80 label parity with the float reference on
+  all 80 corpus examples. See [`docs/transformer.md`](transformer.md).
 - A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
 
 ## Verified end-to-end (2-node product run)
@@ -258,5 +263,6 @@ domain still belong to the older reference node.
 - "Inputs are private from the operator" — inputs are encrypted to the
   validator set; every validator, including the operator, can decrypt. Pre-
   encryption tasks remain public.
-- "Transformer support" or "BFT" — the attention kernel is a prototype and the
-  finality design is not implemented.
+- "LLM or transformer generation support" — a small transformer encoder
+  classifier runs; there is no decoder, tokenizer beyond ASCII words, KV cache
+  or sampling. "BFT" — the finality design is not implemented.

@@ -103,6 +103,33 @@ curl -s localhost:7100/v1/verify/<taskId> | jq '{verified, weightsHash, label}'
 The JSON above is what the node loads. For a customer model you do not write it
 by hand: `onnx-import` produces it from their ONNX checkpoint.
 
+## Transformer encoder models
+
+A separate runtime executes a small pre-norm transformer encoder classifier.
+It is not a graph model and it is not a generative LLM. The full format,
+forward pass, accuracy and limitations are in
+[`docs/transformer.md`](transformer.md).
+
+```bash
+# train and export the committed demo model (PyTorch, CPU is fine)
+python3 scripts/train_transformer.py
+
+# it is registered like any other model
+verinoo-node infer --model intent-transformer-v1 --input "my parcel is delayed again"
+```
+
+`models/intent-transformer-v1.json` is 5,508 Q16.16 parameters: word
+embeddings, positional embeddings, one pre-norm encoder layer (Q/K/V/O,
+layer norm, ReLU FFN), a final layer norm and a classifier head. Q/K/V/O and
+the FFN use the integer dense kernel; attention uses
+`crates/runtime/src/attention.rs` with a fixed-point exponential softmax;
+layer norm uses integer variance and square root. No floats are used.
+
+The runtime validates every tensor length, vocabulary entry and head
+dimension, and refuses a malformed file. A node that loads a different
+transformer file produces a different result hash and its peers reject the
+block, exactly like a graph-model mismatch.
+
 ## Importing ONNX
 
 ```bash
@@ -197,9 +224,13 @@ and refuses to write the file if the predicted class ever changes;
 
 ## Not supported
 
-* Transformer checkpoints and any graph outside the ops above — attention,
-  convolutions, embedding lookups, arbitrary tokenizers. GGUF support is limited
-  to extracting dense classifier layers; it is not an LLM runtime.
+* Generative transformer/LLM checkpoints: decoders, causal masks, KV caches,
+  sampling, BPE/WordPiece tokenizers and ONNX attention graphs. A small
+  transformer **encoder classifier** runs through the separate runtime above;
+  that is not LLM support.
+* Graph ops outside the list above: attention, convolutions, embedding lookups,
+  arbitrary tokenizers. GGUF support is limited to extracting dense classifier
+  layers.
 * Sampling — the runtime returns scores and an argmax label, not generated text.
 * Float weights — parameters are signed integers; conversion happens offline so
   the on-chain path never touches floating point.
