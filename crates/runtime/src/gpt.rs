@@ -14,6 +14,7 @@ use crate::sha256_hex;
 use crate::transformer::{
     add_in_place, argmax_index, dense_accurate, dense_rows_accurate, isqrt, layer_norm_eps,
 };
+use crate::weights::WeightsData;
 use crate::ONE;
 use fancy_regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -480,9 +481,55 @@ impl KVCache {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TensorRange {
+    offset: usize,
+    len: usize,
+}
+
+impl TensorRange {
+    fn index(self) -> std::ops::Range<usize> {
+        self.offset..self.offset + self.len
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayerLayout {
+    ln1_gamma: TensorRange,
+    ln1_beta: TensorRange,
+    q_weights: TensorRange,
+    q_bias: TensorRange,
+    k_weights: TensorRange,
+    k_bias: TensorRange,
+    v_weights: TensorRange,
+    v_bias: TensorRange,
+    o_weights: TensorRange,
+    o_bias: TensorRange,
+    ln2_gamma: TensorRange,
+    ln2_beta: TensorRange,
+    ff1_weights: TensorRange,
+    ff1_bias: TensorRange,
+    ff2_weights: TensorRange,
+    ff2_bias: TensorRange,
+}
+
+#[derive(Debug, Clone)]
+struct WeightLayout {
+    embedding: TensorRange,
+    positional: TensorRange,
+    decoder: Vec<LayerLayout>,
+    lnf_gamma: TensorRange,
+    lnf_beta: TensorRange,
+    head_weights: TensorRange,
+    head_bias: TensorRange,
+    total: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct GptModel {
     spec: GptSpec,
+    weights: WeightsData,
+    layout: WeightLayout,
     weights_hash: String,
     tokenizer: Tokenizer,
     head_dim: usize,
@@ -496,8 +543,9 @@ impl GptModel {
     }
 
     /// Load a decoder from its JSON metadata. When `weightsFile` is set, the
-    /// binary file is resolved relative to the JSON file and its payload is
-    /// verified against `weightsSha256` before the model is constructed.
+    /// binary file is resolved relative to the JSON file, mapped, and its
+    /// payload is verified against `weightsSha256` before the model is
+    /// constructed.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         let value: serde_json::Value =
@@ -505,7 +553,7 @@ impl GptModel {
         let mut spec: GptSpec =
             serde_json::from_value(value).map_err(|e| format!("invalid decoder: {e}"))?;
         if spec.weights_file.is_empty() {
-            return Self::from_spec(spec, None);
+            return Self::from_owned_spec(spec);
         }
         if !spec.embedding.is_empty()
             || !spec.positional.is_empty()
@@ -517,16 +565,32 @@ impl GptModel {
             serde_json::to_string(&spec).map_err(|e| format!("cannot hash model metadata: {e}"))?;
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let weights_path = dir.join(&spec.weights_file);
-        let (weights, payload_sha) = crate::weights::read(&weights_path)?;
-        if !spec.weights_sha256.is_empty() && spec.weights_sha256 != payload_sha {
+        let loaded = crate::weights::load(&weights_path)?;
+        if !spec.weights_sha256.is_empty() && spec.weights_sha256 != loaded.sha256 {
             return Err(format!(
                 "{}: weightsSha256 does not match the binary payload",
                 path.display()
             ));
         }
-        fill_weights(&mut spec, &weights)?;
-        let identity = format!("{metadata}:{payload_sha}");
-        Self::from_spec(spec, Some(sha256_hex(&identity)))
+        if spec.decoder.is_empty() && spec.layers > 0 {
+            spec.decoder = vec![GptLayer::default(); spec.layers];
+        }
+        validate_metadata(&spec)?;
+        let layout = WeightLayout::new(&spec)?;
+        if layout.total > loaded.weights.len() {
+            return Err(format!(
+                "binary is missing {} weight(s) from the canonical tensor order",
+                layout.total - loaded.weights.len()
+            ));
+        }
+        if layout.total < loaded.weights.len() {
+            return Err(format!(
+                "binary has {} trailing weight(s) after the canonical tensor order",
+                loaded.weights.len() - layout.total
+            ));
+        }
+        let identity = format!("{metadata}:{}", loaded.sha256);
+        Self::build(spec, loaded.weights, layout, sha256_hex(&identity))
     }
 
     pub fn from_value(value: &serde_json::Value) -> Result<Self, String> {
@@ -535,25 +599,36 @@ impl GptModel {
         if !spec.weights_file.is_empty() {
             return Err("model has weightsFile; load it with from_file".into());
         }
-        Self::from_spec(spec, None)
+        Self::from_owned_spec(spec)
     }
 
-    fn from_spec(spec: GptSpec, weights_hash: Option<String>) -> Result<Self, String> {
+    fn from_owned_spec(mut spec: GptSpec) -> Result<Self, String> {
         validate_spec(&spec)?;
+        let layout = WeightLayout::new(&spec)?;
+        let weights_hash = sha256_hex(
+            &serde_json::to_string(&spec).map_err(|e| format!("cannot hash model: {e}"))?,
+        );
+        let weights = WeightsData::owned(flatten_inline_weights(&spec, &layout));
+        clear_spec_weights(&mut spec);
+        Self::build(spec, weights, layout, weights_hash)
+    }
+
+    fn build(
+        spec: GptSpec,
+        weights: WeightsData,
+        layout: WeightLayout,
+        weights_hash: String,
+    ) -> Result<Self, String> {
         let tokenizer = match spec.tokenizer_kind.as_str() {
             "char-bpe" => Tokenizer::Char(Box::new(BpeTokenizer::new(&spec)?)),
             "byte-bpe" => Tokenizer::Byte(Box::new(ByteBpeTokenizer::new(&spec)?)),
             other => return Err(format!("unknown tokenizerKind `{other}`")),
         };
-        let weights_hash = match weights_hash {
-            Some(hash) => hash,
-            None => sha256_hex(
-                &serde_json::to_string(&spec).map_err(|e| format!("cannot hash model: {e}"))?,
-            ),
-        };
         Ok(Self {
             head_dim: spec.hidden / spec.heads,
             spec,
+            weights,
+            layout,
             weights_hash,
             tokenizer,
         })
@@ -575,8 +650,17 @@ impl GptModel {
         &self.weights_hash
     }
 
+    /// True when the parameters are a read-only mapping of a `.vnnw` payload.
+    pub fn is_mapped(&self) -> bool {
+        self.weights.is_mapped()
+    }
+
     pub fn parameter_count(&self) -> u64 {
-        parameter_count(&self.spec)
+        self.layout.total as u64
+    }
+
+    fn tensor(&self, range: TensorRange) -> &[i32] {
+        self.weights.tensor(range.offset, range.len)
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<usize>, String> {
@@ -612,30 +696,50 @@ impl GptModel {
         let hidden = self.spec.hidden;
         let rows = ids.len();
         let mut x = vec![0i32; rows * hidden];
+        let embedding = self.tensor(self.layout.embedding);
+        let positional = self.tensor(self.layout.positional);
         for (offset, token) in ids.iter().enumerate() {
             let position = past + offset;
-            let emb = &self.spec.embedding[token * hidden..(token + 1) * hidden];
-            let pos = &self.spec.positional[position * hidden..(position + 1) * hidden];
+            let emb = &embedding[token * hidden..(token + 1) * hidden];
+            let pos = &positional[position * hidden..(position + 1) * hidden];
             for j in 0..hidden {
                 x[offset * hidden + j] = emb[j].saturating_add(pos[j]);
             }
         }
 
-        for (layer_index, layer) in self.spec.decoder.iter().enumerate() {
+        for (layer_index, layer) in self.layout.decoder.iter().enumerate() {
             let norm = layer_norm_eps(
                 &x,
-                &layer.ln1_gamma,
-                &layer.ln1_beta,
+                self.tensor(layer.ln1_gamma),
+                self.tensor(layer.ln1_beta),
                 rows,
                 hidden,
                 self.spec.layer_norm_epsilon,
             );
-            let q =
-                dense_rows_accurate(&norm, &layer.q_weights, &layer.q_bias, hidden, hidden, rows)?;
-            let k =
-                dense_rows_accurate(&norm, &layer.k_weights, &layer.k_bias, hidden, hidden, rows)?;
-            let v =
-                dense_rows_accurate(&norm, &layer.v_weights, &layer.v_bias, hidden, hidden, rows)?;
+            let q = dense_rows_accurate(
+                &norm,
+                self.tensor(layer.q_weights),
+                self.tensor(layer.q_bias),
+                hidden,
+                hidden,
+                rows,
+            )?;
+            let k = dense_rows_accurate(
+                &norm,
+                self.tensor(layer.k_weights),
+                self.tensor(layer.k_bias),
+                hidden,
+                hidden,
+                rows,
+            )?;
+            let v = dense_rows_accurate(
+                &norm,
+                self.tensor(layer.v_weights),
+                self.tensor(layer.v_bias),
+                hidden,
+                hidden,
+                rows,
+            )?;
             cache.append(layer_index, &k, &v)?;
             let attn = causal_attention(
                 &q,
@@ -647,22 +751,28 @@ impl GptModel {
                 self.head_dim,
                 self.spec.attention_scale == "sqrt",
             )?;
-            let projected =
-                dense_rows_accurate(&attn, &layer.o_weights, &layer.o_bias, hidden, hidden, rows)?;
+            let projected = dense_rows_accurate(
+                &attn,
+                self.tensor(layer.o_weights),
+                self.tensor(layer.o_bias),
+                hidden,
+                hidden,
+                rows,
+            )?;
             add_in_place(&mut x, &projected);
 
             let norm = layer_norm_eps(
                 &x,
-                &layer.ln2_gamma,
-                &layer.ln2_beta,
+                self.tensor(layer.ln2_gamma),
+                self.tensor(layer.ln2_beta),
                 rows,
                 hidden,
                 self.spec.layer_norm_epsilon,
             );
             let mut ff = dense_rows_accurate(
                 &norm,
-                &layer.ff1_weights,
-                &layer.ff1_bias,
+                self.tensor(layer.ff1_weights),
+                self.tensor(layer.ff1_bias),
                 hidden,
                 self.spec.ff,
                 rows,
@@ -672,8 +782,8 @@ impl GptModel {
             }
             let ff = dense_rows_accurate(
                 &ff,
-                &layer.ff2_weights,
-                &layer.ff2_bias,
+                self.tensor(layer.ff2_weights),
+                self.tensor(layer.ff2_bias),
                 self.spec.ff,
                 hidden,
                 rows,
@@ -683,17 +793,20 @@ impl GptModel {
 
         let x = layer_norm_eps(
             &x,
-            &self.spec.lnf_gamma,
-            &self.spec.lnf_beta,
+            self.tensor(self.layout.lnf_gamma),
+            self.tensor(self.layout.lnf_beta),
             rows,
             hidden,
             self.spec.layer_norm_epsilon,
         );
         let last = &x[(rows - 1) * hidden..rows * hidden];
         let (head_weights, head_bias): (&[i32], &[i32]) = if self.spec.tie_word_embeddings {
-            (&self.spec.embedding, &[])
+            (self.tensor(self.layout.embedding), &[])
         } else {
-            (&self.spec.head_weights, &self.spec.head_bias)
+            (
+                self.tensor(self.layout.head_weights),
+                self.tensor(self.layout.head_bias),
+            )
         };
         dense_accurate(last, head_weights, head_bias, hidden, self.spec.vocab.len())
     }
@@ -966,67 +1079,185 @@ fn causal_attention(
     Ok(out)
 }
 
-fn fill_weights(spec: &mut GptSpec, weights: &[i32]) -> Result<(), String> {
+impl WeightLayout {
+    fn new(spec: &GptSpec) -> Result<Self, String> {
+        let h = spec.hidden;
+        let ff = spec.ff;
+        let vocab = spec.vocab.len();
+        let mut pos = 0usize;
+        let mut take = |len: usize, name: &str| -> Result<TensorRange, String> {
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| format!("{name}: length overflow"))?;
+            let range = TensorRange { offset: pos, len };
+            pos = end;
+            Ok(range)
+        };
+        let embedding = take(vocab * h, "embedding")?;
+        let positional = take(spec.max_context * h, "positional")?;
+        let mut decoder = Vec::with_capacity(spec.decoder.len());
+        for i in 0..spec.decoder.len() {
+            decoder.push(LayerLayout {
+                ln1_gamma: take(h, &format!("layer {i} ln1Gamma"))?,
+                ln1_beta: take(h, &format!("layer {i} ln1Beta"))?,
+                q_weights: take(h * h, &format!("layer {i} qWeights"))?,
+                q_bias: take(h, &format!("layer {i} qBias"))?,
+                k_weights: take(h * h, &format!("layer {i} kWeights"))?,
+                k_bias: take(h, &format!("layer {i} kBias"))?,
+                v_weights: take(h * h, &format!("layer {i} vWeights"))?,
+                v_bias: take(h, &format!("layer {i} vBias"))?,
+                o_weights: take(h * h, &format!("layer {i} oWeights"))?,
+                o_bias: take(h, &format!("layer {i} oBias"))?,
+                ln2_gamma: take(h, &format!("layer {i} ln2Gamma"))?,
+                ln2_beta: take(h, &format!("layer {i} ln2Beta"))?,
+                ff1_weights: take(ff * h, &format!("layer {i} ff1Weights"))?,
+                ff1_bias: take(ff, &format!("layer {i} ff1Bias"))?,
+                ff2_weights: take(h * ff, &format!("layer {i} ff2Weights"))?,
+                ff2_bias: take(h, &format!("layer {i} ff2Bias"))?,
+            });
+        }
+        let lnf_gamma = take(h, "lnfGamma")?;
+        let lnf_beta = take(h, "lnfBeta")?;
+        let (head_weights, head_bias) = if spec.tie_word_embeddings {
+            (
+                TensorRange {
+                    offset: pos,
+                    len: 0,
+                },
+                TensorRange {
+                    offset: pos,
+                    len: 0,
+                },
+            )
+        } else {
+            (take(vocab * h, "headWeights")?, take(vocab, "headBias")?)
+        };
+        Ok(Self {
+            embedding,
+            positional,
+            decoder,
+            lnf_gamma,
+            lnf_beta,
+            head_weights,
+            head_bias,
+            total: pos,
+        })
+    }
+}
+
+fn flatten_inline_weights(spec: &GptSpec, layout: &WeightLayout) -> Vec<i32> {
+    let mut out = vec![0i32; layout.total];
+    out[layout.embedding.index()].copy_from_slice(&spec.embedding);
+    out[layout.positional.index()].copy_from_slice(&spec.positional);
+    for (layer, ranges) in spec.decoder.iter().zip(&layout.decoder) {
+        out[ranges.ln1_gamma.index()].copy_from_slice(&layer.ln1_gamma);
+        out[ranges.ln1_beta.index()].copy_from_slice(&layer.ln1_beta);
+        out[ranges.q_weights.index()].copy_from_slice(&layer.q_weights);
+        out[ranges.q_bias.index()].copy_from_slice(&layer.q_bias);
+        out[ranges.k_weights.index()].copy_from_slice(&layer.k_weights);
+        out[ranges.k_bias.index()].copy_from_slice(&layer.k_bias);
+        out[ranges.v_weights.index()].copy_from_slice(&layer.v_weights);
+        out[ranges.v_bias.index()].copy_from_slice(&layer.v_bias);
+        out[ranges.o_weights.index()].copy_from_slice(&layer.o_weights);
+        out[ranges.o_bias.index()].copy_from_slice(&layer.o_bias);
+        out[ranges.ln2_gamma.index()].copy_from_slice(&layer.ln2_gamma);
+        out[ranges.ln2_beta.index()].copy_from_slice(&layer.ln2_beta);
+        out[ranges.ff1_weights.index()].copy_from_slice(&layer.ff1_weights);
+        out[ranges.ff1_bias.index()].copy_from_slice(&layer.ff1_bias);
+        out[ranges.ff2_weights.index()].copy_from_slice(&layer.ff2_weights);
+        out[ranges.ff2_bias.index()].copy_from_slice(&layer.ff2_bias);
+    }
+    out[layout.lnf_gamma.index()].copy_from_slice(&spec.lnf_gamma);
+    out[layout.lnf_beta.index()].copy_from_slice(&spec.lnf_beta);
+    if !spec.tie_word_embeddings {
+        out[layout.head_weights.index()].copy_from_slice(&spec.head_weights);
+        out[layout.head_bias.index()].copy_from_slice(&spec.head_bias);
+    }
+    out
+}
+
+fn clear_spec_weights(spec: &mut GptSpec) {
+    spec.embedding = Vec::new();
+    spec.positional = Vec::new();
+    for layer in &mut spec.decoder {
+        layer.ln1_gamma = Vec::new();
+        layer.ln1_beta = Vec::new();
+        layer.q_weights = Vec::new();
+        layer.q_bias = Vec::new();
+        layer.k_weights = Vec::new();
+        layer.k_bias = Vec::new();
+        layer.v_weights = Vec::new();
+        layer.v_bias = Vec::new();
+        layer.o_weights = Vec::new();
+        layer.o_bias = Vec::new();
+        layer.ln2_gamma = Vec::new();
+        layer.ln2_beta = Vec::new();
+        layer.ff1_weights = Vec::new();
+        layer.ff1_bias = Vec::new();
+        layer.ff2_weights = Vec::new();
+        layer.ff2_bias = Vec::new();
+    }
+    spec.lnf_gamma = Vec::new();
+    spec.lnf_beta = Vec::new();
+    spec.head_weights = Vec::new();
+    spec.head_bias = Vec::new();
+}
+
+fn validate_spec(spec: &GptSpec) -> Result<(), String> {
+    validate_metadata(spec)?;
     let h = spec.hidden;
     let ff = spec.ff;
-    let vocab = spec.vocab.len();
-    if spec.decoder.is_empty() && spec.layers > 0 {
-        spec.decoder = vec![GptLayer::default(); spec.layers];
-    }
-    if spec.decoder.len() != spec.layers {
-        return Err("decoder layer count does not match layers".into());
-    }
-    let mut pos = 0usize;
-    let take = |pos: &mut usize, len: usize, name: &str| -> Result<Vec<i32>, String> {
-        let end = pos
-            .checked_add(len)
-            .ok_or_else(|| format!("{name}: length overflow"))?;
-        if end > weights.len() {
-            return Err(format!(
-                "{name}: need {len} values at {pos}, binary has {}",
-                weights.len()
-            ));
+    expect_len("embedding", spec.embedding.len(), spec.vocab.len() * h)?;
+    expect_len("positional", spec.positional.len(), spec.max_context * h)?;
+    expect_len("lnfGamma", spec.lnf_gamma.len(), h)?;
+    expect_len("lnfBeta", spec.lnf_beta.len(), h)?;
+    if spec.tie_word_embeddings {
+        if !spec.head_weights.is_empty() || !spec.head_bias.is_empty() {
+            return Err("tied embeddings must not include headWeights or headBias".into());
         }
-        let out = weights[*pos..end].to_vec();
-        *pos = end;
-        Ok(out)
-    };
-    spec.embedding = take(&mut pos, vocab * h, "embedding")?;
-    spec.positional = take(&mut pos, spec.max_context * h, "positional")?;
-    for (i, layer) in spec.decoder.iter_mut().enumerate() {
-        layer.ln1_gamma = take(&mut pos, h, &format!("layer {i} ln1Gamma"))?;
-        layer.ln1_beta = take(&mut pos, h, &format!("layer {i} ln1Beta"))?;
-        layer.q_weights = take(&mut pos, h * h, &format!("layer {i} qWeights"))?;
-        layer.q_bias = take(&mut pos, h, &format!("layer {i} qBias"))?;
-        layer.k_weights = take(&mut pos, h * h, &format!("layer {i} kWeights"))?;
-        layer.k_bias = take(&mut pos, h, &format!("layer {i} kBias"))?;
-        layer.v_weights = take(&mut pos, h * h, &format!("layer {i} vWeights"))?;
-        layer.v_bias = take(&mut pos, h, &format!("layer {i} vBias"))?;
-        layer.o_weights = take(&mut pos, h * h, &format!("layer {i} oWeights"))?;
-        layer.o_bias = take(&mut pos, h, &format!("layer {i} oBias"))?;
-        layer.ln2_gamma = take(&mut pos, h, &format!("layer {i} ln2Gamma"))?;
-        layer.ln2_beta = take(&mut pos, h, &format!("layer {i} ln2Beta"))?;
-        layer.ff1_weights = take(&mut pos, ff * h, &format!("layer {i} ff1Weights"))?;
-        layer.ff1_bias = take(&mut pos, ff, &format!("layer {i} ff1Bias"))?;
-        layer.ff2_weights = take(&mut pos, h * ff, &format!("layer {i} ff2Weights"))?;
-        layer.ff2_bias = take(&mut pos, h, &format!("layer {i} ff2Bias"))?;
+    } else {
+        expect_len("headWeights", spec.head_weights.len(), spec.vocab.len() * h)?;
+        expect_len("headBias", spec.head_bias.len(), spec.vocab.len())?;
     }
-    spec.lnf_gamma = take(&mut pos, h, "lnfGamma")?;
-    spec.lnf_beta = take(&mut pos, h, "lnfBeta")?;
-    if !spec.tie_word_embeddings {
-        spec.head_weights = take(&mut pos, vocab * h, "headWeights")?;
-        spec.head_bias = take(&mut pos, vocab, "headBias")?;
-    }
-    if pos != weights.len() {
-        return Err(format!(
-            "binary has {} trailing weight(s) after the canonical tensor order",
-            weights.len() - pos
-        ));
+    let matrix = h * h;
+    for (i, layer) in spec.decoder.iter().enumerate() {
+        for (name, len) in [
+            ("ln1Gamma", layer.ln1_gamma.len()),
+            ("ln1Beta", layer.ln1_beta.len()),
+            ("ln2Gamma", layer.ln2_gamma.len()),
+            ("ln2Beta", layer.ln2_beta.len()),
+            ("qBias", layer.q_bias.len()),
+            ("kBias", layer.k_bias.len()),
+            ("vBias", layer.v_bias.len()),
+            ("oBias", layer.o_bias.len()),
+        ] {
+            expect_len(&format!("layer {i} {name}"), len, h)?;
+        }
+        for (name, len) in [
+            ("qWeights", layer.q_weights.len()),
+            ("kWeights", layer.k_weights.len()),
+            ("vWeights", layer.v_weights.len()),
+            ("oWeights", layer.o_weights.len()),
+        ] {
+            expect_len(&format!("layer {i} {name}"), len, matrix)?;
+        }
+        expect_len(
+            &format!("layer {i} ff1Weights"),
+            layer.ff1_weights.len(),
+            ff * h,
+        )?;
+        expect_len(&format!("layer {i} ff1Bias"), layer.ff1_bias.len(), ff)?;
+        expect_len(
+            &format!("layer {i} ff2Weights"),
+            layer.ff2_weights.len(),
+            h * ff,
+        )?;
+        expect_len(&format!("layer {i} ff2Bias"), layer.ff2_bias.len(), h)?;
     }
     Ok(())
 }
 
-fn validate_spec(spec: &GptSpec) -> Result<(), String> {
+fn validate_metadata(spec: &GptSpec) -> Result<(), String> {
     if spec.kind != "gpt-decoder" {
         return Err(format!("kind must be `gpt-decoder`, got `{}`", spec.kind));
     }
@@ -1084,55 +1315,6 @@ fn validate_spec(spec: &GptSpec) -> Result<(), String> {
     if spec.layers == 0 || spec.layers != spec.decoder.len() {
         return Err("layers must equal the number of decoder blocks".into());
     }
-    let h = spec.hidden;
-    let ff = spec.ff;
-    expect_len("embedding", spec.embedding.len(), spec.vocab.len() * h)?;
-    expect_len("positional", spec.positional.len(), spec.max_context * h)?;
-    expect_len("lnfGamma", spec.lnf_gamma.len(), h)?;
-    expect_len("lnfBeta", spec.lnf_beta.len(), h)?;
-    if spec.tie_word_embeddings {
-        if !spec.head_weights.is_empty() || !spec.head_bias.is_empty() {
-            return Err("tied embeddings must not include headWeights or headBias".into());
-        }
-    } else {
-        expect_len("headWeights", spec.head_weights.len(), spec.vocab.len() * h)?;
-        expect_len("headBias", spec.head_bias.len(), spec.vocab.len())?;
-    }
-    let matrix = h * h;
-    for (i, layer) in spec.decoder.iter().enumerate() {
-        for (name, len) in [
-            ("ln1Gamma", layer.ln1_gamma.len()),
-            ("ln1Beta", layer.ln1_beta.len()),
-            ("ln2Gamma", layer.ln2_gamma.len()),
-            ("ln2Beta", layer.ln2_beta.len()),
-            ("qBias", layer.q_bias.len()),
-            ("kBias", layer.k_bias.len()),
-            ("vBias", layer.v_bias.len()),
-            ("oBias", layer.o_bias.len()),
-        ] {
-            expect_len(&format!("layer {i} {name}"), len, h)?;
-        }
-        for (name, len) in [
-            ("qWeights", layer.q_weights.len()),
-            ("kWeights", layer.k_weights.len()),
-            ("vWeights", layer.v_weights.len()),
-            ("oWeights", layer.o_weights.len()),
-        ] {
-            expect_len(&format!("layer {i} {name}"), len, matrix)?;
-        }
-        expect_len(
-            &format!("layer {i} ff1Weights"),
-            layer.ff1_weights.len(),
-            ff * h,
-        )?;
-        expect_len(&format!("layer {i} ff1Bias"), layer.ff1_bias.len(), ff)?;
-        expect_len(
-            &format!("layer {i} ff2Weights"),
-            layer.ff2_weights.len(),
-            h * ff,
-        )?;
-        expect_len(&format!("layer {i} ff2Bias"), layer.ff2_bias.len(), h)?;
-    }
     Ok(())
 }
 
@@ -1142,34 +1324,6 @@ fn expect_len(name: &str, got: usize, want: usize) -> Result<(), String> {
     } else {
         Err(format!("{name}: expected {want} values, got {got}"))
     }
-}
-
-fn parameter_count(spec: &GptSpec) -> u64 {
-    let mut total =
-        (spec.embedding.len() + spec.positional.len() + spec.lnf_gamma.len() + spec.lnf_beta.len())
-            as u64;
-    if !spec.tie_word_embeddings {
-        total += (spec.head_weights.len() + spec.head_bias.len()) as u64;
-    }
-    for layer in &spec.decoder {
-        total += (layer.ln1_gamma.len()
-            + layer.ln1_beta.len()
-            + layer.q_weights.len()
-            + layer.q_bias.len()
-            + layer.k_weights.len()
-            + layer.k_bias.len()
-            + layer.v_weights.len()
-            + layer.v_bias.len()
-            + layer.o_weights.len()
-            + layer.o_bias.len()
-            + layer.ln2_gamma.len()
-            + layer.ln2_beta.len()
-            + layer.ff1_weights.len()
-            + layer.ff1_bias.len()
-            + layer.ff2_weights.len()
-            + layer.ff2_bias.len()) as u64;
-    }
-    total
 }
 
 #[derive(Debug, Default)]
@@ -1522,102 +1676,73 @@ mod tests {
         }
     }
 
-    fn collect_weights(spec: &GptSpec) -> Vec<i32> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&spec.embedding);
-        out.extend_from_slice(&spec.positional);
-        for layer in &spec.decoder {
-            for field in [
-                &layer.ln1_gamma,
-                &layer.ln1_beta,
-                &layer.q_weights,
-                &layer.q_bias,
-                &layer.k_weights,
-                &layer.k_bias,
-                &layer.v_weights,
-                &layer.v_bias,
-                &layer.o_weights,
-                &layer.o_bias,
-                &layer.ln2_gamma,
-                &layer.ln2_beta,
-                &layer.ff1_weights,
-                &layer.ff1_bias,
-                &layer.ff2_weights,
-                &layer.ff2_bias,
-            ] {
-                out.extend_from_slice(field);
-            }
-        }
-        out.extend_from_slice(&spec.lnf_gamma);
-        out.extend_from_slice(&spec.lnf_beta);
-        if !spec.tie_word_embeddings {
-            out.extend_from_slice(&spec.head_weights);
-            out.extend_from_slice(&spec.head_bias);
-        }
-        out
+    struct BinaryFixture {
+        dir: PathBuf,
+        metadata: PathBuf,
+        weights: PathBuf,
+        original: GptModel,
     }
 
-    fn clear_weights(spec: &mut GptSpec) {
-        spec.embedding.clear();
-        spec.positional.clear();
-        for layer in &mut spec.decoder {
-            layer.ln1_gamma.clear();
-            layer.ln1_beta.clear();
-            layer.q_weights.clear();
-            layer.q_bias.clear();
-            layer.k_weights.clear();
-            layer.k_bias.clear();
-            layer.v_weights.clear();
-            layer.v_bias.clear();
-            layer.o_weights.clear();
-            layer.o_bias.clear();
-            layer.ln2_gamma.clear();
-            layer.ln2_beta.clear();
-            layer.ff1_weights.clear();
-            layer.ff1_bias.clear();
-            layer.ff2_weights.clear();
-            layer.ff2_bias.clear();
+    impl Drop for BinaryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
-        spec.lnf_gamma.clear();
-        spec.lnf_beta.clear();
-        spec.head_weights.clear();
-        spec.head_bias.clear();
+    }
+
+    fn binary_fixture(label: &str) -> BinaryFixture {
+        let original = load();
+        let dir = std::env::temp_dir().join(format!("verinoo-gpt-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let weights_path = dir.join("tiny.vnnw");
+        let sha = crate::weights::write(&weights_path, original.weights.as_slice()).unwrap();
+        let metadata_path = dir.join("tiny.json");
+        let mut metadata = original.spec.clone();
+        metadata.weights_file = "tiny.vnnw".into();
+        metadata.weights_sha256 = sha;
+        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
+        BinaryFixture {
+            dir,
+            metadata: metadata_path,
+            weights: weights_path,
+            original,
+        }
+    }
+
+    #[test]
+    fn inline_json_weights_are_owned() {
+        let model = load();
+        assert!(!model.is_mapped());
+        let generated = model.generate("please cancel").unwrap();
+        assert!(!generated.generated_ids.is_empty());
+    }
+
+    #[test]
+    fn binary_weights_are_mapped() {
+        let fixture = binary_fixture("mapped");
+        let loaded = GptModel::from_file(&fixture.metadata).unwrap();
+        assert!(loaded.is_mapped());
+        assert_eq!(loaded.parameter_count(), fixture.original.parameter_count());
+        assert_eq!(loaded.weights_hash().len(), 64);
     }
 
     #[test]
     fn binary_weights_roundtrip_and_tamper_detection() {
-        let original = load();
-        let weights = collect_weights(&original.spec);
-        let dir = std::env::temp_dir().join(format!(
-            "verinoo-gpt-binary-{}-{}",
-            std::process::id(),
-            original.parameter_count()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let weights_path = dir.join("tiny.vnnw");
-        let sha = crate::weights::write(&weights_path, &weights).unwrap();
-        let metadata_path = dir.join("tiny.json");
-        let mut metadata = original.spec.clone();
-        clear_weights(&mut metadata);
-        metadata.weights_file = "tiny.vnnw".into();
-        metadata.weights_sha256 = sha;
-        std::fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
-
-        let loaded = GptModel::from_file(&metadata_path).unwrap();
-        assert_eq!(loaded.parameter_count(), original.parameter_count());
+        let fixture = binary_fixture("roundtrip");
+        let loaded = GptModel::from_file(&fixture.metadata).unwrap();
+        assert!(loaded.is_mapped());
+        assert_eq!(loaded.parameter_count(), fixture.original.parameter_count());
         assert_eq!(loaded.weights_hash().len(), 64);
-        let a = original.generate("please cancel").unwrap();
+        let a = fixture.original.generate("please cancel").unwrap();
         let b = loaded.generate("please cancel").unwrap();
         assert_eq!(a.generated_ids, b.generated_ids);
         assert_eq!(a.text, b.text);
 
-        let mut bytes = std::fs::read(&weights_path).unwrap();
+        let mut bytes = std::fs::read(&fixture.weights).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        std::fs::write(&weights_path, &bytes).unwrap();
-        let err = GptModel::from_file(&metadata_path).unwrap_err();
+        std::fs::write(&fixture.weights, &bytes).unwrap();
+        let err = GptModel::from_file(&fixture.metadata).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

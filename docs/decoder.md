@@ -133,10 +133,13 @@ length, payload hash and declared `weightsSha256` before using any tensor; a
 single tampered byte is rejected. A model may use either inline tensors or
 `weightsFile`, not both.
 
-The current loader reads the payload into memory and copies it into
-`Vec<i32>`; peak memory is roughly twice the file size. Zero-copy `mmap` is the
-next optimization, not implemented. This matters for the 328 MB DistilGPT-2
-file, but not for the tiny demo models.
+Binary payloads are memory-mapped and the tensors borrow from the mapping, so
+loading DistilGPT-2 does not copy the 328 MB payload into `Vec<i32>`. The
+loader still verifies the magic, version, length and both hashes before any
+tensor is used. Mapped tensors require a 4-byte-aligned payload and a
+little-endian host; if either check fails, the loader falls back to an owned
+copy instead of reinterpreting the bytes unsafely. The mapping is read-only,
+and model files must not be modified while a node is running.
 
 ## Tokenizers
 
@@ -264,8 +267,6 @@ redistributed, and `models/NOTICE-tiny-stories-1m.txt` records the caveat.
   foundation, not a service. There is no GPU executor, batching, streaming,
   safety layer, request queue or large-model (7B+) support, and DistilGPT-2 is
   not on the public node.
-- **Zero-copy weights.** The binary loader copies into `Vec<i32>`; `mmap` and a
-  slice-backed tensor view are not implemented.
 - **Per-task generation controls.** Sampling is fixed in the model file. There
   is no API override, stop sequence, repetition penalty or beam search, and
   sampling config is not separately bound in the receipt.

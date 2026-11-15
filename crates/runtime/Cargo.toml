@@ -10,3 +10,4 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 fancy-regex = "0.14"
 hex = { workspace = true }
+memmap2 = "0.9"

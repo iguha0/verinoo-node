@@ -16,12 +16,14 @@
 //! does not repeat tensor names. The payload hash is checked on every load and
 //! is part of the model identity used in receipts.
 //!
-//! The current loader reads the payload into a `Vec<i32>` once at startup.
-//! Zero-copy mmap-backed tensors are the next step; the on-disk format does not
-//! change.
+//! Binary payloads are mapped and exposed as `&[i32]` without copying. Hosts
+//! that are not little-endian, or mappings whose payload is not 4-byte
+//! aligned, fall back to an owned copy.
 
+use memmap2::Mmap;
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"VNNW";
 const VERSION: u32 = 1;
@@ -51,10 +53,107 @@ pub fn write(path: &Path, weights: &[i32]) -> Result<String, String> {
     Ok(hex::encode(digest))
 }
 
-/// Read and verify a weight file. Returns the parameters and the payload hash.
-pub fn read(path: &Path) -> Result<(Vec<i32>, String), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    if bytes.len() < HEADER_LEN || &bytes[0..4] != MAGIC {
+/// Tensor storage for a model: an owned flat buffer for inline JSON, or a
+/// read-only mapping whose payload is reinterpreted as little-endian `i32`.
+#[derive(Debug, Clone)]
+pub struct WeightsData {
+    backing: WeightsBacking,
+}
+
+#[derive(Debug, Clone)]
+enum WeightsBacking {
+    Owned(Vec<i32>),
+    Mapped {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl WeightsData {
+    pub fn owned(values: Vec<i32>) -> Self {
+        Self {
+            backing: WeightsBacking::Owned(values),
+        }
+    }
+
+    fn mapped(mmap: Arc<Mmap>, offset: usize, len: usize) -> Self {
+        Self {
+            backing: WeightsBacking::Mapped { mmap, offset, len },
+        }
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        matches!(self.backing, WeightsBacking::Mapped { .. })
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.backing {
+            WeightsBacking::Owned(values) => values.len(),
+            WeightsBacking::Mapped { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[i32] {
+        match &self.backing {
+            WeightsBacking::Owned(values) => values,
+            // SAFETY: `load` only constructs this variant after verifying that
+            // the payload starts at a 4-byte-aligned address, is a multiple of
+            // four bytes, and that the host is little-endian. Every i32 bit
+            // pattern is valid, and the `Arc<Mmap>` keeps the bytes alive for
+            // at least as long as `&self`.
+            WeightsBacking::Mapped { mmap, offset, len } => unsafe {
+                std::slice::from_raw_parts(mmap.as_ptr().add(*offset).cast::<i32>(), *len)
+            },
+        }
+    }
+
+    pub fn tensor(&self, offset: usize, len: usize) -> &[i32] {
+        let end = offset
+            .checked_add(len)
+            .expect("weight tensor range overflow");
+        &self.as_slice()[offset..end]
+    }
+}
+
+pub struct LoadedWeights {
+    pub weights: WeightsData,
+    pub sha256: String,
+}
+
+/// Map and verify a weight file. The mapping is preferred; an owned copy is
+/// returned on big-endian hosts or if the payload alignment is unsuitable.
+pub fn load(path: &Path) -> Result<LoadedWeights, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("reading {}: {e}", path.display()))?
+        .len();
+    let file_len = usize::try_from(file_len)
+        .map_err(|_| format!("{}: file is too large to map", path.display()))?;
+    if file_len < HEADER_LEN {
+        return Err(format!(
+            "{}: not a Verinoo weight file (expected magic VNNW)",
+            path.display()
+        ));
+    }
+    // SAFETY: The mapping is read-only and is not exposed beyond this module
+    // except as `&[i32]`. Operators are expected to keep model files immutable
+    // while a node is running.
+    let mmap =
+        unsafe { Mmap::map(&file) }.map_err(|e| format!("mapping {}: {e}", path.display()))?;
+    if mmap.len() < HEADER_LEN {
+        return Err(format!(
+            "{}: not a Verinoo weight file (expected magic VNNW)",
+            path.display()
+        ));
+    }
+    let bytes = &mmap[..];
+    if &bytes[0..4] != MAGIC {
         return Err(format!(
             "{}: not a Verinoo weight file (expected magic VNNW)",
             path.display()
@@ -67,7 +166,9 @@ pub fn read(path: &Path) -> Result<(Vec<i32>, String), String> {
             path.display()
         ));
     }
-    let payload_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+    let payload_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let payload_len = usize::try_from(payload_len)
+        .map_err(|_| format!("{}: payload is too large", path.display()))?;
     let expected_sha = hex::encode(&bytes[16..48]);
     let payload = &bytes[HEADER_LEN..];
     if payload.len() != payload_len {
@@ -87,11 +188,27 @@ pub fn read(path: &Path) -> Result<(Vec<i32>, String), String> {
             path.display()
         ));
     }
-    let mut out = Vec::with_capacity(payload.len() / 4);
-    for chunk in payload.as_chunks::<4>().0 {
-        out.push(i32::from_le_bytes(*chunk));
-    }
-    Ok((out, expected_sha))
+    let aligned =
+        (bytes.as_ptr() as usize + HEADER_LEN).is_multiple_of(std::mem::align_of::<i32>());
+    let weights = if cfg!(target_endian = "little") && aligned {
+        WeightsData::mapped(Arc::new(mmap), HEADER_LEN, payload_len / 4)
+    } else {
+        let mut out = Vec::with_capacity(payload.len() / 4);
+        for chunk in payload.as_chunks::<4>().0 {
+            out.push(i32::from_le_bytes(*chunk));
+        }
+        WeightsData::owned(out)
+    };
+    Ok(LoadedWeights {
+        weights,
+        sha256: expected_sha,
+    })
+}
+
+/// Read and verify a weight file into an owned buffer.
+pub fn read(path: &Path) -> Result<(Vec<i32>, String), String> {
+    let loaded = load(path)?;
+    Ok((loaded.weights.as_slice().to_vec(), loaded.sha256))
 }
 
 #[cfg(test)]
@@ -115,6 +232,21 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let err = read(&path).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_maps_the_payload_without_copying() {
+        let dir = std::env::temp_dir().join(format!("verinoo-weights-mmap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mapped.vnnw");
+        let weights = vec![7, -7, 42, 65_536, i32::MIN, i32::MAX];
+        let sha = write(&path, &weights).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(loaded.weights.is_mapped());
+        assert_eq!(loaded.weights.as_slice(), weights);
+        assert_eq!(loaded.weights.tensor(2, 3), &weights[2..5]);
+        assert_eq!(loaded.sha256, sha);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
