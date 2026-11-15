@@ -44,7 +44,7 @@
 //! probability is floor-divided, so the output is a slightly biased-downward
 //! weighted average.
 
-use crate::{softmax, ONE};
+use crate::ONE;
 
 /// One attention head over row-major `[seq_len, head_dim]` Q16.16 matrices.
 ///
@@ -114,7 +114,7 @@ pub fn scaled_dot_product_attention_shaped(
             scores[j] = scaled;
         }
 
-        let weights = softmax(&scores);
+        let weights = softmax_exp(&scores);
         let out_row = &mut out[i * head_dim..(i + 1) * head_dim];
         for (d, slot) in out_row.iter_mut().enumerate() {
             let mut acc = 0i64;
@@ -126,6 +126,47 @@ pub fn scaled_dot_product_attention_shaped(
     }
 
     Ok(out)
+}
+
+/// Fixed-point softmax for attention scores.
+///
+/// The classifier softmax is a piecewise-linear approximation that is right for
+/// the reference classifier but too coarse for attention. This uses a range
+/// reduced exponential:
+///
+/// ```text
+/// exp(-z) = 2^-n * exp(-r),  z = n*ln2 + r,  0 <= r < ln2
+/// ```
+///
+/// `exp(-r)` is a five-term Taylor series in Q16.16 and `2^-n` is a shift.
+/// Rows are normalised to sum to at most `ONE`. No floats are used.
+pub fn softmax_exp(x: &[i32]) -> Vec<i32> {
+    if x.is_empty() {
+        return Vec::new();
+    }
+    let max = *x.iter().max().unwrap_or(&0) as i64;
+    let exps: Vec<i64> = x
+        .iter()
+        .map(|&v| exp_neg((max - v as i64).clamp(0, 10 * ONE as i64)))
+        .collect();
+    let sum = exps.iter().sum::<i64>().max(1);
+    exps.iter()
+        .map(|&e| ((e * ONE as i64) / sum).clamp(0, ONE as i64) as i32)
+        .collect()
+}
+
+/// ln(2) in Q16.16.
+const LN2_Q: i64 = 45_426;
+
+fn exp_neg(z: i64) -> i64 {
+    let n = (z / LN2_Q).clamp(0, 15);
+    let r = z - n * LN2_Q;
+    let r2 = (r * r) >> 16;
+    let r3 = (r2 * r) >> 16;
+    let r4 = (r3 * r) >> 16;
+    let r5 = (r4 * r) >> 16;
+    let e = (ONE as i64 - r + r2 / 2 - r3 / 6 + r4 / 24 - r5 / 120).max(0);
+    e >> n
 }
 
 /// Multi-head attention over row-major `[seq_len, heads, head_dim]` Q16.16
@@ -248,13 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn one_hot_key_selects_matching_v_row() {
-        let q = [ONE, 0, ONE, 0, ONE, 0];
+    fn peaked_attention_selects_matching_v_row() {
+        // A 12-logit gap is effectively one-hot in Q16.16 exp softmax.
+        let q = [12 * ONE, 0, 12 * ONE, 0, 12 * ONE, 0];
         let k = [ONE, 0, 0, ONE, 0, 0];
         let v = [ONE, 2 * ONE, 3 * ONE, 4 * ONE, 5 * ONE, 6 * ONE];
 
         let out = scaled_dot_product_attention(&q, &k, &v);
-        assert_eq!(out, vec![ONE, 2 * ONE, ONE, 2 * ONE, ONE, 2 * ONE]);
+        let want = [ONE, 2 * ONE, ONE, 2 * ONE, ONE, 2 * ONE];
+        for (got, expected) in out.iter().zip(want) {
+            assert!((got - expected).abs() <= 100, "got {got}, want {expected}");
+        }
     }
 
     #[test]
@@ -330,6 +375,20 @@ mod tests {
 
         assert!(scaled_dot_product_attention_shaped(&q, &k, &v, 4, 2).is_err());
         assert!(scaled_dot_product_attention(&q, &k, &v[..2]).is_empty());
+    }
+
+    #[test]
+    fn exp_softmax_matches_known_values() {
+        let uniform = softmax_exp(&[0, 0]);
+        assert_eq!(uniform, vec![ONE / 2, ONE / 2]);
+        let one_hot = softmax_exp(&[ONE, 0]);
+        assert!((one_hot[0] - 47_900).abs() < 200, "{one_hot:?}");
+        assert!((one_hot[1] - 17_636).abs() < 200, "{one_hot:?}");
+        let wider = softmax_exp(&[2 * ONE, 0]);
+        assert!((wider[0] - 57_744).abs() < 300, "{wider:?}");
+        assert!((wider[1] - 7_792).abs() < 300, "{wider:?}");
+        let total: i64 = one_hot.iter().map(|v| *v as i64).sum();
+        assert!((total - ONE as i64).abs() < 4);
     }
 
     #[test]

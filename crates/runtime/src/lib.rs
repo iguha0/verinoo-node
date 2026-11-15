@@ -29,6 +29,8 @@
 //! ```
 
 pub mod attention;
+pub mod transformer;
+pub use transformer::{TransformerModel, TransformerRegistry};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -405,14 +407,27 @@ impl Registry {
         paths.sort();
         for path in paths {
             match std::fs::read(&path) {
-                Ok(bytes) => match Model::from_bytes(&bytes) {
-                    Ok(model) => {
-                        if let Err(e) = reg.insert(model) {
-                            problems.push(format!("{}: {e}", path.display()));
-                        }
+                Ok(bytes) => {
+                    let is_transformer = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("kind")
+                                .and_then(|k| k.as_str())
+                                .map(|s| s == "transformer-classifier")
+                        })
+                        .unwrap_or(false);
+                    if is_transformer {
+                        continue;
                     }
-                    Err(e) => problems.push(format!("{}: {e}", path.display())),
-                },
+                    match Model::from_bytes(&bytes) {
+                        Ok(model) => {
+                            if let Err(e) = reg.insert(model) {
+                                problems.push(format!("{}: {e}", path.display()));
+                            }
+                        }
+                        Err(e) => problems.push(format!("{}: {e}", path.display())),
+                    }
+                }
                 Err(e) => problems.push(format!("{}: {e}", path.display())),
             }
         }
