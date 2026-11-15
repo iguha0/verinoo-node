@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (104 tests) |
+| Test suite | green | `cargo test --workspace --locked` (109 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -43,18 +43,20 @@ claims a technical buyer will test in the first diligence call.
 | Metering | works | `/v1/usage`, CSV export |
 | Dispute ops | implemented | `exec/tests/r6_disputes.rs` (in-memory) |
 | Transformer encoder | works (experimental) | `intent-transformer-v1`, 5 508 params, Q16.16 attention, 80/80 label parity |
-| GPT decoder | works (demonstration) | `tiny-gpt-v1`, 110 400 params, BPE, KV cache, greedy, token parity on 8 prompts |
+| GPT decoder | works (demonstration) | `tiny-gpt-v1`, 110 400 params, char-BPE, KV cache, greedy, token parity on 8 prompts |
+| Real pretrained decoder | works (experimental) | `tiny-stories-1m`, 3.75M-param GPT-Neo, GPT-2 BPE, 32-token parity on 8 prompts |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
 
-1. **No production LLM runtime.** A tiny GPT-style **decoder** now runs in
-   consensus (`tiny-gpt-v1`, 110,400 params, 320-token char-BPE, context 32,
-   greedy decoding, KV cache). It matches its float reference token-for-token
-   on 8 prompts. It is a synthetic demonstration: no real GPT-2/LLaMA
-   tokenizer, long context, sampling, batching, safety filters or production
-   model quality. A transformer **encoder classifier** also runs. A customer's
-   LLM checkpoint still cannot be imported or served. Dense classifiers from
+1. **No production LLM runtime.** A real pretrained 3.75M-parameter GPT-Neo
+   decoder (`tiny-stories-1m`) now runs in consensus with the GPT-2 byte-level
+   BPE tokenizer, causal attention, a KV cache and greedy decoding. It matches
+   its float reference token-for-token for 32 tokens on 8 prompts. A synthetic
+   decoder (`tiny-gpt-v1`) and a transformer encoder also run. What is missing
+   is production LLM support: 128-token context, one GPT-2 tokenizer, no
+   sampling, batching, streaming, safety filters or large-model serving, and
+   the TinyStories weights have no explicit license. Dense classifiers from
    ONNX/GGUF continue to work. This is the main product gap.
 2. **No finality.** `RoundRobin` selects producers; there are no prevote /
    precommit rounds, so a block is only as final as the single producer's
@@ -136,11 +138,13 @@ claims a technical buyer will test in the first diligence call.
   trained model, fixed-point exponential attention softmax, encrypted inputs
   and a weights-bound receipt. 80/80 label parity with the float reference on
   all 80 corpus examples. See [`docs/transformer.md`](transformer.md).
-- A deterministic GPT-style decoder (`crates/runtime/src/gpt.rs`) with a
-  char-BPE tokenizer, causal attention, a per-layer KV cache and greedy
-  decoding. `tiny-gpt-v1` is 110,400 Q16.16 parameters, matches the float
-  reference token-for-token on 8 prompts, and produces a weights-bound receipt.
-  See [`docs/decoder.md`](decoder.md). Demonstration model, not LLM quality.
+- A deterministic GPT-style decoder runtime (`crates/runtime/src/gpt.rs`) with
+  char-BPE and GPT-2 byte-level BPE tokenizers, causal attention, a per-layer
+  KV cache and greedy decoding. `tiny-gpt-v1` is a 110,400-parameter synthetic
+  demo; `tiny-stories-1m` is a real 3.75M-parameter pretrained GPT-Neo decoder
+  that matches its float reference token-for-token for 32 tokens on 8 prompts.
+  See [`docs/decoder.md`](decoder.md). The real weights are downloaded locally
+  and are not redistributed (no license on the model card).
 - A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
 
 ## Verified end-to-end (2-node product run)
@@ -271,7 +275,8 @@ domain still belong to the older reference node.
 - "Inputs are private from the operator" — inputs are encrypted to the
   validator set; every validator, including the operator, can decrypt. Pre-
   encryption tasks remain public.
-- "LLM support" — a 110k-parameter synthetic decoder runs, with char-BPE,
-  greedy decoding and a 32-token context. There is no real GPT-2/LLaMA
-  tokenizer, long context, sampling, batching, safety layer or production model
-  quality. "BFT" — the finality design is not implemented.
+- "LLM support" — a real 3.75M-parameter GPT-Neo demo runs with GPT-2 BPE,
+  greedy decoding and a 128-token context, plus a synthetic 110k decoder. There
+  is no long context, sampling, batching, streaming, safety layer, large-model
+  serving or clear model license. "BFT" — the finality design is not
+  implemented.

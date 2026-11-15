@@ -11,3 +11,7 @@ __pycache__/
 
 # Local browser artifacts
 .playwright-mcp/
+
+# TinyStories-1M is downloaded locally, not redistributed (no license on the model card)
+models/tiny-stories-1m.json
+models/tiny-stories-1m.test.json

@@ -46,12 +46,14 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   Train 100%, validation 90%, held-out 80% on a 10-example split; 80/80 label
   parity with its float reference on the full 80-example corpus. Small corpus,
   demonstration only.
-- **A GPT-style decoder now runs in consensus.** `tiny-gpt-v1` is a two-layer
-  causal decoder with a 320-token char-BPE tokenizer, a per-layer KV cache and
-  greedy decoding. 110,400 Q16.16 parameters, 32-token context, 24 new tokens
-  maximum. It matches its float reference token-for-token on 8 prompts. The
-  output is often template-like or garbled; this is a runtime demonstration,
-  not LLM quality.
+- **A real pretrained decoder now runs in consensus.** `tiny-stories-1m` is a
+  3.75M-parameter GPT-Neo decoder with the GPT-2 byte-level BPE tokenizer,
+  causal attention, a per-layer KV cache and greedy decoding. 8 layers, 64
+  hidden, 16 heads, 128-token context, 32 new tokens. It matches its float
+  reference **token-for-token for 32 tokens on 8 prompts**. It generates simple
+  children's stories, not production LLM quality. A synthetic `tiny-gpt-v1`
+  decoder also runs. The TinyStories weights are downloaded locally, not
+  redistributed, because the model card states no license.
 - **Deterministic across machines.** Inference is Q16.16 integer arithmetic with
   no floating point and no threading. Two independent nodes produced the same
   result hash for the same task in the verification run below.
@@ -66,14 +68,15 @@ the chain itself is inconsistent — that is the invariant a validator protects.
 - **Not a production LLM host.** Dense / relu / softmax classifiers convert
   from ONNX (`onnx-import`) or GGUF (`gguf-import`) — see
   [`docs/runtime.md`](runtime.md). A transformer **encoder classifier** runs
-  through `crates/runtime/src/transformer.rs`, and a tiny **GPT-style decoder**
-  runs through `crates/runtime/src/gpt.rs` with char-BPE, a KV cache and greedy
-  decoding. The decoder is a 110k-parameter synthetic demo with a 32-token
-  context. There is no real GPT-2/LLaMA tokenizer, sampling, batching, long
-  context, safety layer or ONNX LLM import, so a customer's LLM checkpoint
-  cannot be served yet. See [`docs/decoder.md`](decoder.md). Tasks for models a
-  node has not loaded fall back to the manual claim → submit result flow and
-  are **not** verified by the chain.
+  through `crates/runtime/src/transformer.rs`, and a **GPT-style decoder**
+  runtime runs through `crates/runtime/src/gpt.rs` with char-BPE and GPT-2
+  byte-level BPE, a KV cache and greedy decoding. The real demo is a
+  3.75M-parameter GPT-Neo with a 128-token context. There is no long context,
+  sampling, batching, streaming, safety layer, large-model serving or clear
+  model license, so a customer's LLM checkpoint cannot be served yet. See
+  [`docs/decoder.md`](decoder.md). Tasks for models a node has not loaded fall
+  back to the manual claim → submit result flow and are **not** verified by the
+  chain.
 - **Not ZK-proven.** The attention/matmul dispute path still falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like. With consensus
   re-execution, verification is recomputation; the dispute game is test-only
@@ -182,7 +185,8 @@ The first thing a technical buyer will test is a model they care about. A
 dense classifier converts from ONNX or GGUF in one command, executes in
 consensus, and comes with a measured parity figure against its float reference
 (see [`docs/runtime.md`](runtime.md)). A transformer encoder and a tiny
-GPT-style decoder also run in consensus, but what is missing is production LLM
-support: a real tokenizer, long context, sampling, batching and model quality.
-An LLM checkpoint still cannot be served. Everything around it — receipts,
+GPT-style decoder also run in consensus, including a real 3.75M-parameter
+pretrained model with the GPT-2 tokenizer, but what is missing is production LLM
+support: long context, sampling, batching, streaming, safety and large-model
+serving. An LLM checkpoint still cannot be served. Everything around it — receipts,
 verification, metering, settlement — already works.

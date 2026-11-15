@@ -132,24 +132,29 @@ block, exactly like a graph-model mismatch.
 
 ## GPT decoder models
 
-A third runtime executes a tiny GPT-style **decoder** with a char-BPE
-tokenizer, causal attention, a per-layer KV cache and greedy decoding. It is a
-demonstration model, not production LLM support. The format, tokenizer, cache
-and limits are in [`docs/decoder.md`](decoder.md).
+A third runtime executes GPT-style **decoders** with causal attention, a
+per-layer KV cache and greedy decoding. The format, tokenizers, cache and
+limits are in [`docs/decoder.md`](decoder.md).
 
 ```bash
+# synthetic demo model
 python3 scripts/train_gpt.py
-
 verinoo-node infer --model tiny-gpt-v1 --input "please cancel"
+
+# real pretrained TinyStories-1M (weights downloaded locally, not redistributed)
+python3 scripts/import_tiny_stories.py
+verinoo-node infer --model tiny-stories-1m --input "Once upon a time"
 ```
 
-`models/tiny-gpt-v1.json` is 110,400 Q16.16 parameters: token and position
-embeddings, two pre-norm decoder blocks (causal Q/K/V/O, layernorm, ReLU FFN),
-a final layernorm and a vocabulary head. Generation prefills the prompt, caches
-K/V per layer, then runs one forward step per new token and takes the argmax.
-The KV-cache path is tested to produce exactly the same logits as a full
-forward pass, and the Q16.16 greedy tokens match the float reference on the
-committed parity prompts.
+`tiny-gpt-v1` is 110,400 Q16.16 parameters: token and position embeddings, two
+pre-norm decoder blocks (causal Q/K/V/O, layernorm, ReLU FFN), a final
+layernorm and a vocabulary head. `tiny-stories-1m` is a 3.75M-parameter GPT-Neo
+decoder with the GPT-2 byte-level BPE tokenizer, `gelu_new`, no attention-score
+scaling, tied embeddings and eight layers. Generation prefills the prompt,
+caches K/V per layer, then runs one forward step per new token and takes the
+argmax. The KV-cache path is tested to produce exactly the same logits as a
+full forward pass, and the Q16.16 greedy tokens match the float reference on
+the committed parity prompts (32 tokens on 8 prompts for the real model).
 
 ## Importing ONNX
 
@@ -245,10 +250,10 @@ and refuses to write the file if the predicted class ever changes;
 
 ## Not supported
 
-* Production LLM checkpoints: a real GPT-2/LLaMA tokenizer, long context,
-  sampling, batching, safety layers and ONNX attention graphs. A tiny
-  synthetic GPT-style **decoder** runs through the separate runtime above; it
-  is a demonstration, not LLM support.
+* Production LLM checkpoints: LLaMA/SentencePiece tokenizers, long context,
+  sampling, batching, streaming, safety layers, large-model serving and ONNX
+  attention graphs. The decoder runtime supports GPT-2 BPE and a real 3.75M
+  GPT-Neo demo, but that is not production LLM support.
 * Graph ops outside the list above: attention, convolutions, embedding lookups,
   arbitrary tokenizers. GGUF support is limited to extracting dense classifier
   layers.

@@ -73,6 +73,7 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
 | A customer classifier can run | ONNX (`onnx-import`) and GGUF (`gguf-import`) import to a runtime graph with f32 parity checks |
 | A real transformer runs in consensus | `intent-transformer-v1`: Q16.16 attention encoder, 80/80 label parity, weights-bound receipt |
 | A causal decoder runs in consensus | `tiny-gpt-v1`: char-BPE, KV cache, greedy, token parity on 8 prompts |
+| A real pretrained decoder runs in consensus | `tiny-stories-1m`: 3.75M GPT-Neo, GPT-2 BPE, 32-token parity on 8 prompts |
 | On-chain settlement of fees | signed transfers, gas market, on-chain fee split |
 
 ## What is not claimed
@@ -80,13 +81,14 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
 - **Not trustless.** One operator runs both validators. Round-robin leader
   election with one producer signature per block; no BFT, no finality gadget,
   no equivocation slashing in the live path.
-- **Not a production LLM host.** A tiny GPT-style **decoder** now runs in
-  consensus (`tiny-gpt-v1`, 110,400 params, char-BPE, KV cache, greedy
-  decoding, 32-token context), and matches its float reference token-for-token
-  on 8 prompts. The output is often template-like or garbled. There is no real
-  GPT-2/LLaMA tokenizer, long context, sampling, batching, safety layer or
-  production model quality, so a Llama-class checkpoint cannot be served yet.
-  A transformer encoder classifier and dense classifiers also run.
+- **Not a production LLM host.** A real pretrained 3.75M-parameter GPT-Neo
+  decoder (`tiny-stories-1m`) now runs in consensus with the GPT-2 byte-level
+  BPE tokenizer, KV cache and greedy decoding. It matches its float reference
+  token-for-token for 32 tokens on 8 prompts and generates simple children's
+  stories. A synthetic decoder and a transformer encoder classifier also run.
+  There is still no long context, sampling, batching, streaming, safety layer,
+  clear model license or production model quality, so a Llama-class checkpoint
+  cannot be served yet.
 - **Not ZK-proven.** The attention/matmul dispute path falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like.
 - **Catch-up, not snapshot sync.** A late node replays blocks from genesis via
@@ -136,9 +138,9 @@ model returned.
 
 ## Known engineering gaps before self-serve
 
-1. Production LLM runtime. A Q16.16 transformer encoder classifier and a tiny
-   GPT-style decoder (BPE, KV cache, greedy) run end-to-end. Real GPT-2/LLaMA
-   tokenizers, long context, sampling, batching, safety layers and ONNX LLM
+1. Production LLM runtime. A transformer encoder and a real 3.75M GPT-Neo
+   decoder with GPT-2 BPE, KV cache and greedy decoding run end-to-end. Long
+   context, sampling, batching, streaming, safety, LLaMA tokenizers and ONNX LLM
    import are not implemented (`docs/decoder.md`). 4–8 weeks.
 2. Byzantine finality. `docs/adr/004-bft-finality.md` is a design only; no
    prevote/precommit, certificate or slashing code exists. 5.5–7 weeks.

@@ -11,9 +11,10 @@ Models come from the compiled-in reference classifier, operator graph models
 loaded from `VNN_MODEL_DIR`, and a transformer encoder classifier
 (`intent-transformer-v1`). Dense/relu/softmax classifiers convert from ONNX
 (`onnx-import`) and GGUF (`gguf-import`, dequantising Q4/Q5/Q8 and Q2_K–Q6_K).
-A transformer encoder and a tiny GPT-style decoder (char-BPE, KV cache,
-greedy decoding) run in consensus. Production LLM support (real tokenizers,
-long context, sampling, batching) does not. See
+A transformer encoder and a GPT-style decoder runtime run in consensus. The
+decoder supports GPT-2 byte-level BPE and a real 3.75M-parameter pretrained
+GPT-Neo demo (`tiny-stories-1m`), plus a synthetic char-BPE model. Production
+LLM support (long context, sampling, batching, safety) does not. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
 [`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary,
@@ -175,8 +176,13 @@ verinoo-node infer --model acme-support-v1 --input "my parcel was never delivere
 # a real transformer encoder in consensus (5,508 params, 80/80 label parity)
 verinoo-node infer --model intent-transformer-v1 --input "my parcel is delayed again"
 
-# a causal decoder with BPE, KV cache and greedy generation (demo model)
+# a synthetic causal decoder with char-BPE, KV cache and greedy generation
 verinoo-node infer --model tiny-gpt-v1 --input "please cancel"
+
+# a real 3.75M-param pretrained TinyStories-1M decoder (GPT-2 BPE)
+# weights are downloaded locally, not redistributed (no license on the model card)
+python3 scripts/import_tiny_stories.py
+verinoo-node infer --model tiny-stories-1m --input "Once upon a time"
 ```
 
 ## Wallet and API keys
@@ -200,7 +206,7 @@ replica/HA and incident response.
 
 ```bash
 cargo build --workspace --locked
-cargo test --workspace --locked        # 104 tests
+cargo test --workspace --locked        # 109 tests (4 TinyStories tests skip without the imported model)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/demo.sh                      # single node, ~45 s
