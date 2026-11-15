@@ -15,9 +15,12 @@ A transformer encoder and a GPT-style decoder runtime run in consensus. The
 decoder supports GPT-2 byte-level BPE, deterministic temperature/top-k/top-p
 sampling and binary `.vnnw` weights. It runs a synthetic char-BPE model, a
 3.75M-parameter GPT-Neo demo (`tiny-stories-1m`) and a locally imported
-Apache-2.0 82M-parameter DistilGPT-2 with 1,024-token context. Production LLM
-serving (GPU execution, batching, streaming, safety) is not deployed; the
-public node serves a small decoder demo, not DistilGPT-2. See
+Apache-2.0 82M-parameter DistilGPT-2 with 1,024-token context. A config-driven
+importer (`scripts/import_hf_gpt.py`) accepts other GPT-2/GPT-Neo checkpoints
+with the GPT-2 byte-level BPE tokenizer; LLaMA/SentencePiece and rotary
+architectures are still unsupported. Production LLM serving (GPU execution,
+batching, streaming, safety) is not deployed; the public node serves a small
+decoder demo, not DistilGPT-2. See
 [`docs/product.md`](docs/product.md) for the product and
 [`docs/readiness.md`](docs/readiness.md) for the matrix, and
 [`docs/pilot.md`](docs/pilot.md) for the design-partner proof summary,
@@ -194,7 +197,20 @@ verinoo-node infer --model tiny-stories-1m --input "Once upon a time"
 # Local/GPU path only; not served on the public 1-CPU node.
 python3 scripts/import_distilgpt2.py
 verinoo-node infer --model distilgpt2 --input "Once upon a time"
+
+# generic GPT-2/GPT-Neo importer: HuggingFace id or local directory
+python3 scripts/import_hf_gpt.py --model distilgpt2 --skip-generation
+python3 scripts/import_hf_gpt.py --model roneneldan/TinyStories-1M \
+  --max-context 256 --out-name tiny-stories-1m
 ```
+
+The generic importer supports GPT-2 (`GPT2LMHeadModel`) and GPT-Neo
+(`GPTNeoForCausalLM`) checkpoints only, with tied/untied heads, `gelu_new` or
+`relu`, and `vocab.json` + `merges.txt`. It transposes GPT-2 Conv1D weights but
+not GPT-Neo Linear weights, and rejects LLaMA/SentencePiece tokenizers,
+rotary-embedding architectures, other activations and GPT-Neo contexts longer
+than the local-attention window. Weights are downloaded or read locally, not
+redistributed.
 
 ## Claims-triage pilot demo
 

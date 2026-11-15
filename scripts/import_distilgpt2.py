@@ -21,45 +21,29 @@ public verinoo.com node.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import math
-import struct
 from pathlib import Path
 
-import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from hf_gpt_common import (
+    export_checkpoint,
+    load_tokenizer_data,
+    resolve_max_context,
+    resolve_max_new_tokens,
+    shape_from_config,
+    write_generation_fixture,
+)
+
 MODEL = "distilgpt2"
-Q = 65536
-MAGIC = b"VNNW"
-VERSION = 1
 PROMPTS = [
     "Once upon a time",
     "The little dog",
     "In a world where",
 ]
-
-
-def quantise(tensor: torch.Tensor) -> np.ndarray:
-    values = tensor.detach().cpu().numpy().astype(np.float64)
-    if np.max(np.abs(values)) >= 32768:
-        raise ValueError("weight outside the Q16.16 real range")
-    scaled = values * Q
-    rounded = np.where(scaled >= 0, np.floor(scaled + 0.5), np.ceil(scaled - 0.5))
-    return rounded.astype("<i4").reshape(-1)
-
-
-def write_weights(path: Path, arrays: list[np.ndarray]) -> str:
-    payload = np.concatenate(arrays).astype("<i4").tobytes()
-    digest = hashlib.sha256(payload).digest()
-    header = struct.pack("<4sIQ32s", MAGIC, VERSION, len(payload), digest)
-    with open(path, "wb") as handle:
-        handle.write(header)
-        handle.write(payload)
-    return digest.hex()
+DESCRIPTION = (
+    "DistilGPT-2, an Apache 2.0 82M-parameter GPT-2 decoder. "
+    "Demonstration/production foundation; not served on the public node."
+)
 
 
 def main() -> None:
@@ -73,144 +57,43 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     model = AutoModelForCausalLM.from_pretrained(MODEL)
     model.eval()
-    config = model.config
-    hidden = config.n_embd
-    heads = config.n_head
-    layers = config.n_layer
-    ff = config.n_inner or hidden * 4
-    max_context = min(args.max_context, config.n_positions)
-    if hidden % heads:
-        raise ValueError("n_embd must be divisible by n_head")
-
-    vocab_path = hf_hub_download(MODEL, "vocab.json")
-    merges_path = hf_hub_download(MODEL, "merges.txt")
-    vocab_map = json.load(open(vocab_path))
-    vocab: list[str | None] = [None] * len(vocab_map)
-    for token, idx in vocab_map.items():
-        vocab[idx] = token
-    if any(tok is None for tok in vocab):
-        raise ValueError("vocab.json has holes")
-    merges = []
-    for line in Path(merges_path).read_text().splitlines():
-        if not line or line.startswith("#version"):
-            continue
-        a, b = line.split(" ", 1)
-        merges.append([a, b])
-    print(f"tokenizer: {len(vocab)} tokens, {len(merges)} merges", flush=True)
-
-    state = model.state_dict()
-    arrays: list[np.ndarray] = []
-    arrays.append(quantise(state["transformer.wte.weight"]))
-    arrays.append(quantise(state["transformer.wpe.weight"][:max_context]))
-    for i in range(layers):
-        p = f"transformer.h.{i}"
-        attn = f"{p}.attn"
-        mlp = f"{p}.mlp"
-        arrays.append(quantise(state[f"{p}.ln_1.weight"]))
-        arrays.append(quantise(state[f"{p}.ln_1.bias"]))
-        # GPT-2 Conv1D: c_attn.weight is [in, 3*out]; our dense is [out, in].
-        c_attn = state[f"{attn}.c_attn.weight"]
-        c_bias = state[f"{attn}.c_attn.bias"]
-        for part in range(3):
-            block = c_attn[:, part * hidden : (part + 1) * hidden].T.contiguous()
-            arrays.append(quantise(block))
-            arrays.append(quantise(c_bias[part * hidden : (part + 1) * hidden]))
-        arrays.append(quantise(state[f"{attn}.c_proj.weight"].T.contiguous()))
-        arrays.append(quantise(state[f"{attn}.c_proj.bias"]))
-        arrays.append(quantise(state[f"{p}.ln_2.weight"]))
-        arrays.append(quantise(state[f"{p}.ln_2.bias"]))
-        arrays.append(quantise(state[f"{mlp}.c_fc.weight"].T.contiguous()))
-        arrays.append(quantise(state[f"{mlp}.c_fc.bias"]))
-        arrays.append(quantise(state[f"{mlp}.c_proj.weight"].T.contiguous()))
-        arrays.append(quantise(state[f"{mlp}.c_proj.bias"]))
-    arrays.append(quantise(state["transformer.ln_f.weight"]))
-    arrays.append(quantise(state["transformer.ln_f.bias"]))
-    tied = bool(config.tie_word_embeddings)
-    if not tied:
-        arrays.append(quantise(state["lm_head.weight"]))
-        arrays.append(np.zeros(len(vocab), dtype="<i4"))
+    shape = shape_from_config(model.config)
+    max_context = resolve_max_context(shape, args.max_context)
+    max_new_tokens = resolve_max_new_tokens(args.max_new_tokens, max_context)
+    tokenizer_data = load_tokenizer_data(MODEL)
+    print(
+        f"tokenizer: {len(tokenizer_data.vocab)} tokens, "
+        f"{len(tokenizer_data.merges)} merges",
+        flush=True,
+    )
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = out_dir / "distilgpt2.vnnw"
-    payload_sha = write_weights(weights_path, arrays)
-    parameters = int(sum(arr.size for arr in arrays))
-    print(f"wrote {weights_path} ({weights_path.stat().st_size / 1e6:.1f} MB, {parameters} params)")
-
-    spec = {
-        "kind": "gpt-decoder",
-        "modelId": "distilgpt2",
-        "architecture": f"gpt2-{layers}x{hidden}-{heads}h",
-        "description": (
-            "DistilGPT-2, an Apache 2.0 82M-parameter GPT-2 decoder. "
-            "Demonstration/production foundation; not served on the public node."
-        ),
-        "tokenizerKind": "byte-bpe",
-        "activation": "gelu_new",
-        "attentionScale": "sqrt",
-        "layerNormEpsilon": int(round(config.layer_norm_epsilon * (1 << 32))),
-        "tieWordEmbeddings": tied,
-        "prependBos": False,
-        "vocab": vocab,
-        "merges": merges,
-        "maxContext": max_context,
-        "maxNewTokens": args.max_new_tokens,
-        "hidden": hidden,
-        "heads": heads,
-        "ff": ff,
-        "layers": layers,
-        "bosId": tokenizer.bos_token_id,
-        "eosId": tokenizer.eos_token_id,
-        "padId": tokenizer.eos_token_id,
-        "unkId": tokenizer.unk_token_id,
-        "sampling": {
-            "temperatureMilli": 0,
-            "topK": 0,
-            "topPMilli": 0,
-            "seed": 0,
-        },
-        "weightsFile": "distilgpt2.vnnw",
-        "weightsSha256": payload_sha,
-    }
-    metadata_path = out_dir / "distilgpt2.json"
-    metadata_path.write_text(json.dumps(spec) + "\n")
-    print(f"wrote {metadata_path} ({metadata_path.stat().st_size / 1e6:.2f} MB)")
+    export_checkpoint(
+        state=model.state_dict(),
+        shape=shape,
+        tokenizer=tokenizer_data,
+        model_id=MODEL,
+        architecture=f"gpt2-{shape.layers}x{shape.hidden}-{shape.heads}h",
+        description=DESCRIPTION,
+        out_dir=out_dir,
+        out_name=MODEL,
+        max_context=max_context,
+        max_new_tokens=max_new_tokens,
+    )
 
     if args.skip_generation:
         print("skipping float-reference generation")
         return
 
-    cases = []
-    with torch.no_grad():
-        for prompt in PROMPTS:
-            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            input_ids = torch.tensor([prompt_ids], dtype=torch.long)
-            output = model.generate(
-                input_ids,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                num_beams=1,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-            generated = output[0, input_ids.shape[1] :].tolist()
-            text = tokenizer.decode(generated, skip_special_tokens=True)
-            cases.append(
-                {
-                    "prompt": prompt,
-                    "promptTokens": prompt_ids,
-                    "tokenIds": generated,
-                    "text": text,
-                }
-            )
-            print(f"{prompt!r} -> {text!r}", flush=True)
-    fixture = {
-        "modelId": "distilgpt2",
-        "note": "Float-reference greedy generation from the official DistilGPT-2 checkpoint.",
-        "cases": cases,
-    }
-    (out_dir / "distilgpt2.test.json").write_text(json.dumps(fixture, indent=2) + "\n")
-    print(f"wrote {out_dir / 'distilgpt2.test.json'}")
+    write_generation_fixture(
+        model,
+        tokenizer,
+        PROMPTS,
+        out_dir / "distilgpt2.test.json",
+        model_id=MODEL,
+        max_new_tokens=max_new_tokens,
+        note="Float-reference greedy generation from the official DistilGPT-2 checkpoint.",
+    )
 
 
 if __name__ == "__main__":

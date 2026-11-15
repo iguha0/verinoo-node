@@ -13,7 +13,9 @@ imported and parity-tested locally, but is **not served on the public
 
 All use causal attention, a per-layer KV cache and greedy or seeded sampling.
 Every op is integer or Q16.16, so two nodes with the same model file and seed
-generate the same token ids from the same prompt.
+generate the same token ids from the same prompt. A config-driven importer,
+`scripts/import_hf_gpt.py`, handles other checkpoints in the same GPT-2/GPT-Neo
+subset (it is not arbitrary LLM checkpoint support).
 
 ## What runs
 
@@ -237,7 +239,14 @@ file, so a verifier must load the same file.
 ## Import or train
 
 ```bash
-# Apache 2.0 DistilGPT-2: 81.9M params, 1024 context, binary weights
+# generic GPT-2/GPT-Neo importer: HuggingFace model id or local directory
+python3 scripts/import_hf_gpt.py --model distilgpt2 --skip-generation
+python3 scripts/import_hf_gpt.py --model roneneldan/TinyStories-1M \
+  --max-context 256 --out-name tiny-stories-1m
+# models/<out-name>.json, models/<out-name>.vnnw,
+# models/<out-name>.test.json (unless --skip-generation)
+
+# Apache 2.0 DistilGPT-2 convenience wrapper: same CLI shape and outputs
 python3 scripts/import_distilgpt2.py
 # models/distilgpt2.json (1.7 MB), models/distilgpt2.vnnw (328 MB),
 # models/distilgpt2.test.json
@@ -251,15 +260,41 @@ python3 scripts/train_gpt.py
 # models/tiny-gpt-v1.json, models/tiny-gpt-v1.test.json
 ```
 
-Both large-model outputs are gitignored. The DistilGPT-2 importer quantises
-the official checkpoint to Q16.16, writes the `.vnnw` header and SHA-256,
-extracts the GPT-2 tokenizer and records float-reference greedy vectors.
+The generic importer is config-driven and covers the same decoder subset as the
+runtime:
+
+- **GPT-2** (`GPT2LMHeadModel` or model type `gpt2`): Conv1D weights are
+  `[in, out]` and are transposed to the runtime's `[out, in]` layout; attention
+  uses sqrt scaling.
+- **GPT-Neo** (`GPTNeoForCausalLM` or model type `gpt_neo`): Linear weights are
+  already `[out, in]` and are not transposed; attention has no score scaling.
+- Tied and untied `lm_head`; an untied head gets the required bias (zeros when
+  the checkpoint has none).
+- `gelu_new` or `relu` activation only, and the GPT-2 byte-level BPE tokenizer
+  (`vocab.json` + `merges.txt`).
+
+`--max-context` defaults to `min(1024, config positions)` and is capped by the
+model's positional embeddings. GPT-Neo local-attention checkpoints are rejected
+when the requested context exceeds their window because the runtime treats
+local layers as global attention; choose `--max-context` at or below the
+window. LLaMA/SentencePiece tokenizers, non-`gelu_new`/`relu` activations,
+rotary embeddings, other architectures, and shapes outside the runtime limits
+fail with a clear error.
+
+Model weight files are not committed. The DistilGPT-2 and TinyStories-1M
+outputs above are gitignored; generic imports produce the same kind of binary
+and must not be committed. The importers quantise the checkpoint to Q16.16,
+write the `.vnnw` header and SHA-256, extract the GPT-2 tokenizer and optionally
+record float-reference greedy vectors. Weights are downloaded from HuggingFace
+or read from a local directory; they are not redistributed.
 
 **Licensing:** DistilGPT-2 is Apache 2.0 according to its model card; verify the
 card before redistribution. The model files are downloaded locally and are not
 committed or included in release artifacts. The TinyStories-1M model card does
 not state a license for the weights; they are also downloaded locally, not
-redistributed, and `models/NOTICE-tiny-stories-1m.txt` records the caveat.
+redistributed, and `models/NOTICE-tiny-stories-1m.txt` records the caveat. The
+generic importer does not change the checkpoint's license: verify the model card
+before using or redistributing any imported weights.
 
 ## What is still missing
 
@@ -270,9 +305,9 @@ redistributed, and `models/NOTICE-tiny-stories-1m.txt` records the caveat.
 - **Per-task generation controls.** Sampling is fixed in the model file. There
   is no API override, stop sequence, repetition penalty or beam search, and
   sampling config is not separately bound in the receipt.
-- **Arbitrary checkpoints.** Only GPT-2/GPT-Neo shapes and the GPT-2 byte-BPE
-  tokenizer are supported. No LLaMA/SentencePiece, no arbitrary tokenizer
-  formats, no ONNX LLM import.
+- **Arbitrary checkpoints.** The generic importer covers GPT-2/GPT-Neo shapes
+  and the GPT-2 byte-BPE tokenizer, but there is no LLaMA/SentencePiece support,
+  no rotary embeddings, no arbitrary tokenizer formats and no ONNX LLM import.
 - **Long-context quality.** The runtime supports up to 8,192 positions of
   validation, but only DistilGPT-2's 1,024 positions are tested; local attention
   beyond GPT-Neo's window is not implemented.
