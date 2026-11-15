@@ -397,3 +397,67 @@ fn an_encrypted_task_with_a_wrong_commitment_does_not_execute() {
         assert_eq!(task.status, "pending", "wrong commitment must not complete");
     }
 }
+
+fn install_transformer_model() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models/intent-transformer-v1.json");
+    let bytes = std::fs::read(path).expect("committed transformer model");
+    let model = verinoo_runtime::TransformerModel::from_bytes(&bytes).expect("valid model");
+    let mut registry = verinoo_runtime::TransformerRegistry::empty();
+    registry.insert(model).unwrap();
+    verinoo_runtime::transformer::install_transformers_once(registry);
+}
+
+#[test]
+fn transformer_task_runs_by_consensus_and_receipt_binds_weights() {
+    install_transformer_model();
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-transformer", 6);
+    let user = keypair("transformer-requester");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let input = "my parcel is delayed again";
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": "intent-transformer-v1",
+            "input": input,
+            "inputCommitment": verinoo_model::sha256_hex(input),
+            "maxFee": 100,
+            "deadline": 1_000,
+        }),
+        1,
+    );
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let head = current_head(&store).unwrap();
+    verinoo_exec::engine::validate_block(
+        &block,
+        &head.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .unwrap();
+    set_head(&store, &block);
+
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert_eq!(task.status, "completed");
+    let output = task.result_output.clone().unwrap();
+    assert!(output.contains("\"shipping\""), "{output}");
+    let receipt = verinoo_exec::engine::receipt_for(&store, &task.task_id).unwrap();
+    assert_eq!(receipt["modelId"], "intent-transformer-v1");
+    assert_eq!(
+        receipt["weightsHash"].as_str().unwrap().len(),
+        64,
+        "receipt must bind the transformer weights"
+    );
+    assert_eq!(
+        receipt["outputHash"].as_str().unwrap(),
+        verinoo_model::sha256_hex(&output)
+    );
+}

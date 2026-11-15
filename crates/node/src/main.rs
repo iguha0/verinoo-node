@@ -399,6 +399,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     verinoo_runtime::install_once(registry);
 
+    // Transformer encoder models are a separate runtime but part of the same
+    // consensus model set. Every validator must load the same files.
+    let (transformers, transformer_problems) =
+        verinoo_runtime::transformer::TransformerRegistry::load_dir(&model_dir);
+    for problem in &transformer_problems {
+        tracing::warn!("transformer set: {problem}");
+    }
+    if !transformers.is_empty() {
+        for id in transformers.ids() {
+            tracing::info!("transformer loaded | {id}");
+        }
+        tracing::info!(
+            "transformer set: {} model(s) | hash {}",
+            transformers.len(),
+            &transformers.hash()[..16.min(transformers.hash().len())]
+        );
+    }
+    verinoo_runtime::transformer::install_transformers_once(transformers);
+
     let shared = Arc::new(Shared {
         store,
         params: cfg.genesis.clone(),

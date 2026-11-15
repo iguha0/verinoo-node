@@ -1069,6 +1069,7 @@ fn match_pending_tasks(store: &StateStore, height: u64) {
 pub enum ExecModel {
     Builtin,
     Runtime(std::sync::Arc<verinoo_runtime::Model>),
+    Transformer(std::sync::Arc<verinoo_runtime::TransformerModel>),
 }
 
 impl ExecModel {
@@ -1078,16 +1079,20 @@ impl ExecModel {
         if model_id == verinoo_model::MODEL_ID {
             return Some(ExecModel::Builtin);
         }
-        verinoo_runtime::global()
+        if let Some(model) = verinoo_runtime::global().get(model_id) {
+            return Some(ExecModel::Runtime(model.clone()));
+        }
+        verinoo_runtime::transformer::transformer_global()
             .get(model_id)
             .cloned()
-            .map(ExecModel::Runtime)
+            .map(ExecModel::Transformer)
     }
 
     pub fn model_id(&self) -> &str {
         match self {
             ExecModel::Builtin => verinoo_model::MODEL_ID,
             ExecModel::Runtime(m) => m.model_id(),
+            ExecModel::Transformer(m) => m.model_id(),
         }
     }
 
@@ -1096,14 +1101,16 @@ impl ExecModel {
         match self {
             ExecModel::Builtin => verinoo_model::weights_hash(),
             ExecModel::Runtime(m) => m.weights_hash().to_string(),
+            ExecModel::Transformer(m) => m.weights_hash().to_string(),
         }
     }
 
     /// Canonical result bytes for an input.
-    pub fn result_json(&self, input: &str) -> String {
+    pub fn result_json(&self, input: &str) -> Result<String, String> {
         match self {
-            ExecModel::Builtin => verinoo_model::result_json(input),
-            ExecModel::Runtime(m) => m.result_json(input),
+            ExecModel::Builtin => Ok(verinoo_model::result_json(input)),
+            ExecModel::Runtime(m) => Ok(m.result_json(input)),
+            ExecModel::Transformer(m) => m.result_json(input),
         }
     }
 }
@@ -1112,6 +1119,7 @@ impl ExecModel {
 pub fn execute_models() -> Vec<serde_json::Value> {
     let mut out = vec![verinoo_model::descriptor()];
     out.extend(verinoo_runtime::global().descriptors());
+    out.extend(verinoo_runtime::transformer::transformer_global().descriptors());
     out
 }
 
@@ -1173,7 +1181,13 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
                 continue;
             }
         };
-        let output = model.result_json(&plaintext);
+        let output = match model.result_json(&plaintext) {
+            Ok(output) => output,
+            Err(e) => {
+                tracing::warn!(task = %task.task_id, error = %e, "model execution failed");
+                continue;
+            }
+        };
         let result_hash = sha256_hex(&output);
         task.status = "completed".into();
         task.result_output = Some(output);

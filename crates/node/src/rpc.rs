@@ -434,6 +434,7 @@ async fn v1_models() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "models": verinoo_exec::engine::execute_models(),
         "modelSetHash": verinoo_runtime::global().hash(),
+        "transformerSetHash": verinoo_runtime::transformer::transformer_global().hash(),
         "runtime": "deterministic-q16.16",
         "verification": "recompute",
     }))
@@ -531,7 +532,17 @@ async fn v1_verify(
             })))
         }
     };
-    let recomputed = model.result_json(&plaintext);
+    let recomputed = match model.result_json(&plaintext) {
+        Ok(output) => output,
+        Err(reason) => {
+            return Ok(Json(serde_json::json!({
+                "taskId": task_id,
+                "verified": false,
+                "reason": reason,
+                "modelId": model.model_id(),
+            })))
+        }
+    };
     let recomputed_hash = verinoo_model::sha256_hex(&recomputed);
     let on_chain = task.result_hash.clone().unwrap_or_default();
     let receipt = verinoo_exec::engine::receipt_for(&shared.store, &task_id);
