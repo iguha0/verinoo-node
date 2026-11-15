@@ -93,7 +93,9 @@ test vectors. `--seed`, `--epochs` and `--out-dir` are configurable.
 
 ## What is still missing
 
-- **Generation.** No decoder, causal mask, sampling, temperature or KV cache.
+- **Generation in this runtime.** No decoder or causal mask here. A separate
+  decoder runtime now exists with BPE, a KV cache and greedy decoding; see
+  [`docs/decoder.md`](decoder.md). It is a tiny synthetic demo, not LLM support.
 - **Tokenizers.** ASCII words only. No BPE, WordPiece, SentencePiece, byte-level
   mapping or Unicode normalisation.
 - **Scale.** One tiny layer, context 12, vocabulary 187. Long context, multi-layer

@@ -470,7 +470,7 @@ fn parameter_count(spec: &TransformerSpec) -> u64 {
     total
 }
 
-fn dense(
+pub(crate) fn dense(
     x: &[i32],
     weights: &[i32],
     bias: &[i32],
@@ -502,7 +502,7 @@ fn dense(
     Ok(out)
 }
 
-fn dense_rows(
+pub(crate) fn dense_rows(
     x: &[i32],
     weights: &[i32],
     bias: &[i32],
@@ -531,13 +531,19 @@ fn dense_rows(
     Ok(out)
 }
 
-fn add_in_place(x: &mut [i32], delta: &[i32]) {
+pub(crate) fn add_in_place(x: &mut [i32], delta: &[i32]) {
     for (a, b) in x.iter_mut().zip(delta) {
         *a = (*a as i64 + *b as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
 }
 
-fn layer_norm(x: &[i32], gamma: &[i32], beta: &[i32], rows: usize, hidden: usize) -> Vec<i32> {
+pub(crate) fn layer_norm(
+    x: &[i32],
+    gamma: &[i32],
+    beta: &[i32],
+    rows: usize,
+    hidden: usize,
+) -> Vec<i32> {
     let mut out = vec![0i32; rows * hidden];
     for row in 0..rows {
         let values = &x[row * hidden..(row + 1) * hidden];
@@ -575,7 +581,7 @@ fn div_round(value: i64, divisor: i64) -> i64 {
     }
 }
 
-fn isqrt(n: u64) -> u64 {
+pub(crate) fn isqrt(n: u64) -> u64 {
     if n < 2 {
         return n;
     }
@@ -588,7 +594,7 @@ fn isqrt(n: u64) -> u64 {
     x
 }
 
-fn argmax_index(values: &[i32]) -> Option<usize> {
+pub(crate) fn argmax_index(values: &[i32]) -> Option<usize> {
     values
         .iter()
         .enumerate()

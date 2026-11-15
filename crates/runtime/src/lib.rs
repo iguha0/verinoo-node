@@ -29,7 +29,9 @@
 //! ```
 
 pub mod attention;
+pub mod gpt;
 pub mod transformer;
+pub use gpt::{GptModel, GptRegistry};
 pub use transformer::{TransformerModel, TransformerRegistry};
 
 use std::collections::BTreeMap;
@@ -413,7 +415,7 @@ impl Registry {
                         .and_then(|v| {
                             v.get("kind")
                                 .and_then(|k| k.as_str())
-                                .map(|s| s == "transformer-classifier")
+                                .map(|s| s == "transformer-classifier" || s == "gpt-decoder")
                         })
                         .unwrap_or(false);
                     if is_transformer {
