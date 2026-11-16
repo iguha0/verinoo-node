@@ -259,8 +259,27 @@ mod tests {
             serde_json::from_value(json!({"taskId":"t1","requester":"r","targetModel":"m",
                 "maxFee":10,"deadline":5,"status":"pending"}))
             .unwrap();
+        assert!(task.sampling.is_none());
+        assert!(
+            serde_json::to_value(&task)
+                .unwrap()
+                .get("sampling")
+                .is_none(),
+            "old tasks must keep their serialized shape"
+        );
         store.set_task(&task);
         assert_eq!(store.iter_tasks_by_status("pending").len(), 1);
         assert_eq!(store.iter_tasks_by_status("assigned").len(), 0);
+
+        let mut sampled = task.clone();
+        sampled.sampling = Some(verinoo_types::SamplingSpec {
+            temperature_milli: 800,
+            top_k: 40,
+            top_p_milli: 900,
+            seed: 7,
+        });
+        let encoded = serde_json::to_value(&sampled).unwrap();
+        assert_eq!(encoded["sampling"]["temperatureMilli"], 800);
+        assert_eq!(encoded["sampling"]["seed"], 7);
     }
 }

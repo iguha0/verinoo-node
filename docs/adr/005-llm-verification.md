@@ -4,10 +4,11 @@
 
 **Proposed — partially implemented.** The deterministic decoder now has
 integer temperature/top-k/top-p sampling with a seeded SplitMix64 RNG, a
-SHA-256-bound binary weight format, and a locally imported 81.9M DistilGPT-2
-with 1,024-token context. Not implemented: an optimistic LLM executor, a bonded
-challenger, a TEE attestation path, per-task sampling commitment and repetition
-penalties. Nothing else here may be cited as shipped behavior.
+SHA-256-bound binary weight format, per-task sampling bound in the transaction,
+task and receipt, and a locally imported 81.9M DistilGPT-2 with 1,024-token
+context. Not implemented: an optimistic LLM executor, a bonded challenger, a
+TEE attestation path, task-derived seeds and repetition penalties. Nothing else
+here may be cited as shipped behavior.
 
 Date: 2026-11-15
 Scope: `crates/exec`, `crates/runtime`, `crates/node`, `crates/network`,
@@ -312,28 +313,46 @@ derive to its address using `public_key_to_address`
 
 ### Sampling commitment and determinism
 
-Sampling is now integer and reproducible (`Sampling` in
-`crates/runtime/src/gpt.rs`; see `docs/decoder.md`). The current parameters are
-`temperatureMilli` (`0` = greedy), `topK`, `topPMilli` and a `seed`, fixed in
-the model JSON. A per-task sampling commitment and `repetitionPenaltyMilli` are
-still design work; until they exist, a claim must use the model's fixed
-sampling configuration and the verifier must load the same model file.
+**Per-task commitment (implemented).** Sampling is integer and reproducible
+(`SamplingSpec` in `crates/types/src/sampling.rs`, `Sampling` in
+`crates/runtime/src/gpt.rs`; see `docs/decoder.md`). The implemented object is
+`{temperatureMilli, topK, topPMilli, seed}`, supplied as an optional
+`sampling` field in `submitInference` data. Because it is canonical transaction
+data, it changes `txId` and the derived task id (`task_id_for`,
+`crates/exec/src/engine.rs`). The task stores it, every validator executes with
+it, `/v1/verify` recomputes with it, and the receipt carries `sampling` plus
+`samplingHash = sha256(canonical_json(sampling))`. If absent, the model's fixed
+default is used, preserving old tasks. Only decoder models accept an override;
+a classifier task with sampling fails deterministically instead of ignoring it.
 
-**Sampling parameters.** Encode all parameters as integers in canonical JSON:
+Implemented validation ranges: `temperatureMilli` in `0..=100000`
+(`0` = greedy), `topK` in `0..=1000000` (`0` disables top-k), `topPMilli` in
+`0..=1000` (`0` or `1000` disables the nucleus), and `seed` is any `u64`.
 
-- `temperatureMilli` in `1..=2000`, where 1000 is 1.0;
-- `topK` in `0..=vocab_size`, where 0 disables top-k;
-- `topPMilli` in `1..=1000`, where 1000 keeps all tokens;
-- `maxNewTokens` in `1..=max_context - prompt_len`;
-- `repetitionPenaltyMilli` in `1000..=2000`, where 1000 disables it;
+**Remaining design work.** `maxNewTokens`, `repetitionPenaltyMilli` and the
+task-derived seed below are not implemented. The current `seed` is chosen by
+the client (or inherited from the model default), not derived from task
+metadata; a deployed optimistic verifier should derive it as shown here so the
+executor cannot choose the sequence. A challenger must also load the same model
+file to reproduce the result.
+
+**Sampling parameters.** The implemented wire fields use the ranges above.
+The broader design keeps every parameter an integer in canonical JSON:
+
+- `temperatureMilli` in `0..=100000`;
+- `topK` in `0..=1000000`, where 0 disables top-k;
+- `topPMilli` in `0..=1000`, where 1000 keeps all tokens;
+- `maxNewTokens` in `1..=max_context - prompt_len` (design only);
+- `repetitionPenaltyMilli` in `1000..=2000` (design only);
 - `clientSeed` is optional 32 bytes; empty means the requester does not choose
-  a seed.
+  a seed (design only; the current wire field is the concrete `seed`).
 
-`paramsHash = sha256(canonical_json(sampling_object))`. The object is included
-in the task transaction, so the executor cannot change it after the fact.
+`samplingHash = sha256(canonical_json(sampling_object))`. The object is
+included in the task transaction, so the executor cannot change it after the
+fact.
 
-**Task-derived seed.** The executor does not choose the seed. Both the
-executor and a challenger derive:
+**Task-derived seed (design only).** The intended production rule is that the
+executor does not choose the seed. Both the executor and a challenger derive:
 
 ```text
 seed = sha256("verinoo/llm-sampling/v1" || chain_id || task_id ||
@@ -341,7 +360,7 @@ seed = sha256("verinoo/llm-sampling/v1" || chain_id || task_id ||
 ```
 
 `task_id` already commits the transaction contents (`task_id_for`,
-`crates/exec/src/engine.rs:1259`), and `inputCommitment` binds the input. If
+`crates/exec/src/engine.rs`), and `inputCommitment` binds the input. If
 `clientSeed` is non-empty, append it as the last field; it is then part of the
 committed parameters. A changed seed changes the token sequence, so it is not
 a private executor choice.
@@ -802,13 +821,15 @@ security audit.
 ## Non-claims
 
 - **Not implemented.** No optimistic LLM executor, verifier panel, bond,
-  challenge window, TEE attestation, ZK proof, or integer sampler exists in
-  this repository.
+  challenge window, TEE attestation or ZK proof exists in this repository. The
+  integer sampler, per-task sampling commitment and deterministic replay do
+  exist.
 - **No production LLM support.** The largest model that runs in consensus is
   the 3.75M-parameter `tiny-stories-1m`; 7B/70B serving, long context,
   batching, streaming, and a production tokenizer are not implemented.
-- **No sampling today.** The decoder is greedy (`docs/decoder.md:161-166`).
-  This ADR specifies sampling; it does not ship it.
+- **No task-derived seed or repetition penalty.** The client supplies `seed`
+  directly today (`docs/decoder.md`); this ADR's seed derivation and
+  `repetitionPenaltyMilli` are still design.
 - **No trustless verification with one operator.** Optimistic verification
   requires an independent verifier and a producer that cannot censor
   challenges. The current deployment has neither.

@@ -40,6 +40,26 @@ check = client.verify(task_id)
 print(check["verified"], check.get("output"))
 ```
 
+Decoder tasks can pin sampling in the signed transaction; the node, every
+validator and the receipt then use the same values:
+
+```python
+client.infer(
+    private_key=wallet,
+    input="Once upon a time",
+    model="tiny-gpt-v1",
+    sampling={
+        "temperatureMilli": 800,
+        "topK": 40,
+        "topPMilli": 900,
+        "seed": 7,
+    },
+)
+```
+
+Omitting `sampling` keeps the model's default. Only decoder models accept an
+override; classifier submissions with `sampling` are rejected.
+
 `private_key` in `infer` accepts a wallet dict, a Rust-CLI key-file path, a
 base64/hex seed, or an `Ed25519PrivateKey`. The wallet file shape is the same
 as `verinoo-node wallet generate`:
@@ -65,6 +85,8 @@ Address derivation is `ai_` + the first 20 bytes of
 - Inference envelopes use `to: ""`, `value: 0`, and
   `nonce = account.nonce + 1`.
 - `deadline = int(time.time()) + 3600`.
+- `sampling` is optional and, when present, becomes part of the canonical
+  transaction data and therefore the `txId` / task id.
 - `gasLimit` / `gasPrice` are omitted unless explicitly supplied.
 
 ## Input encryption

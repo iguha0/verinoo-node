@@ -5,6 +5,10 @@ Status: **three decoder slices, binary weights and deterministic sampling.**
 imported and parity-tested locally, but is **not served on the public
 `verinoo.com` node** and is not yet a production LLM service.
 
+Sampling can be fixed in the model JSON or chosen per task. A per-task choice
+is signed with the transaction, executed by every validator and exposed in the
+receipt.
+
 | Model | What it is | Source |
 |---|---|---|
 | `tiny-gpt-v1` | synthetic two-layer GPT-style decoder, char-BPE, 110,400 params | trained by `scripts/train_gpt.py` |
@@ -80,7 +84,8 @@ the FFN. No full-sequence recomputation per token.
 
 ## Sampling
 
-Sampling is part of the model spec and is deterministic across nodes:
+Sampling defaults are part of the model spec and are deterministic across
+nodes:
 
 ```json
 "sampling": {
@@ -103,9 +108,38 @@ quantises the softmax to Q16.16 and draws with a SplitMix64 integer PRNG. There
 is no floating-point random number generation. Temperature `0` keeps the old
 greedy path, so existing models and fixtures are unchanged.
 
-Sampling is fixed in the model JSON; the HTTP API does not yet accept a
-per-task sampling override or bind one in the receipt. Every node and verifier
-must load the same model file. If you change sampling for a published model,
+Sampling defaults come from the model JSON. A client may override it per task
+by adding the same object to `submitInference` data:
+
+```json
+{
+  "type": "submitInference",
+  "data": {
+    "targetModel": "tiny-gpt-v1",
+    "input": "Once upon a time",
+    "sampling": {
+      "temperatureMilli": 800,
+      "topK": 40,
+      "topPMilli": 900,
+      "seed": 7
+    }
+  }
+}
+```
+
+The optional `sampling` object is canonical transaction data, so it changes
+`txId` and is bound to the derived task id. The task stores it, every validator
+uses it during deterministic execution, and `/v1/verify` recomputes with it.
+The receipt includes `sampling` and `samplingHash = sha256(canonical_json(
+sampling))`; `samplingSource` is `task` for an override and `model-default`
+when no override was supplied. Tasks without sampling keep the model default,
+so old tasks and receipts are unchanged.
+
+Range validation is enforced before execution: `temperatureMilli` `0..=100000`,
+`topK` `0..=1000000`, `topPMilli` `0..=1000`, and `seed` is any `u64`. Only
+decoder models accept sampling; submitting one for a classifier fails instead
+of being silently ignored. Every node and verifier must still load the same
+model file. If you change the model's default sampling for a published model,
 treat it as a new model version.
 
 ## Binary weights (`.vnnw`)
@@ -237,9 +271,9 @@ uniqueness, head dimension, context limit and sampling range.
 }
 ```
 
-The receipt binds `modelId` and `weightsHash`; `/v1/verify` regenerates the
-text and compares the output hash. Sampling configuration is part of the model
-file, so a verifier must load the same file.
+The receipt binds `modelId`, `weightsHash` and the effective `sampling`
+configuration; `/v1/verify` regenerates the text with the same sampling and
+compares the output hash. A verifier must load the same model file.
 
 ## Import or train
 
@@ -313,9 +347,10 @@ before using or redistributing any imported weights.
   foundation, not a service. There is no GPU executor, batching, streaming,
   safety layer, request queue or large-model (7B+) support, and DistilGPT-2 is
   not on the public node.
-- **Per-task generation controls.** Sampling is fixed in the model file. There
-  is no API override, stop sequence, repetition penalty or beam search, and
-  sampling config is not separately bound in the receipt.
+- **Per-task generation controls.** Temperature, top-k, top-p and seed can be
+  chosen per task and are bound in the receipt. There is no stop sequence,
+  repetition penalty or beam search, and sampling is only accepted for decoder
+  models.
 - **Arbitrary checkpoints.** The generic importer covers GPT-2/GPT-Neo shapes
   and the GPT-2 byte-BPE tokenizer, but there is no LLaMA/SentencePiece support,
   no rotary embeddings, no arbitrary tokenizer formats and no ONNX LLM import.

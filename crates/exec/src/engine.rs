@@ -10,6 +10,7 @@ use verinoo_state::models::{
 };
 use verinoo_state::StateStore;
 use verinoo_types::tx::TxEnvelope;
+use verinoo_types::SamplingSpec;
 
 use crate::gas;
 
@@ -17,6 +18,22 @@ pub fn sha256_hex(input: &str) -> String {
     let mut h = Sha256::new();
     h.update(input.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// Parse the optional `sampling` object from `submitInference` data. Shared by
+/// consensus execution and the node's submission boundary so both reject the
+/// same inputs.
+pub fn parse_sampling(value: Option<&serde_json::Value>) -> Result<Option<SamplingSpec>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let spec: SamplingSpec = serde_json::from_value(value.clone())
+                .map_err(|e| format!("malformed sampling: {e}"))?;
+            spec.validate()
+                .map_err(|e| format!("invalid sampling: {e}"))?;
+            Ok(Some(spec))
+        }
+    }
 }
 
 /// Ed25519 address: `ai_` + sha256(publicKey)[0..20] hex — mirrors reference.
@@ -488,6 +505,7 @@ pub fn execute_transaction(
                 tx.tx_id
             ))[..32]
                 .to_string();
+            let sampling = parse_sampling(data.get("sampling")).map_err(EngineError::Reverted)?;
             let plain_input = data["input"].as_str().unwrap_or("").to_string();
             let encrypted = data.get("encryptedInput").filter(|v| !v.is_null());
             if !plain_input.is_empty() && encrypted.is_some() {
@@ -547,6 +565,7 @@ pub fn execute_transaction(
                 encrypted_input,
                 max_fee: data["maxFee"].as_u64().unwrap_or(0),
                 deadline: data["deadline"].as_u64().unwrap_or(0),
+                sampling,
                 verification_type: data["verificationType"]
                     .as_str()
                     .unwrap_or("optimistic")
@@ -1113,13 +1132,78 @@ impl ExecModel {
 
     /// Canonical result bytes for an input.
     pub fn result_json(&self, input: &str) -> Result<String, String> {
+        self.result_json_with_sampling(input, None)
+    }
+
+    /// Canonical result bytes for an input, optionally using the task's
+    /// sampling override. Non-decoder models cannot sample, so a request that
+    /// carries one fails instead of silently producing a different result.
+    pub fn result_json_with_sampling(
+        &self,
+        input: &str,
+        sampling: Option<&SamplingSpec>,
+    ) -> Result<String, String> {
         match self {
-            ExecModel::Builtin => Ok(verinoo_model::result_json(input)),
-            ExecModel::Runtime(m) => Ok(m.result_json(input)),
-            ExecModel::Transformer(m) => m.result_json(input),
-            ExecModel::Decoder(m) => m.result_json(input),
+            ExecModel::Builtin => {
+                reject_sampling(self, sampling)?;
+                Ok(verinoo_model::result_json(input))
+            }
+            ExecModel::Runtime(m) => {
+                reject_sampling(self, sampling)?;
+                Ok(m.result_json(input))
+            }
+            ExecModel::Transformer(m) => {
+                reject_sampling(self, sampling)?;
+                m.result_json(input)
+            }
+            ExecModel::Decoder(m) => match sampling {
+                Some(spec) => {
+                    spec.validate()
+                        .map_err(|e| format!("invalid sampling: {e}"))?;
+                    m.result_json_with_sampling(input, &runtime_sampling(spec))
+                }
+                None => m.result_json(input),
+            },
         }
     }
+
+    pub fn supports_sampling(&self) -> bool {
+        matches!(self, ExecModel::Decoder(_))
+    }
+
+    /// The sampling object used for this task: the request override on a
+    /// decoder, or the decoder's model default. `None` for non-decoders.
+    pub fn effective_sampling_json(
+        &self,
+        sampling: Option<&SamplingSpec>,
+    ) -> Option<serde_json::Value> {
+        let ExecModel::Decoder(model) = self else {
+            return None;
+        };
+        match sampling {
+            Some(spec) => serde_json::to_value(spec).ok(),
+            None => serde_json::to_value(model.default_sampling()).ok(),
+        }
+    }
+}
+
+fn runtime_sampling(spec: &SamplingSpec) -> verinoo_runtime::gpt::Sampling {
+    verinoo_runtime::gpt::Sampling {
+        temperature_milli: spec.temperature_milli,
+        top_k: spec.top_k as usize,
+        top_p_milli: spec.top_p_milli,
+        seed: spec.seed,
+    }
+}
+
+fn reject_sampling(model: &ExecModel, sampling: Option<&SamplingSpec>) -> Result<(), String> {
+    if sampling.is_some() {
+        return Err(format!(
+            "model `{}` does not support per-task sampling",
+            model.model_id()
+        ));
+    }
+    Ok(())
 }
 
 /// Every model this node can execute, for `/v1/models`.
@@ -1167,6 +1251,14 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
         let Some(model) = ExecModel::resolve(&task.target_model) else {
             continue;
         };
+        if task.sampling.is_some() && !model.supports_sampling() {
+            let reason = format!(
+                "model `{}` does not support per-task sampling",
+                model.model_id()
+            );
+            fail_task(store, task, height, reason);
+            continue;
+        }
         // A matched task has already paid the requester at assignment time;
         // an unmatched one is settled here so the executor still gets its fee.
         let payee = match task.assigned_to.clone() {
@@ -1189,7 +1281,7 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
                 continue;
             }
         };
-        let output = match model.result_json(&plaintext) {
+        let output = match model.result_json_with_sampling(&plaintext, task.sampling.as_ref()) {
             Ok(output) => output,
             Err(e) => {
                 tracing::warn!(task = %task.task_id, error = %e, "model execution failed");
@@ -1219,6 +1311,28 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
     }
 }
 
+/// Permanently unexecutable task: mark it failed, release a matched executor
+/// and return its withheld fee instead of retrying every block forever.
+fn fail_task(store: &StateStore, mut task: InferenceTask, height: u64, reason: String) {
+    tracing::warn!(task = %task.task_id, error = %reason, "task failed during deterministic execution");
+    if let Some(node_id) = task.assigned_to.clone() {
+        let mut requester = store.account_or_default(&task.requester);
+        requester.balance += task.max_fee as i64;
+        requester.updated_at = height;
+        store.set_account(&requester);
+        if let Some(mut node) = store.get_node(&node_id) {
+            node.available_capacity += 1;
+            node.active_tasks = node.active_tasks.saturating_sub(1);
+            node.failed_inferences += 1;
+            store.set_node(&node);
+        }
+    }
+    task.status = "failed".into();
+    task.executed_at = height;
+    task.proof_data = Some(reason);
+    store.set_task(&task);
+}
+
 /// Anchor every task executed in this block to the block that carries it.
 /// The receipt is the block signature plus the recomputable output hash, so a
 /// third party can verify without trusting the operator's API.
@@ -1228,20 +1342,36 @@ pub fn stamp_receipts(store: &StateStore, block: &Block) {
     done.retain(|t| t.status == "completed" && t.executed_at == height);
     done.sort_by(|a, b| a.task_id.cmp(&b.task_id));
     for task in done {
-        let weights_hash = ExecModel::resolve(&task.target_model)
-            .map(|m| m.weights_hash())
-            .unwrap_or_default();
+        let model = ExecModel::resolve(&task.target_model);
+        let weights_hash = model.as_ref().map(|m| m.weights_hash()).unwrap_or_default();
         let input_hash = if task.input.is_empty() {
             task.input_commitment.clone()
         } else {
             verinoo_model::sha256_hex(&task.input)
         };
+        let sampling = model
+            .as_ref()
+            .and_then(|m| m.effective_sampling_json(task.sampling.as_ref()));
+        let sampling_hash = sampling
+            .as_ref()
+            .and_then(|value| verinoo_types::canonical::canonical_json(value).ok())
+            .map(|canonical| sha256_hex(&canonical));
+        let sampling_source = sampling.as_ref().map(|_| {
+            if task.sampling.is_some() {
+                "task"
+            } else {
+                "model-default"
+            }
+        });
         let receipt = json!({
             "taskId": task.task_id,
             "modelId": task.target_model,
             "weightsHash": weights_hash,
             "inputHash": input_hash,
             "outputHash": task.result_hash,
+            "sampling": sampling,
+            "samplingHash": sampling_hash,
+            "samplingSource": sampling_source,
             "height": height,
             "blockHash": block.header.hash,
             "validator": block.header.validator,

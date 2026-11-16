@@ -941,7 +941,18 @@ impl GptModel {
     }
 
     pub fn result_json(&self, prompt: &str) -> Result<String, String> {
-        let generated = self.generate_with_sampling(prompt, &self.spec.sampling)?;
+        self.result_json_with_sampling(prompt, &self.spec.sampling)
+    }
+
+    /// Canonical result bytes using an explicit sampling configuration. The
+    /// output shape is identical to `result_json`, so a per-task override only
+    /// changes the generated token ids.
+    pub fn result_json_with_sampling(
+        &self,
+        prompt: &str,
+        sampling: &Sampling,
+    ) -> Result<String, String> {
+        let generated = self.generate_with_sampling(prompt, sampling)?;
         Ok(serde_json::json!({
             "generatedText": generated.text,
             "prompt": generated.prompt,
@@ -951,6 +962,10 @@ impl GptModel {
             "weightsHash": self.weights_hash,
         })
         .to_string())
+    }
+
+    pub fn default_sampling(&self) -> &Sampling {
+        &self.spec.sampling
     }
 
     pub fn descriptor(&self) -> serde_json::Value {
@@ -1872,6 +1887,20 @@ mod tests {
         assert_eq!(a.generated_ids, b.generated_ids);
         assert_eq!(a.text, b.text);
         assert!(!a.generated_ids.is_empty());
+
+        let result_default = model.result_json("please cancel").unwrap();
+        let result_explicit_default = model
+            .result_json_with_sampling("please cancel", model.default_sampling())
+            .unwrap();
+        assert_eq!(result_default, result_explicit_default);
+
+        let result_a = model
+            .result_json_with_sampling("please cancel", &sampling)
+            .unwrap();
+        let result_b = model
+            .result_json_with_sampling("please cancel", &sampling)
+            .unwrap();
+        assert_eq!(result_a, result_b);
 
         let top_one = model
             .generate_with_sampling(

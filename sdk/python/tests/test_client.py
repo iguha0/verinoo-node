@@ -257,6 +257,52 @@ def test_infer_uses_legacy_input_when_node_has_no_key(monkeypatch):
     assert post["api_key"] == "tenant-key"
 
 
+def test_infer_sends_optional_per_task_sampling(monkeypatch):
+    client = Client(base_url="https://node.test")
+    wallet = load_wallet({"privateKey": SEED_B64})
+    calls = []
+
+    def fake_request(method, path, body=None, api_key=None, raw=False):
+        calls.append({"path": path, "body": body})
+        if path.startswith("/account/"):
+            return {"balance": 1_000_000, "nonce": 4}
+        if path == "/v1/input-key":
+            raise VerinooError(
+                'HTTP 404: {"error":"not found"}',
+                status=404,
+                body={"error": "not found"},
+            )
+        if path == "/v1/infer":
+            return {"accepted": True, "taskId": "task-1"}
+        raise AssertionError(f"unexpected {path}")
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    sampling = {
+        "temperatureMilli": 800,
+        "topK": 40,
+        "topPMilli": 900,
+        "seed": 7,
+    }
+    client.infer(
+        wallet,
+        "Once upon a time",
+        model="tiny-gpt-v1",
+        sampling=sampling,
+    )
+
+    post = next(call for call in calls if call["path"] == "/v1/infer")
+    assert post["body"]["data"]["data"]["sampling"] == sampling
+
+
+def test_inference_data_omits_sampling_when_not_supplied():
+    data = build_inference_data(
+        from_address=EXPECTED_ADDRESS,
+        input_text="hello world",
+        model="tiny-gpt-v1",
+    )
+    assert "sampling" not in data["data"]
+
+
 def test_infer_encrypts_when_network_key_is_advertised(monkeypatch):
     network = X25519PrivateKey.generate()
     network_public = network.public_key().public_bytes(

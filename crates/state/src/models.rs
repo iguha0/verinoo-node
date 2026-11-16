@@ -63,6 +63,10 @@ pub struct InferenceTask {
     #[serde(rename = "maxFee")]
     pub max_fee: u64,
     pub deadline: u64,
+    /// Per-task decoder sampling bound by the submission transaction. Absent
+    /// means the model's fixed default, so old tasks keep their behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<verinoo_types::SamplingSpec>,
     #[serde(rename = "verificationType", default = "default_verification_type")]
     pub verification_type: String,
     pub status: String,

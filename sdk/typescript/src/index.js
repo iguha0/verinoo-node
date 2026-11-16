@@ -331,6 +331,7 @@ export function buildInferenceData({
   deadline,
   encryptedInput = null,
   commitment = inputCommitment(input),
+  sampling = null,
 }) {
   const inner = {
     requester: from,
@@ -344,6 +345,9 @@ export function buildInferenceData({
     inner.encryptedInput = encryptedInput;
   } else {
     inner.input = input;
+  }
+  if (sampling != null) {
+    inner.sampling = sampling;
   }
   return { type: 'submitInference', data: inner };
 }
@@ -492,6 +496,7 @@ export class Client {
     encrypt = true,
     deadline,
     nonce,
+    sampling = null,
   } = {}) {
     if (typeof input !== 'string') {
       throw new TypeError('input must be a string');
@@ -530,6 +535,7 @@ export class Client {
       deadline: txDeadline,
       encryptedInput: encrypted,
       commitment,
+      sampling,
     });
     const envelope = buildSignedTx({
       signingKey: wallet.signingKey,

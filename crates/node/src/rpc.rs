@@ -516,6 +516,21 @@ async fn submit_tx(
         if has_encrypted && has_plain {
             return Err(bad("submit either input or encryptedInput, not both"));
         }
+        match verinoo_exec::engine::parse_sampling(tx.data.data.get("sampling")) {
+            Err(e) => return Err(bad(&e)),
+            Ok(Some(_)) => {
+                let target = tx.data.data["targetModel"].as_str().unwrap_or("");
+                if let Some(model) = verinoo_exec::engine::ExecModel::resolve(target) {
+                    if !model.supports_sampling() {
+                        return Err(bad(&format!(
+                            "model `{}` does not support per-task sampling",
+                            model.model_id()
+                        )));
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
         // Commitment-only submissions are allowed for the manual-claim path.
         if encrypted_input_required() && !has_encrypted {
             return Err(bad(
@@ -729,7 +744,7 @@ async fn v1_verify(
             })))
         }
     };
-    let recomputed = match model.result_json(&plaintext) {
+    let recomputed = match model.result_json_with_sampling(&plaintext, task.sampling.as_ref()) {
         Ok(output) => output,
         Err(reason) => {
             return Ok(Json(serde_json::json!({
@@ -755,6 +770,7 @@ async fn v1_verify(
         "output": recomputed,
         "modelId": model.model_id(),
         "weightsHash": model.weights_hash(),
+        "sampling": task.sampling,
         "receipt": receipt,
     })))
 }

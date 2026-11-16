@@ -305,6 +305,38 @@ test('infer sends legacy input when the node has no input key', async () => {
   assert.equal(post.init.headers.authorization, 'Bearer tenant-key');
 });
 
+test('infer sends optional per-task sampling', async () => {
+  const { calls, fetch } = fakeNode({ inputKey: null });
+  const client = new Client({ baseUrl: 'https://node.test', fetch });
+  const wallet = loadWallet({ privateKey: SEED.toString('base64') });
+  const sampling = {
+    temperatureMilli: 800,
+    topK: 40,
+    topPMilli: 900,
+    seed: 7,
+  };
+
+  await client.infer({
+    privateKey: wallet,
+    input: 'Once upon a time',
+    model: 'tiny-gpt-v1',
+    sampling,
+  });
+
+  const post = calls.find((call) => call.path === '/v1/infer');
+  const inner = JSON.parse(post.init.body).data.data;
+  assert.deepEqual(inner.sampling, sampling);
+});
+
+test('inference data omits sampling when it is not supplied', () => {
+  const data = buildInferenceData({
+    from: EXPECTED_ADDRESS,
+    input: 'hello world',
+    model: 'tiny-gpt-v1',
+  });
+  assert.equal('sampling' in data.data, false);
+});
+
 test('infer encrypts when a network key is advertised', async () => {
   const network = generateKeyPairSync('x25519');
   const networkPublic = Buffer.from(

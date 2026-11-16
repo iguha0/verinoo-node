@@ -6,7 +6,9 @@
 //! `crates/conformance/fixtures` pin this implementation byte-for-byte.
 
 pub mod canonical;
+pub mod sampling;
 pub mod tx;
 
 pub use canonical::{canonical_json, CanonicalError, UnsignedPayload};
+pub use sampling::SamplingSpec;
 pub use tx::{TxData, TxEnvelope, TxKind};

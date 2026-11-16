@@ -320,6 +320,7 @@ def build_inference_data(
     deadline: int = 0,
     encrypted_input: Optional[dict[str, str]] = None,
     commitment: Optional[str] = None,
+    sampling: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Assemble the ``submitInference`` TxData (encrypted or plaintext)."""
     inner: dict[str, Any] = {
@@ -336,6 +337,8 @@ def build_inference_data(
         inner["encryptedInput"] = encrypted_input
     else:
         inner["input"] = input_text
+    if sampling is not None:
+        inner["sampling"] = sampling
     return {"type": "submitInference", "data": inner}
 
 
@@ -532,6 +535,7 @@ class Client:
         encrypt: bool = True,
         deadline: Optional[int] = None,
         nonce: Optional[int] = None,
+        sampling: Optional[dict[str, Any]] = None,
     ) -> Any:
         """Sign and submit an inference transaction.
 
@@ -579,6 +583,7 @@ class Client:
             deadline=tx_deadline,
             encrypted_input=encrypted_input,
             commitment=commitment,
+            sampling=sampling,
         )
         envelope = build_signed_tx(
             signing_key=wallet.signing_key,
