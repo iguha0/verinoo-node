@@ -17,6 +17,7 @@ pub struct ReadinessInput {
     pub block_time_ms: u64,
     pub best_peer_height: Option<u64>,
     pub peer_lag_blocks: u64,
+    pub validator_set_consistent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +37,16 @@ impl Readiness {
 
 /// Apply the readiness rule with an already-measured head age.
 ///
-/// A node is ready when it has a head, is not applying catch-up blocks, the
-/// head is younger than three block intervals, and (when a peer height is
-/// known) it is within the configured lag tolerance of the best peer.
+/// A node is ready when it has a head, its state-derived validator set matches
+/// the configured set, is not applying catch-up blocks, the head is younger
+/// than three block intervals, and (when a peer height is known) it is within
+/// the configured lag tolerance of the best peer.
 pub fn evaluate(input: ReadinessInput) -> Readiness {
     if !input.serving {
         return Readiness::not_ready("no_head");
+    }
+    if !input.validator_set_consistent {
+        return Readiness::not_ready("validator_set_mismatch");
     }
     if input.syncing {
         return Readiness::not_ready("syncing");
@@ -69,15 +74,21 @@ pub fn canonical_validator_set(addresses: &[String]) -> Vec<String> {
     set
 }
 
-/// Lowercase hex SHA-256 over the canonical set joined with `\n`.
+/// Lowercase hex SHA-256 over the canonical JSON of the sorted address array.
 ///
 /// The digest covers addresses only, not public keys, stake, or registration
 /// height, so nodes with the same active addresses agree even if their local
-/// `val:` records differ. An empty set hashes the empty string.
+/// `val:` records differ. Canonical JSON is the compact serde encoding of the
+/// sorted, deduplicated `Vec<String>` (for example `["ai_a","ai_b"]`); an
+/// empty set hashes `[]`.
+///
+/// This is an observability hash. It is not part of the state root and does
+/// not make validator-set changes consensus state.
 pub fn validator_set_hash(addresses: &[String]) -> String {
     let canonical = canonical_validator_set(addresses);
+    let encoded = serde_json::to_vec(&canonical).expect("validator set is JSON-serializable");
     let mut hasher = Sha256::new();
-    hasher.update(canonical.join("\n").as_bytes());
+    hasher.update(&encoded);
     hex::encode(hasher.finalize())
 }
 
@@ -96,6 +107,7 @@ mod tests {
             block_time_ms: BLOCK_TIME_MS,
             best_peer_height: None,
             peer_lag_blocks: 2,
+            validator_set_consistent: true,
         }
     }
 
@@ -153,15 +165,24 @@ mod tests {
         );
         assert_eq!(
             validator_set_hash(&canonical),
-            "51601458f4bce4547570cc8bb3dc800150d0da61e558100097b69fd07c32b70a"
+            "613d100e31f0fdbd765986c9544186b43dd5b8652b1eafefc0ad545efb9d8ecb"
         );
     }
 
     #[test]
-    fn empty_validator_set_hashes_the_empty_string() {
+    fn empty_validator_set_hashes_the_empty_json_array() {
         assert_eq!(
             validator_set_hash(&[]),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
         );
+    }
+
+    #[test]
+    fn inconsistent_validator_set_is_not_ready() {
+        let mut decision_input = input(true, false, 0);
+        decision_input.validator_set_consistent = false;
+        let decision = evaluate(decision_input);
+        assert!(!decision.ready);
+        assert_eq!(decision.reason, Some("validator_set_mismatch"));
     }
 }

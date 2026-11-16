@@ -25,7 +25,23 @@ pub async fn serve(
     port: u16,
     auth: Auth,
 ) -> Result<(), String> {
-    let app = Router::new()
+    let app = app(shared, net, auth);
+
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    tracing::info!("rpc listening on {addr}");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+fn app(shared: Arc<Shared>, net: verinoo_network::NetworkNode, auth: Auth) -> Router {
+    Router::new()
         .route("/status", get(status))
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -50,19 +66,7 @@ pub async fn serve(
         .with_state(shared)
         .layer(Extension(net))
         .layer(Extension(auth))
-        .layer(Extension(KeyRateLimit::default()));
-
-    let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| e.to_string())?;
-    tracing::info!("rpc listening on {addr}");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| e.to_string())
+        .layer(Extension(KeyRateLimit::default()))
 }
 
 const KEY_RATE_LIMIT: usize = 5;
@@ -142,12 +146,17 @@ fn ready_report(
     peer_count: usize,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let head = shared.head();
-    let (serving, height, ts) = match &head {
-        Some(block) => (true, block.header.index, block.header.timestamp),
+    let (serving, height, head_age_ms) = match &head {
+        Some(block) => (
+            true,
+            block.header.index,
+            now_ms.saturating_sub(block.header.timestamp),
+        ),
+        // No head means no age to report, not "as old as the epoch".
         None => (false, 0, 0),
     };
-    let head_age_ms = now_ms.saturating_sub(ts);
     let syncing = shared.syncing.load(Ordering::Relaxed);
+    let validator_set_consistent = shared.validator_set_consistent();
     let decision = readiness::evaluate(ReadinessInput {
         serving,
         syncing,
@@ -156,6 +165,7 @@ fn ready_report(
         block_time_ms: shared.block_time_ms,
         best_peer_height: shared.best_peer_height(),
         peer_lag_blocks: shared.peer_lag_blocks,
+        validator_set_consistent,
     });
     let status = if decision.ready {
         StatusCode::OK
@@ -172,6 +182,7 @@ fn ready_report(
             "peerCount": peer_count,
             "syncing": syncing,
             "validatorSetHash": shared.validator_set_hash(),
+            "validatorSetConsistent": validator_set_consistent,
             "reason": decision.reason,
         })),
     )
@@ -230,6 +241,7 @@ async fn status(
         "peerCount": net.peer_count(),
         "syncing": shared.syncing.load(Ordering::Relaxed),
         "validatorSetHash": shared.validator_set_hash(),
+        "validatorSetConsistent": shared.validator_set_consistent(),
         "mempool": shared.mempool.lock().await.len(),
         "validators": shared.params.validators,
     }))
@@ -887,6 +899,7 @@ mod tests {
         assert_eq!(body.0["serving"], false);
         assert_eq!(body.0["height"], 0);
         assert_eq!(body.0["reason"], "no_head");
+        assert_eq!(body.0["headAgeMs"], 0);
         assert_eq!(body.0["peerCount"], 0);
     }
 
@@ -904,6 +917,7 @@ mod tests {
         assert_eq!(body.0["syncing"], false);
         assert_eq!(body.0["reason"], serde_json::Value::Null);
         assert_eq!(body.0["validatorSetHash"], shared.validator_set_hash());
+        assert_eq!(body.0["validatorSetConsistent"], true);
     }
 
     #[test]
@@ -927,6 +941,22 @@ mod tests {
         assert_eq!(body.0["ready"], false);
         assert_eq!(body.0["syncing"], true);
         assert_eq!(body.0["reason"], "syncing");
+    }
+
+    #[test]
+    fn ready_rejects_a_divergent_state_validator_set() {
+        let params = GenesisParams {
+            validators: vec!["ai_a".into()],
+            ..GenesisParams::default()
+        };
+        let shared = test_shared_with(params);
+        shared.store.seed_genesis_validators(&["ai_b".into()], 0);
+        set_test_head(&shared, 42, 1_000);
+        let (status, body) = ready_report(&shared, 1_100, 1);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["ready"], false);
+        assert_eq!(body.0["validatorSetConsistent"], false);
+        assert_eq!(body.0["reason"], "validator_set_mismatch");
     }
 
     #[test]
@@ -964,6 +994,50 @@ mod tests {
             shared.validator_set_hash(),
             crate::readiness::validator_set_hash(&["ai_a".into()])
         );
+        assert!(!shared.validator_set_consistent());
+    }
+
+    #[test]
+    fn best_peer_height_is_replaced_each_poll_not_retained_forever() {
+        let shared = test_shared();
+        shared.set_best_peer_height(Some(100));
+        assert_eq!(shared.best_peer_height(), Some(100));
+        shared.set_best_peer_height(Some(90));
+        assert_eq!(shared.best_peer_height(), Some(90));
+        shared.set_best_peer_height(None);
+        assert_eq!(shared.best_peer_height(), None);
+    }
+
+    #[tokio::test]
+    async fn ready_route_has_the_network_extension_and_returns_200_and_503() {
+        let shared = test_shared();
+        let (net, _events) =
+            verinoo_network::NetworkNode::new(0, [7u8; 32], &[], &shared.params.chain_id)
+                .await
+                .unwrap();
+        let app = app(shared.clone(), net, Auth::disabled());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let url = format!("http://{addr}/ready");
+        let response = reqwest::get(&url).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["reason"], "no_head");
+        assert_eq!(body["headAgeMs"], 0);
+
+        set_test_head(&shared, 42, shared.now_ms());
+        let response = reqwest::get(&url).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["peerCount"], 0);
+        assert_eq!(body["validatorSetConsistent"], true);
     }
 
     async fn call_issue(

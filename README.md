@@ -125,16 +125,20 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `VNN_INPUT_KEY` | *(none)* | network X25519 secret (64 hex); enables encrypted inputs |
 | `VNN_REQUIRE_ENCRYPTED_INPUT` | `false` | reject plaintext inference submissions |
 | `VNN_BLOCK_TIME_MS` | chain default (10 000) | block interval; identical on every validator |
+| `VNN_PEER_LAG_BLOCKS` | `2` | allowed lag behind the best valid sync peer before `/ready` fails |
 
 Catch-up: a node that starts late or falls behind replays validated blocks from
-`VNN_SYNC_URLS`. Proof: `./scripts/demo-sync.sh`.
+`VNN_SYNC_URLS`. Peer heights are only used when the peer reports the same
+`chainId`, and they are refreshed on every sync poll so a stale value cannot
+keep `/ready` failing. Proof: `./scripts/demo-sync.sh`.
 
 ## API
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | liveness + head age + validator count |
-| `GET /status` | chain id, height, head hash, mempool depth |
+| `GET /ready` | readiness probe: 200 only when fresh, caught up, and the validator set is consistent |
+| `GET /status` | chain id, height, head hash, mempool depth, validator-set consistency |
 | `GET /metrics` | height, head age, mempool, validator count |
 | `GET /blocks` | latest 20 blocks |
 | `GET /blocks/since/:index` | up to 200 blocks after `index` (catch-up sync) |

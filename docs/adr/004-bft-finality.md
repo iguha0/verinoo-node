@@ -284,9 +284,14 @@ no timers, and applies blocks only on a verified commit certificate.
 - For N=4, quorum=3: tolerates exactly one Byzantine **or** one crash fault,
   not both. This is the minimum configuration that supports the "one
   byzantine node" test and claim.
-- If nodes disagree on `VNN_VALIDATORS`, safety is undefined. Add
-  `validatorSetHash = sha256(canonical_json(sorted(addresses)))` to
-  `/status` and refuse to vote if a peer's value differs.
+- If nodes disagree on `VNN_VALIDATORS`, safety is undefined. `/status` and
+  `/ready` expose `validatorSetHash = sha256(canonical_json(sorted(addresses)))`
+  — SHA-256 over the compact JSON array of the sorted, deduplicated addresses,
+  not a newline-joined string — plus `validatorSetConsistent`, which compares
+  the state-derived set with the configured set. `/ready` fails closed with
+  `validator_set_mismatch` when they differ. This is an observability check,
+  not part of the state root and not a consensus set change; refusing to vote
+  on a mismatch remains future BFT work.
 
 ### Execution and state handling
 
@@ -551,7 +556,9 @@ signatures verify over exactly the bytes that were signed.
   and never advance the head without a certificate. Reset the consensus
   state machine to `finalized+1, round 0` after syncing.
 - Add a `VNN_CONSENSUS` mode switch (`legacy` default, `bft` opt-in) and a
-  startup check that `validatorSetHash` matches peers.
+  startup check that `validatorSetHash` matches peers. Until then, `/ready`
+  reports `validator_set_mismatch` but consensus still uses the configured
+  list.
 
 ### `crates/exec/src/engine.rs`
 
@@ -599,8 +606,8 @@ Add methods and keys:
 ### `crates/node/src/rpc.rs`
 
 - `/status` (lines 99-113): add `finalizedHeight`, `finalizedHash`,
-  `consensusRound`, and `validatorSetHash`. Keep `height` equal to the
-  finalized head in BFT mode.
+  `consensusRound`, `validatorSetHash`, and `validatorSetConsistent`. Keep
+  `height` equal to the finalized head in BFT mode.
 - Add `GET /finalized/since/:index` returning `{block, certificate}` pairs
   for sync. Keep `/blocks/since` as-is.
 - Add `GET /evidence` and `GET /evidence/:validator` for operations.

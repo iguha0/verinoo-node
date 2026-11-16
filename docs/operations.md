@@ -146,7 +146,9 @@ interval drives the `/ready` staleness threshold.
 when all of these hold:
 
 - `serving`: a head exists.
-- `syncing` is false: catch-up sync is not fetching or applying blocks.
+- `validatorSetConsistent`: the state-derived active validator set matches the
+  genesis/`VNN_VALIDATORS` set.
+- `syncing` is false: the node is not applying catch-up blocks.
 - `headAgeMs < 3 * blockTimeMs`, using `VNN_BLOCK_TIME_MS` or the genesis
   default.
 - When a peer height is known, `height + VNN_PEER_LAG_BLOCKS >= peerHeight`.
@@ -156,7 +158,8 @@ Otherwise it returns HTTP 503 with a stable `reason`:
 | `reason` | Meaning |
 |---|---|
 | `no_head` | The node has no head block yet. |
-| `syncing` | `sync_once` is running. |
+| `validator_set_mismatch` | The state-derived set differs from `VNN_VALIDATORS`. |
+| `syncing` | The node is applying catch-up blocks. |
 | `stale_head` | The head is at least three block intervals old. |
 | `behind_peer` | The node is more than `VNN_PEER_LAG_BLOCKS` behind the best peer. |
 
@@ -168,7 +171,8 @@ Otherwise it returns HTTP 503 with a stable `reason`:
   "headAgeMs": 4100,
   "peerCount": 2,
   "syncing": false,
-  "validatorSetHash": "51601458f4bce4547570cc8bb3dc800150d0da61e558100097b69fd07c32b70a",
+  "validatorSetHash": "613d100e31f0fdbd765986c9544186b43dd5b8652b1eafefc0ad545efb9d8ecb",
+  "validatorSetConsistent": true,
   "reason": "behind_peer"
 }
 ```
@@ -176,15 +180,28 @@ Otherwise it returns HTTP 503 with a stable `reason`:
 - `peerCount` is the live libp2p connection count (0 on an isolated or
   single-validator node).
 - Peer height comes from the `/status` response of the URLs in
-  `VNN_SYNC_URLS`. A node without `VNN_SYNC_URLS` (for example the live
-  single validator) has no peer height, so the `behind_peer` condition is
-  skipped rather than fabricated. The best height ever observed is retained.
-- `validatorSetHash` is lowercase hex SHA-256 over the active validator
-  addresses sorted, deduplicated, and joined with `\n`. It is derived from
-  `val:` state when non-empty, otherwise from the genesis/`VNN_VALIDATORS`
-  list. Addresses only; public keys and stake are not included. Compare it
-  across nodes to detect a set mismatch. `/status` exposes the same value and
-  `syncing` field alongside its existing fields.
+  `VNN_SYNC_URLS`. A peer is only used when its `chainId` matches this node.
+  The best height is recomputed on every sync poll (every 3 s) from the valid
+  peers that respond; if none respond it is cleared. A stale or wrong-chain
+  height therefore cannot keep `/ready` in `behind_peer` indefinitely. A node
+  without `VNN_SYNC_URLS` (for example the live single validator) has no peer
+  height, so the `behind_peer` condition is skipped rather than fabricated.
+- `syncing` is true only while replayed catch-up blocks are being applied. The
+  routine `/status` poll and block fetch do not set it. The sync HTTP client
+  has a 2 s connect timeout, 5 s read timeout, and 5 s total request timeout,
+  so a silent peer cannot hold the sync loop open.
+- `validatorSetHash` is lowercase hex SHA-256 over the canonical JSON of the
+  active validator addresses sorted and deduplicated (for example
+  `["ai_a","ai_b"]`, not newline-joined). It is derived from `val:` state when
+  non-empty, otherwise from the genesis/`VNN_VALIDATORS` list. Addresses only;
+  public keys and stake are not included. This is an observability hash: it is
+  not part of the state root and does not make set changes consensus state.
+- `validatorSetConsistent` is false when the state-derived set differs from the
+  configured set. `/ready` fails closed with `validator_set_mismatch`; the node
+  does not change consensus membership or rewrite state to "fix" it. Compare
+  the value across nodes and fix `VNN_VALIDATORS` or the database.
+- `/status` exposes the same `syncing`, `validatorSetHash`, and
+  `validatorSetConsistent` values alongside its existing fields.
 - `GET /health` remains a liveness probe: `ok` only means a head exists. Do not
   route traffic on `ok` alone.
 - `deploy/nginx-verinoo.conf` proxies `/ready`; add the same `location` to the
@@ -229,8 +246,8 @@ VNN_API_KEYS_FILE=/etc/verinoo/api-keys.json
 
 The replica validates every replayed block and refuses a divergent state root.
 Point a load balancer health check at `GET /ready` and send reads only to a node
-that returns 200. A replica returns 503 while it is syncing, stale, or behind
-the best peer. Promotion is manual: stop the old validator, start the replica
+that returns 200. A replica returns 503 while it is syncing, stale, behind the
+best peer, or has a divergent validator set. Promotion is manual: stop the old validator, start the replica
 with the validator seed and `VNN_VALIDATOR=true`, and update `VNN_SYNC_URLS` on
 the other nodes. There is no automatic failover and no split-brain protection.
 
@@ -240,7 +257,7 @@ the other nodes. There is no automatic failover and no split-brain protection.
 |---|---|---|
 | readiness | `GET /ready` | HTTP 503 or a non-null `reason` |
 | liveness | `GET /health` (`ok`, `height`, `headAgeMs`) | `ok=false` |
-| chain | `GET /status` (`height`, `syncing`, `validatorSetHash`) | height not advancing, unexpected `syncing`, or hash differs across nodes |
+| chain | `GET /status` (`height`, `syncing`, `validatorSetHash`, `validatorSetConsistent`) | height not advancing, unexpected `syncing`, hash differs across nodes, or `validatorSetConsistent=false` |
 | mempool | `GET /metrics` | sustained growth |
 | service | `systemctl status verinoo-node` | restarts |
 | disk | `df -h /var/lib/verinoo` | < 20% free |

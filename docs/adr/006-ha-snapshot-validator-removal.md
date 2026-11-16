@@ -3,14 +3,14 @@
 ## Status
 
 **Partially implemented — readiness observability only.** `GET /ready`, the
-`syncing` flag, `peerCount`, and `validatorSetHash` are implemented as described
-in "API failover, health checks, DNS, and load balancer". The rest of this
-document remains a target design: no code in this repository implements
-automatic failover, split-brain protection, state snapshot transfer, or a
-consensus validator-set change. Do not cite anything else here as shipped
-behavior.
+`syncing` flag, `peerCount`, `validatorSetHash`, and `validatorSetConsistent`
+are implemented as described in "API failover, health checks, DNS, and load
+balancer". The rest of this document remains a target design: no code in this
+repository implements automatic failover, split-brain protection, state
+snapshot transfer, or a consensus validator-set change. Do not cite anything
+else here as shipped behavior.
 
-Date: 2026-11-15 (readiness surface implemented 2026-11-15)
+Date: 2026-11-15 (readiness surface implemented 2026-11-15; hardened 2026-11-16)
 Scope: `crates/node`, `crates/state`, `crates/exec`, `crates/network`,
 `scripts/`, and operations documentation.
 
@@ -157,26 +157,44 @@ stop/start with a fencing requirement.
 ### API failover, health checks, DNS, and load balancer
 
 - `GET /ready` (`crates/node/src/rpc.rs`) is the readiness surface. It returns
-  200 only when a head exists (`serving`), `sync_once` is not running
-  (`syncing == false`), `headAgeMs < 3 * block_time_ms`, and the local height is
-  within `VNN_PEER_LAG_BLOCKS` of the best peer height observed through
-  `VNN_SYNC_URLS`. It returns 503 with a stable `reason`: `no_head`, `syncing`,
+  200 only when a head exists (`serving`), the state-derived validator set
+  matches the configured set (`validatorSetConsistent`), the node is not
+  applying catch-up blocks (`syncing == false`), `headAgeMs < 3 *
+  block_time_ms`, and the local height is within `VNN_PEER_LAG_BLOCKS` of the
+  best peer height observed through `VNN_SYNC_URLS`. It returns 503 with a
+  stable `reason`: `no_head`, `validator_set_mismatch`, `syncing`,
   `stale_head`, or `behind_peer`. The response also includes `height`,
   `headAgeMs`, `peerCount` (live libp2p connections), `syncing`,
-  `validatorSetHash`, and `reason` (null when ready).
-- Peer height is only available when catch-up sync is configured. A node with
-  no `VNN_SYNC_URLS` (for example the live single validator) has no peer height,
-  so the `behind_peer` condition is skipped rather than fabricated. `peerCount`
-  is always the real connection count, including 0 when isolated.
+  `validatorSetHash`, `validatorSetConsistent`, and `reason` (null when ready).
+  With no head, `headAgeMs` is 0 rather than the current epoch time.
+- Peer height is only available when catch-up sync is configured. Each poll
+  accepts a peer's height only after its `/status` reports this node's
+  `chainId`, and replaces the stored best height with the maximum from the
+  valid peers that responded (clearing it when none did). A wrong-chain or
+  vanished peer therefore cannot pin `/ready` in `behind_peer` forever. A node
+  with no `VNN_SYNC_URLS` (for example the live single validator) has no peer
+  height, so the `behind_peer` condition is skipped rather than fabricated.
+  `peerCount` is always the real connection count, including 0 when isolated.
+- `syncing` is set only while replayed catch-up blocks are being applied, not
+  during the routine `/status` poll or block fetch. The sync HTTP client uses a
+  2 s connect timeout, 5 s read timeout, and 5 s total request timeout, so a
+  silent peer cannot hold the loop open indefinitely.
 - `GET /health` remains liveness only: `ok: head.is_some()` with `height` and
   `headAgeMs`. A lagging replica with an old head still returns `ok: true`, so
   a load balancer must use `/ready`, not `ok` alone.
-- `validatorSetHash` is lowercase hex SHA-256 over the active validator
-  addresses sorted, deduplicated, and joined with `\n`. It comes from `val:`
-  state when non-empty, otherwise from the genesis/`VNN_VALIDATORS` list. It
-  covers addresses only, not keys or stake, and never panics on an empty set.
-  `/status` exposes the same `syncing` and `validatorSetHash` values alongside
-  its existing fields. `finalizedHeight` still waits on ADR 004.
+- `validatorSetHash` is lowercase hex SHA-256 over the canonical JSON of the
+  active validator addresses sorted and deduplicated (a JSON array such as
+  `["ai_a","ai_b"]`, not newline-joined). It comes from `val:` state when
+  non-empty, otherwise from the genesis/`VNN_VALIDATORS` list. It covers
+  addresses only, not keys or stake, and never panics on an empty set. This is
+  an observability hash: it is not part of `compute_state_root` and does not
+  make set changes consensus state.
+- `validatorSetConsistent` compares the state-derived set with the configured
+  set and fails closed: `/ready` returns 503 `validator_set_mismatch` when they
+  differ. It does not rewrite state or change consensus membership.
+  `/status` exposes the same `syncing`, `validatorSetHash`, and
+  `validatorSetConsistent` values alongside its existing fields.
+  `finalizedHeight` still waits on ADR 004.
 - API failover: DNS name or load balancer in front of the API ports. Use
   active/passive for writes that depend on a specific validator (there are
   none today: `POST /tx` and `/v1/infer` just gossip transactions) and
@@ -222,7 +240,7 @@ snapshot-<height>/
   "commitCertificate": null,
   "modelSetHash": "<runtime + transformer + gpt + builtin weights>",
   "modelHashes": { "<modelId>": "<weightsHash>" },
-  "validatorSetHash": "<sha256 of canonical sorted validator set>",
+  "validatorSetHash": "<sha256 of canonical JSON sorted address array>",
   "validatorSet": [
     { "address": "ai_...", "publicKey": "<hex or empty>",
       "stakedAmount": 0, "genesis": true, "activationHeight": 0 }
@@ -475,11 +493,13 @@ restart toggle:
 
 Do the prerequisites before the visible features:
 
-1. **State-root coverage and set hash (1 wk).** `validatorSetHash` is now
-   exposed on `/status` and `/ready` (addresses only), but `val:` and `meta:`
-   set parameters are not yet in `compute_state_root`, and the node does not
-   refuse to run with a mismatched set. This coverage is a prerequisite for
-   on-chain removal and for BFT.
+1. **State-root coverage and set hash (1 wk).** `validatorSetHash` and
+   `validatorSetConsistent` are now exposed on `/status` and `/ready` (addresses
+   only), and `/ready` fails closed on a mismatch. But `val:` and `meta:` set
+   parameters are not yet in `compute_state_root`, and consensus membership is
+   still the configured list, so the node does not refuse to run with a
+   mismatched set. This coverage is a prerequisite for on-chain removal and for
+   BFT.
 2. **Snapshot format, manifest, and verifier (1-2 wk).** Add
    `StateStore::checkpoint_to`, a manifest builder/signer, a download/verify/
    apply tool, and tests. Do not serve snapshots until the verifier rejects
@@ -583,8 +603,10 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
 
 ## Non-claims
 
-- **Readiness only.** `/ready`, `syncing`, `peerCount`, and `validatorSetHash`
-  are implemented as observability. They do not elect a leader, fence a host,
+- **Readiness only.** `/ready`, `syncing`, `peerCount`, `validatorSetHash`, and
+  `validatorSetConsistent` are implemented as observability. A mismatch makes
+  `/ready` return 503, but the node still runs and consensus membership remains
+  the configured list. These signals do not elect a leader, fence a host,
   transfer state, or change consensus membership.
 - **Not implemented.** There is no automatic failover, leader lease, fencing
   primitive, snapshot endpoint, snapshot verifier, epoch activation,

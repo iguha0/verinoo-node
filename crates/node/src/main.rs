@@ -121,20 +121,44 @@ impl Shared {
             .unwrap()
             .as_millis() as u64
     }
+    /// Genesis/configured validator set, canonicalised.
+    pub fn configured_validator_set(&self) -> Vec<String> {
+        readiness::canonical_validator_set(&self.params.validators)
+    }
+    /// State-derived active validator set, canonicalised.
+    pub fn state_validator_set(&self) -> Vec<String> {
+        readiness::canonical_validator_set(&self.store.validator_addresses())
+    }
     /// Active set from state, falling back to the genesis/configured list when
     /// state has no `val:` entries.
-    pub fn validator_set_hash(&self) -> String {
-        let mut addresses = self.store.validator_addresses();
+    pub fn effective_validator_set(&self) -> Vec<String> {
+        let addresses = self.state_validator_set();
         if addresses.is_empty() {
-            addresses = self.params.validators.clone();
+            self.configured_validator_set()
+        } else {
+            addresses
         }
-        readiness::validator_set_hash(&addresses)
+    }
+    /// Fail-closed comparison of the state-derived set with the configured set.
+    /// An unseeded state only matches an empty configured set.
+    pub fn validator_set_consistent(&self) -> bool {
+        self.state_validator_set() == self.configured_validator_set()
+    }
+    /// Observability hash of the effective active set (not part of the state root).
+    pub fn validator_set_hash(&self) -> String {
+        readiness::validator_set_hash(&self.effective_validator_set())
     }
     pub fn best_peer_height(&self) -> Option<u64> {
         match self.best_peer_height.load(Ordering::Relaxed) {
             0 => None,
             height => Some(height),
         }
+    }
+    /// Replace the best peer height with this poll's result. `None` clears it,
+    /// so a peer that disappears cannot poison readiness indefinitely.
+    pub fn set_best_peer_height(&self, height: Option<u64>) {
+        self.best_peer_height
+            .store(height.unwrap_or(0), Ordering::Relaxed);
     }
 }
 
@@ -689,18 +713,51 @@ fn backfill_height_index(store: &verinoo_state::StateStore) {
     }
 }
 
+/// A silent peer must not hold a request forever: bound connection setup,
+/// per-read waits and the whole request.
+const SYNC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const SYNC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SYNC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct SyncReport {
+    applied: usize,
+    peer_height: Option<u64>,
+}
+
 async fn sync_loop(shared: Arc<Shared>, urls: Vec<String>) {
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder()
+        .connect_timeout(SYNC_CONNECT_TIMEOUT)
+        .read_timeout(SYNC_READ_TIMEOUT)
+        .timeout(SYNC_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("catch-up sync client failed: {e}");
+            return;
+        }
+    };
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3));
     loop {
         ticker.tick().await;
+        let mut best_peer_height = None;
         for url in &urls {
             match sync_once(&shared, &client, url).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("synced {n} block(s) from {url}"),
+                Ok(report) => {
+                    if let Some(height) = report.peer_height {
+                        best_peer_height =
+                            Some(best_peer_height.map_or(height, |best: u64| best.max(height)));
+                    }
+                    if report.applied > 0 {
+                        tracing::info!("synced {} block(s) from {url}", report.applied);
+                    }
+                }
                 Err(e) => tracing::debug!("sync from {url} failed: {e}"),
             }
         }
+        // Refresh (not fetch_max) so a stale or wrong-chain height cannot make
+        // /ready report behind_peer forever.
+        shared.set_best_peer_height(best_peer_height);
     }
 }
 
@@ -720,9 +777,14 @@ impl Drop for SyncingGuard<'_> {
     }
 }
 
-async fn sync_once(shared: &Shared, client: &reqwest::Client, base: &str) -> Result<usize, String> {
-    let _syncing = SyncingGuard::enter(&shared.syncing);
+async fn sync_once(
+    shared: &Shared,
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<SyncReport, String> {
     let base = base.trim_end_matches('/');
+    // The routine peer-height poll is not "syncing": /ready must stay 200 while
+    // this request is in flight, and the client timeouts bound it.
     let status: serde_json::Value = client
         .get(format!("{base}/status"))
         .send()
@@ -731,16 +793,30 @@ async fn sync_once(shared: &Shared, client: &reqwest::Client, base: &str) -> Res
         .json()
         .await
         .map_err(|e| e.to_string())?;
+    let peer_chain_id = status["chainId"]
+        .as_str()
+        .ok_or_else(|| "peer /status is missing chainId".to_string())?;
+    if peer_chain_id != shared.params.chain_id {
+        return Err(format!(
+            "peer chainId mismatch: expected {}, got {peer_chain_id}",
+            shared.params.chain_id
+        ));
+    }
     let peer_height = match status["height"].as_u64() {
-        Some(height) => {
-            shared.best_peer_height.fetch_max(height, Ordering::Relaxed);
-            height
+        Some(height) => height,
+        None => {
+            return Ok(SyncReport {
+                applied: 0,
+                peer_height: None,
+            })
         }
-        None => 0,
     };
     let our_height = shared.head().map(|b| b.header.index).unwrap_or(0);
     if peer_height <= our_height {
-        return Ok(0);
+        return Ok(SyncReport {
+            applied: 0,
+            peer_height: Some(peer_height),
+        });
     }
     let blocks: Vec<Block> = client
         .get(format!("{base}/blocks/since/{our_height}"))
@@ -751,24 +827,31 @@ async fn sync_once(shared: &Shared, client: &reqwest::Client, base: &str) -> Res
         .await
         .map_err(|e| e.to_string())?;
     let mut applied = 0usize;
-    for block in blocks {
-        let _guard = shared.chain_lock.lock().await;
-        let current = shared.head().map(|b| b.header.index).unwrap_or(0);
-        if block.header.index != current + 1 {
-            break;
+    {
+        // Only block application is catch-up work; the polls above are routine.
+        let _syncing = SyncingGuard::enter(&shared.syncing);
+        for block in blocks {
+            let _guard = shared.chain_lock.lock().await;
+            let current = shared.head().map(|b| b.header.index).unwrap_or(0);
+            if block.header.index != current + 1 {
+                break;
+            }
+            admit_block(shared, &block)?;
+            let producer = block.header.validator.clone();
+            commit_block(shared, &block, &producer);
+            if shared.head().map(|b| b.header.index) != Some(block.header.index) {
+                return Err(format!(
+                    "block #{} did not advance head (state root or model set mismatch?)",
+                    block.header.index
+                ));
+            }
+            applied += 1;
         }
-        admit_block(shared, &block)?;
-        let producer = block.header.validator.clone();
-        commit_block(shared, &block, &producer);
-        if shared.head().map(|b| b.header.index) != Some(block.header.index) {
-            return Err(format!(
-                "block #{} did not advance head (state root or model set mismatch?)",
-                block.header.index
-            ));
-        }
-        applied += 1;
     }
-    Ok(applied)
+    Ok(SyncReport {
+        applied,
+        peer_height: Some(peer_height),
+    })
 }
 
 /// `verinoo-node address --seed <string>` — the validator address a node with

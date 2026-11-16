@@ -25,7 +25,7 @@ claims a technical buyer will test in the first diligence call.
 | Canonical tx-id binding | works | conformance vectors |
 | Gas market / base fee | works | EIP-1559-style adjustment, tested |
 | P2P block + tx gossip | works | 2-node testnet converges, blocks every 10 s |
-| RPC read surface | works | `/status`, `/metrics`, `/blocks`, `/account`, `/validators` |
+| RPC read surface | works | `/status`, `/ready`, `/metrics`, `/blocks`, `/account`, `/validators` |
 | Wallet CLI | works | generate / balance / send |
 | Validator set | works | genesis-seeded, round-robin leader schedule |
 | Inference execution | works | consensus-level, `exec/tests/inference.rs` |
@@ -78,6 +78,8 @@ claims a technical buyer will test in the first diligence call.
    replica and an incident runbook now exist ([`docs/operations.md`](operations.md)),
    but there is no automatic failover, no split-brain protection and no way to
    remove a validator from the active set without a coordinated re-genesis.
+   `/ready` exposes lag, sync activity and validator-set consistency for a load
+   balancer; it does not fence a host or promote a replica.
 6. **No state snapshot transfer.** Catch-up replays blocks from the caller's
    height; a node far behind replays from genesis, which is O(chain length).
    There is no snapshot download yet.
@@ -125,6 +127,13 @@ claims a technical buyer will test in the first diligence call.
 - Catch-up sync: `GET /blocks/since/:index` plus `VNN_SYNC_URLS`. A late
   replica replays blocks through the same validation and state-root check;
   `scripts/demo-sync.sh` proves a three-block catch-up.
+- `/ready` hardening: catch-up HTTP has 2 s connect / 5 s read / 5 s total
+  timeouts, `syncing` is set only while replayed blocks are applied, peer
+  heights are accepted only from peers with a matching `chainId` and are
+  refreshed on every poll, and `validatorSetConsistent` fails closed with
+  `validator_set_mismatch` when state disagrees with `VNN_VALIDATORS`. The
+  validator-set hash is SHA-256 over canonical JSON of the sorted address
+  array; it is an observability value, not part of the state root.
 - `scripts/backup.sh` takes a consistent stopped-service backup, and
   [`docs/operations.md`](operations.md) covers restore, API-key rotation,
   validator-key rotation, a catch-up replica/HA recipe, monitoring and
