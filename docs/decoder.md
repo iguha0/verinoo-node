@@ -130,18 +130,23 @@ The file layout is:
 
 Tensors are stored in the same order as the JSON fields: embedding,
 positional, then each decoder layer (layernorm, Q/K/V/O, FFN), then the final
-layernorm and optional untied head. The loader verifies the magic, version,
-length, payload hash and declared `weightsSha256` before using any tensor; a
-single tampered byte is rejected. A model may use either inline tensors or
-`weightsFile`, not both.
+layernorm and optional untied head. `weightsSha256` is mandatory when
+`weightsFile` is set. The loader verifies the magic, version, length, payload
+hash and declared `weightsSha256` before using any tensor; a single tampered
+byte is rejected. A model may use either inline tensors or `weightsFile`, not
+both: any non-empty inline tensor field is rejected.
 
 Binary payloads are memory-mapped and the tensors borrow from the mapping, so
 loading DistilGPT-2 does not copy the 328 MB payload into `Vec<i32>`. The
 loader still verifies the magic, version, length and both hashes before any
 tensor is used. Mapped tensors require a 4-byte-aligned payload and a
 little-endian host; if either check fails, the loader falls back to an owned
-copy instead of reinterpreting the bytes unsafely. The mapping is read-only,
-and model files must not be modified while a node is running.
+copy instead of reinterpreting the bytes unsafely. If the platform cannot map
+the file at all, the loader reads it into an owned buffer and performs the same
+header and hash checks. The mapping is read-only, and model files must not be
+modified in place while a node is running. Writes go to a temporary file in the
+same directory, are fsynced, and are renamed into place so replacing a weight
+file does not truncate a live mapping.
 
 ## Tokenizers
 
@@ -210,7 +215,7 @@ execution or an optimistic-execution path is required before serving it.
 | `prependBos` | whether to prepend `bosId` |
 | `bosId`, `eosId`, `padId`, `unkId` | special token ids |
 | `sampling` | temperature, top-k, top-p and seed |
-| `weightsFile`, `weightsSha256` | optional binary tensor file and its payload hash |
+| `weightsFile`, `weightsSha256` | optional binary tensor file and its required payload hash |
 | `embedding`, `positional` | Q16.16 token and position embeddings (inline mode) |
 | `decoder[]` | per layer: layernorm, Q/K/V/O, FFN |
 | `lnfGamma`, `lnfBeta` | final layernorm |

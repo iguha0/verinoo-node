@@ -555,18 +555,24 @@ impl GptModel {
         if spec.weights_file.is_empty() {
             return Self::from_owned_spec(spec);
         }
-        if !spec.embedding.is_empty()
-            || !spec.positional.is_empty()
-            || spec.decoder.iter().any(|layer| !layer.q_weights.is_empty())
-        {
-            return Err("weightsFile is set but the JSON also contains weight arrays".into());
+        if spec.weights_sha256.is_empty() {
+            return Err(format!(
+                "{}: weightsFile is set but weightsSha256 is missing",
+                path.display()
+            ));
+        }
+        if has_inline_weights(&spec) {
+            return Err(format!(
+                "{}: weightsFile is set but the JSON also contains inline weight arrays",
+                path.display()
+            ));
         }
         let metadata =
             serde_json::to_string(&spec).map_err(|e| format!("cannot hash model metadata: {e}"))?;
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let weights_path = dir.join(&spec.weights_file);
         let loaded = crate::weights::load(&weights_path)?;
-        if !spec.weights_sha256.is_empty() && spec.weights_sha256 != loaded.sha256 {
+        if spec.weights_sha256 != loaded.sha256 {
             return Err(format!(
                 "{}: weightsSha256 does not match the binary payload",
                 path.display()
@@ -1203,6 +1209,33 @@ fn clear_spec_weights(spec: &mut GptSpec) {
     spec.head_bias = Vec::new();
 }
 
+fn has_inline_weights(spec: &GptSpec) -> bool {
+    !spec.embedding.is_empty()
+        || !spec.positional.is_empty()
+        || !spec.lnf_gamma.is_empty()
+        || !spec.lnf_beta.is_empty()
+        || !spec.head_weights.is_empty()
+        || !spec.head_bias.is_empty()
+        || spec.decoder.iter().any(|layer| {
+            !layer.ln1_gamma.is_empty()
+                || !layer.ln1_beta.is_empty()
+                || !layer.q_weights.is_empty()
+                || !layer.q_bias.is_empty()
+                || !layer.k_weights.is_empty()
+                || !layer.k_bias.is_empty()
+                || !layer.v_weights.is_empty()
+                || !layer.v_bias.is_empty()
+                || !layer.o_weights.is_empty()
+                || !layer.o_bias.is_empty()
+                || !layer.ln2_gamma.is_empty()
+                || !layer.ln2_beta.is_empty()
+                || !layer.ff1_weights.is_empty()
+                || !layer.ff1_bias.is_empty()
+                || !layer.ff2_weights.is_empty()
+                || !layer.ff2_bias.is_empty()
+        })
+}
+
 fn validate_spec(spec: &GptSpec) -> Result<(), String> {
     validate_metadata(spec)?;
     let h = spec.hidden;
@@ -1737,12 +1770,74 @@ mod tests {
         assert_eq!(a.generated_ids, b.generated_ids);
         assert_eq!(a.text, b.text);
 
+        drop(loaded);
         let mut bytes = std::fs::read(&fixture.weights).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         std::fs::write(&fixture.weights, &bytes).unwrap();
         let err = GptModel::from_file(&fixture.metadata).unwrap_err();
         assert!(err.contains("hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn binary_metadata_requires_a_declared_sha256() {
+        let fixture = binary_fixture("missing-sha");
+        let bytes = std::fs::read(&fixture.metadata).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["weightsSha256"] = serde_json::json!("");
+        std::fs::write(&fixture.metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+        let err = GptModel::from_file(&fixture.metadata).unwrap_err();
+        assert!(err.contains("weightsSha256"), "{err}");
+    }
+
+    #[test]
+    fn binary_metadata_rejects_inline_weights_in_any_field() {
+        let fixture = binary_fixture("inline-fields");
+        let bytes = std::fs::read(&fixture.metadata).unwrap();
+        let base: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let mut cases = Vec::new();
+        for field in [
+            "embedding",
+            "positional",
+            "lnfGamma",
+            "lnfBeta",
+            "headWeights",
+            "headBias",
+        ] {
+            cases.push((field.to_string(), None));
+        }
+        for field in [
+            "ln1Gamma",
+            "ln1Beta",
+            "qWeights",
+            "qBias",
+            "kWeights",
+            "kBias",
+            "vWeights",
+            "vBias",
+            "oWeights",
+            "oBias",
+            "ln2Gamma",
+            "ln2Beta",
+            "ff1Weights",
+            "ff1Bias",
+            "ff2Weights",
+            "ff2Bias",
+        ] {
+            cases.push((format!("decoder[0].{field}"), Some(field)));
+        }
+
+        for (label, layer_field) in cases {
+            let mut value = base.clone();
+            match layer_field {
+                Some(field) => value["decoder"][0][field] = serde_json::json!([0]),
+                None => value[label.as_str()] = serde_json::json!([0]),
+            }
+            std::fs::write(&fixture.metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+            let err = GptModel::from_file(&fixture.metadata).unwrap_err();
+            assert!(err.contains("inline weight arrays"), "{label}: {err}");
+        }
     }
 
     #[test]

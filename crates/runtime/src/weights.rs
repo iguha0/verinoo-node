@@ -22,12 +22,17 @@
 
 use memmap2::Mmap;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 4] = b"VNNW";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 4 + 4 + 8 + 32;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn payload_sha256(weights: &[i32]) -> String {
     let mut h = Sha256::new();
@@ -49,8 +54,38 @@ pub fn write(path: &Path, weights: &[i32]) -> Result<String, String> {
     bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&digest);
     bytes.extend_from_slice(&payload);
-    std::fs::write(path, &bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    write_atomic(path, &bytes)?;
     Ok(hex::encode(digest))
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temp = temp_path(path);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|e| format!("writing {}: {e}", temp.display()))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("writing {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("syncing {}: {e}", temp.display()))?;
+        drop(file);
+        std::fs::rename(&temp, path).map_err(|e| format!("replacing {}: {e}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "weights".into());
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.tmp-{}-{counter}", std::process::id()))
 }
 
 /// Tensor storage for a model: an owned flat buffer for inline JSON, or a
@@ -126,9 +161,10 @@ pub struct LoadedWeights {
 }
 
 /// Map and verify a weight file. The mapping is preferred; an owned copy is
-/// returned on big-endian hosts or if the payload alignment is unsuitable.
+/// returned on big-endian hosts, if the payload alignment is unsuitable, or if
+/// the platform cannot map the file at all.
 pub fn load(path: &Path) -> Result<LoadedWeights, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let file = File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let file_len = file
         .metadata()
         .map_err(|e| format!("reading {}: {e}", path.display()))?
@@ -144,15 +180,42 @@ pub fn load(path: &Path) -> Result<LoadedWeights, String> {
     // SAFETY: The mapping is read-only and is not exposed beyond this module
     // except as `&[i32]`. Operators are expected to keep model files immutable
     // while a node is running.
-    let mmap =
-        unsafe { Mmap::map(&file) }.map_err(|e| format!("mapping {}: {e}", path.display()))?;
-    if mmap.len() < HEADER_LEN {
+    match unsafe { Mmap::map(&file) } {
+        Ok(mmap) => {
+            let (payload_len, sha256) = verify(&mmap, path)?;
+            let aligned =
+                (mmap.as_ptr() as usize + HEADER_LEN).is_multiple_of(std::mem::align_of::<i32>());
+            let weights = if cfg!(target_endian = "little") && aligned {
+                WeightsData::mapped(Arc::new(mmap), HEADER_LEN, payload_len / 4)
+            } else {
+                owned_from_payload(&mmap[HEADER_LEN..])
+            };
+            Ok(LoadedWeights { weights, sha256 })
+        }
+        Err(map_error) => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                format!(
+                    "mapping {}: {map_error}; reading {}: {e}",
+                    path.display(),
+                    path.display()
+                )
+            })?;
+            let (_, sha256) = verify(&bytes, path)?;
+            Ok(LoadedWeights {
+                weights: owned_from_payload(&bytes[HEADER_LEN..]),
+                sha256,
+            })
+        }
+    }
+}
+
+fn verify(bytes: &[u8], path: &Path) -> Result<(usize, String), String> {
+    if bytes.len() < HEADER_LEN {
         return Err(format!(
             "{}: not a Verinoo weight file (expected magic VNNW)",
             path.display()
         ));
     }
-    let bytes = &mmap[..];
     if &bytes[0..4] != MAGIC {
         return Err(format!(
             "{}: not a Verinoo weight file (expected magic VNNW)",
@@ -178,31 +241,31 @@ pub fn load(path: &Path) -> Result<LoadedWeights, String> {
             payload.len()
         ));
     }
+    if payload.is_empty() {
+        return Err(format!(
+            "{}: weight file has an empty payload",
+            path.display()
+        ));
+    }
     let digest = Sha256::digest(payload);
     if hex::encode(digest) != expected_sha {
         return Err(format!("{}: payload hash mismatch", path.display()));
     }
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(format!(
             "{}: payload is not a multiple of 4 bytes",
             path.display()
         ));
     }
-    let aligned =
-        (bytes.as_ptr() as usize + HEADER_LEN).is_multiple_of(std::mem::align_of::<i32>());
-    let weights = if cfg!(target_endian = "little") && aligned {
-        WeightsData::mapped(Arc::new(mmap), HEADER_LEN, payload_len / 4)
-    } else {
-        let mut out = Vec::with_capacity(payload.len() / 4);
-        for chunk in payload.as_chunks::<4>().0 {
-            out.push(i32::from_le_bytes(*chunk));
-        }
-        WeightsData::owned(out)
-    };
-    Ok(LoadedWeights {
-        weights,
-        sha256: expected_sha,
-    })
+    Ok((payload_len, expected_sha))
+}
+
+fn owned_from_payload(payload: &[u8]) -> WeightsData {
+    let mut out = Vec::with_capacity(payload.len() / 4);
+    for chunk in payload.as_chunks::<4>().0 {
+        out.push(i32::from_le_bytes(*chunk));
+    }
+    WeightsData::owned(out)
 }
 
 /// Read and verify a weight file into an owned buffer.
@@ -215,10 +278,39 @@ pub fn read(path: &Path) -> Result<(Vec<i32>, String), String> {
 mod tests {
     use super::*;
 
+    fn scratch(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("verinoo-weights-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_bytes(version: u32, declared_len: u64, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes.extend_from_slice(&declared_len.to_le_bytes());
+        bytes.extend_from_slice(&Sha256::digest(payload));
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn load_error(path: &Path) -> String {
+        match load(path) {
+            Ok(_) => panic!("expected {} to be rejected", path.display()),
+            Err(err) => err,
+        }
+    }
+
     #[test]
     fn roundtrip_and_tamper_detection() {
-        let dir = std::env::temp_dir().join(format!("verinoo-weights-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("roundtrip");
         let path = dir.join("test.vnnw");
         let weights = vec![0, 1, -1, 65_536, i32::MIN, i32::MAX];
         let sha = write(&path, &weights).unwrap();
@@ -236,9 +328,21 @@ mod tests {
     }
 
     #[test]
+    fn write_replaces_an_existing_file() {
+        let dir = scratch("replace");
+        let path = dir.join("weights.vnnw");
+        write(&path, &[1, 2, 3]).unwrap();
+        let sha = write(&path, &[4, 5, 6]).unwrap();
+        let (got, read_sha) = read(&path).unwrap();
+        assert_eq!(got, vec![4, 5, 6]);
+        assert_eq!(sha, read_sha);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_maps_the_payload_without_copying() {
-        let dir = std::env::temp_dir().join(format!("verinoo-weights-mmap-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("mmap");
         let path = dir.join("mapped.vnnw");
         let weights = vec![7, -7, 42, 65_536, i32::MIN, i32::MAX];
         let sha = write(&path, &weights).unwrap();
@@ -247,6 +351,76 @@ mod tests {
         assert_eq!(loaded.weights.as_slice(), weights);
         assert_eq!(loaded.weights.tensor(2, 3), &weights[2..5]);
         assert_eq!(loaded.sha256, sha);
+        drop(loaded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_an_empty_file() {
+        let dir = scratch("negative-empty");
+        let path = write_file(&dir, "empty.vnnw", &[]);
+        let err = load_error(&path);
+        assert!(err.contains("not a Verinoo weight file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_header_only_file() {
+        let dir = scratch("negative-header");
+        let path = write_file(&dir, "header.vnnw", &file_bytes(VERSION, 0, &[]));
+        let err = load_error(&path);
+        assert!(err.contains("empty payload"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_truncated_payload() {
+        let dir = scratch("negative-truncated");
+        let payload = [1u8, 0, 0, 0, 2, 0, 0, 0];
+        let mut bytes = file_bytes(VERSION, payload.len() as u64, &payload);
+        bytes.truncate(bytes.len() - 4);
+        let path = write_file(&dir, "truncated.vnnw", &bytes);
+        let err = load_error(&path);
+        assert!(err.contains("header says 8 payload bytes"), "{err}");
+        assert!(err.contains("file has 4"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_wrong_magic() {
+        let dir = scratch("negative-magic");
+        let mut bytes = file_bytes(VERSION, 4, &[1, 0, 0, 0]);
+        bytes[..4].copy_from_slice(b"XXXX");
+        let path = write_file(&dir, "magic.vnnw", &bytes);
+        let err = load_error(&path);
+        assert!(err.contains("not a Verinoo weight file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_unsupported_versions() {
+        let dir = scratch("negative-version");
+        let path = write_file(
+            &dir,
+            "version.vnnw",
+            &file_bytes(VERSION + 1, 4, &[1, 0, 0, 0]),
+        );
+        let err = load_error(&path);
+        assert!(err.contains("unsupported weight version"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_payload_length_mismatches() {
+        let dir = scratch("negative-length");
+        let path = write_file(
+            &dir,
+            "length.vnnw",
+            &file_bytes(VERSION, 4, &[1, 0, 0, 0, 2, 0, 0, 0]),
+        );
+        let err = load_error(&path);
+        assert!(err.contains("header says 4 payload bytes"), "{err}");
+        assert!(err.contains("file has 8"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
