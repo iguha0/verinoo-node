@@ -21,3 +21,8 @@ jobs:
           cd sdk/typescript && node --test
           python3 -m pip install --quiet cryptography pytest
           cd ../python && python3 -m pytest -q
+      - name: Python importer tests (offline)
+        run: |
+          python3 -m pip install --quiet numpy huggingface_hub "torch==2.8.0+cpu" \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          python3 scripts/test_hf_gpt_import.py

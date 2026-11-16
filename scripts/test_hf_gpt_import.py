@@ -11,6 +11,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -136,6 +137,42 @@ def make_tokenizer() -> TokenizerData:
         unk_id=0,
         prepend_bos=False,
     )
+
+
+def make_gpt2_config(**overrides) -> types.SimpleNamespace:
+    values = {
+        "model_type": "gpt2",
+        "architectures": ["GPT2LMHeadModel"],
+        "n_embd": HIDDEN,
+        "n_head": HEADS,
+        "n_layer": 1,
+        "n_inner": None,
+        "n_positions": POSITIONS,
+        "activation_function": "gelu_new",
+        "layer_norm_epsilon": 1e-5,
+        "tie_word_embeddings": True,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def make_gpt_neo_config(**overrides) -> types.SimpleNamespace:
+    values = {
+        "model_type": "gpt_neo",
+        "architectures": ["GPTNeoForCausalLM"],
+        "hidden_size": HIDDEN,
+        "num_heads": HEADS,
+        "num_layers": 1,
+        "intermediate_size": None,
+        "max_position_embeddings": POSITIONS,
+        "activation_function": "gelu_new",
+        "layer_norm_epsilon": 1e-5,
+        "tie_word_embeddings": True,
+        "window_size": 4,
+        "attention_types": [[["global", "global"], 1]],
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
 
 
 class OrientationTests(unittest.TestCase):
@@ -318,6 +355,39 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("LLaMA", str(caught.exception))
 
 
+class AttentionConfigValidationTests(unittest.TestCase):
+    def test_gpt2_scale_attn_weights_false_is_rejected(self):
+        with self.assertRaises(UnsupportedModelError) as caught:
+            shape_from_config(make_gpt2_config(scale_attn_weights=False))
+        self.assertIn("scale_attn_weights", str(caught.exception))
+
+    def test_gpt2_inverse_layer_index_scaling_is_rejected(self):
+        with self.assertRaises(UnsupportedModelError) as caught:
+            shape_from_config(
+                make_gpt2_config(scale_attn_by_inverse_layer_idx=True)
+            )
+        self.assertIn("scale_attn_by_inverse_layer_idx", str(caught.exception))
+
+    def test_gpt2_cross_attention_is_rejected(self):
+        with self.assertRaises(UnsupportedModelError) as caught:
+            shape_from_config(make_gpt2_config(add_cross_attention=True))
+        self.assertIn("add_cross_attention", str(caught.exception))
+
+    def test_gpt_neo_scale_attn_weights_is_checked(self):
+        with self.assertRaises(UnsupportedModelError) as caught:
+            shape_from_config(make_gpt_neo_config(scale_attn_weights=True))
+        self.assertIn("scale_attn_weights", str(caught.exception))
+        shape = shape_from_config(
+            make_gpt_neo_config(scale_attn_weights=False)
+        )
+        self.assertEqual(shape.attention_scale, "none")
+
+    def test_gpt_neo_cross_attention_is_rejected(self):
+        with self.assertRaises(UnsupportedModelError) as caught:
+            shape_from_config(make_gpt_neo_config(add_cross_attention=True))
+        self.assertIn("add_cross_attention", str(caught.exception))
+
+
 class MetadataAndBinaryTests(unittest.TestCase):
     def test_metadata_fields_and_tensor_lengths(self):
         shape = make_shape(
@@ -439,6 +509,46 @@ class MetadataAndBinaryTests(unittest.TestCase):
         self.assertEqual(length, 20)
         self.assertEqual(digest, hashlib.sha256(payload).digest())
         self.assertEqual(digest_hex, digest.hex())
+
+
+class AtomicWriterTests(unittest.TestCase):
+    def test_rewrite_replaces_the_file_and_leaves_no_temporary(self):
+        arrays = [np.array([9, 10, 11], dtype="<i4")]
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = directory / "weights.vnnw"
+            old_digest = write_weights(
+                path, [np.array([1, 2, 3], dtype="<i4")]
+            )
+            digest = write_weights(path, arrays)
+            raw = path.read_bytes()
+            self.assertEqual(
+                sorted(item.name for item in directory.iterdir()),
+                ["weights.vnnw"],
+            )
+        magic, version, length, header_digest = struct.unpack("<4sIQ32s", raw[:48])
+        payload = raw[48:]
+        self.assertEqual((magic, version, length), (b"VNNW", 1, 12))
+        self.assertEqual(header_digest.hex(), digest)
+        self.assertEqual(payload, arrays[0].tobytes())
+        self.assertNotEqual(old_digest, digest)
+
+    def test_failed_replace_keeps_the_previous_file_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = directory / "weights.vnnw"
+            write_weights(path, [np.array([1, 2, 3], dtype="<i4")])
+            original = path.read_bytes()
+            with mock.patch(
+                "hf_gpt_common.os.replace", side_effect=OSError("replace failed")
+            ):
+                with self.assertRaises(OSError):
+                    write_weights(path, [np.array([4, 5], dtype="<i4")])
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(
+                sorted(item.name for item in directory.iterdir()),
+                ["weights.vnnw"],
+            )
 
 
 if __name__ == "__main__":

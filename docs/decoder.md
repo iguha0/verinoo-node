@@ -277,6 +277,10 @@ runtime:
   the checkpoint has none).
 - `gelu_new` or `relu` activation only, and the GPT-2 byte-level BPE tokenizer
   (`vocab.json` + `merges.txt`).
+- Attention scaling configs outside the runtime subset are rejected instead of
+  importing logits that differ: GPT-2 `scale_attn_weights=False`,
+  `scale_attn_by_inverse_layer_idx=True`, `add_cross_attention=True`, and
+  GPT-Neo configs that expose `scale_attn_weights=True`.
 
 `--max-context` defaults to `min(1024, config positions)` and is capped by the
 model's positional embeddings. GPT-Neo local-attention checkpoints are rejected
@@ -286,12 +290,14 @@ window. LLaMA/SentencePiece tokenizers, non-`gelu_new`/`relu` activations,
 rotary embeddings, other architectures, and shapes outside the runtime limits
 fail with a clear error.
 
-Model weight files are not committed. The DistilGPT-2 and TinyStories-1M
-outputs above are gitignored; generic imports produce the same kind of binary
-and must not be committed. The importers quantise the checkpoint to Q16.16,
-write the `.vnnw` header and SHA-256, extract the GPT-2 tokenizer and optionally
-record float-reference greedy vectors. Weights are downloaded from HuggingFace
-or read from a local directory; they are not redistributed.
+Model weight files are not committed. `models/*.vnnw` is gitignored, so both
+the specific outputs above and generic `models/<name>.vnnw` imports are never
+committed or redistributed. The small metadata JSON (tokenizer and sampling
+config) and optional float-reference fixtures may be committed. The importers
+quantise the checkpoint to Q16.16, write the `.vnnw` header and SHA-256, extract
+the GPT-2 tokenizer and optionally record float-reference greedy vectors.
+Weights are downloaded from HuggingFace or read from a local directory; they
+are not redistributed.
 
 **Licensing:** DistilGPT-2 is Apache 2.0 according to its model card; verify the
 card before redistribution. The model files are downloaded locally and are not

@@ -8,7 +8,7 @@ file; the JSON file carries only metadata, tokenizer and sampling config.
     python3 scripts/import_distilgpt2.py
     python3 scripts/import_distilgpt2.py --max-context 1024 --max-new-tokens 16
 
-Outputs (both gitignored):
+Outputs (all gitignored; weights are never committed or redistributed):
   models/distilgpt2.json       metadata + tokenizer + sampling
   models/distilgpt2.vnnw       82M Q16.16 parameters (328 MB)
   models/distilgpt2.test.json  float-reference greedy vectors (optional)
@@ -26,6 +26,8 @@ from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from hf_gpt_common import (
+    architecture_name,
+    describe_model,
     export_checkpoint,
     load_tokenizer_data,
     resolve_max_context,
@@ -40,10 +42,6 @@ PROMPTS = [
     "The little dog",
     "In a world where",
 ]
-DESCRIPTION = (
-    "DistilGPT-2, an Apache 2.0 82M-parameter GPT-2 decoder. "
-    "Demonstration/production foundation; not served on the public node."
-)
 
 
 def main() -> None:
@@ -73,8 +71,8 @@ def main() -> None:
         shape=shape,
         tokenizer=tokenizer_data,
         model_id=MODEL,
-        architecture=f"gpt2-{shape.layers}x{shape.hidden}-{shape.heads}h",
-        description=DESCRIPTION,
+        architecture=architecture_name(shape),
+        description=describe_model(MODEL, shape),
         out_dir=out_dir,
         out_name=MODEL,
         max_context=max_context,

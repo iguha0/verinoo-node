@@ -12,6 +12,10 @@ __pycache__/
 # Local browser artifacts
 .playwright-mcp/
 
+# Imported decoder weights are downloaded locally and are never committed or
+# redistributed, including generic `models/<name>.vnnw` importer outputs.
+models/*.vnnw
+
 # TinyStories-1M is downloaded locally, not redistributed (no license on the model card)
 models/tiny-stories-1m.json
 models/tiny-stories-1m.test.json
@@ -19,7 +23,6 @@ models/tiny-stories-1m.test.json
 # Generated pilot reports
 reports/
 
-# DistilGPT-2 weights are downloaded locally, not redistributed
+# DistilGPT-2 is downloaded locally, not redistributed
 models/distilgpt2.json
-models/distilgpt2.vnnw
 models/distilgpt2.test.json

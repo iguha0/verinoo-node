@@ -12,7 +12,8 @@ clear error.
         --max-context 256 --max-new-tokens 16
     python3 scripts/import_hf_gpt.py --model ./local-checkpoint --out-name my-gpt2
 
-Outputs (gitignored model files, weights downloaded not redistributed):
+Outputs (weights are gitignored by `models/*.vnnw` and are never committed;
+the small metadata and optional float-reference JSON files may be committed):
   models/<out-name>.json       metadata + tokenizer + sampling
   models/<out-name>.vnnw       Q16.16 weights with the VNNW header and SHA-256
   models/<out-name>.test.json  float-reference greedy vectors (optional)
@@ -28,7 +29,9 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from hf_gpt_common import (
     UnsupportedModelError,
     UnsupportedTokenizerError,
+    architecture_name,
     default_model_name,
+    describe_model,
     export_checkpoint,
     load_tokenizer_data,
     resolve_max_context,
@@ -88,22 +91,14 @@ def main() -> None:
         args.model, revision=args.revision
     )
 
-    family = "GPT-2" if shape.family == "gpt2" else "GPT-Neo"
-    architecture = (
-        f"{shape.family}-{shape.layers}x{shape.hidden}-{shape.heads}h"
-    )
-    description = (
-        f"{args.model}: a {family} causal decoder imported with the GPT-2 "
-        "byte-level BPE tokenizer. Weights are loaded locally and not redistributed."
-    )
     out_dir = Path(args.out_dir)
     export_checkpoint(
         state=model.state_dict(),
         shape=shape,
         tokenizer=tokenizer_data,
         model_id=out_name,
-        architecture=architecture,
-        description=description,
+        architecture=architecture_name(shape),
+        description=describe_model(args.model, shape),
         out_dir=out_dir,
         out_name=out_name,
         max_context=max_context,

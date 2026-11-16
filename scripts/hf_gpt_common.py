@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -91,9 +93,27 @@ def write_weights(path: Path, arrays: Sequence[np.ndarray]) -> str:
     payload = np.concatenate(arrays).astype("<i4").tobytes()
     digest = hashlib.sha256(payload).digest()
     header = struct.pack("<4sIQ32s", MAGIC, VERSION, len(payload), digest)
-    with open(path, "wb") as handle:
-        handle.write(header)
-        handle.write(payload)
+    path = Path(path)
+    temporary = tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with temporary as handle:
+            handle.write(header)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary.name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary.name)
+        except FileNotFoundError:
+            pass
+        raise
     return digest.hex()
 
 
@@ -105,6 +125,18 @@ def default_model_name(model: str) -> str:
     if not slug:
         raise ValueError(f"cannot derive an output name from `{model}`; pass --out-name")
     return slug
+
+
+def architecture_name(shape: ModelShape) -> str:
+    return f"{shape.family}-{shape.layers}x{shape.hidden}-{shape.heads}h"
+
+
+def describe_model(model: str, shape: ModelShape) -> str:
+    family = "GPT-2" if shape.family == "gpt2" else "GPT-Neo"
+    return (
+        f"{model}: a {family} causal decoder imported with the GPT-2 "
+        "byte-level BPE tokenizer. Weights are loaded locally and not redistributed."
+    )
 
 
 def detect_family(config: Any) -> str:
@@ -138,6 +170,31 @@ def validate_activation(value: Any) -> str:
     )
 
 
+def _validate_attention_config(config: Any, family: str) -> None:
+    scale_weights = getattr(config, "scale_attn_weights", None)
+    if scale_weights is not None:
+        if family == "gpt2" and not bool(scale_weights):
+            raise UnsupportedModelError(
+                "unsupported config scale_attn_weights=False; the Verinoo GPT-2 "
+                "decoder always applies sqrt attention scaling"
+            )
+        if family == "gpt_neo" and bool(scale_weights):
+            raise UnsupportedModelError(
+                "unsupported config scale_attn_weights=True for GPT-Neo; the "
+                "Verinoo GPT-Neo decoder applies no attention-score scaling"
+            )
+    if bool(getattr(config, "scale_attn_by_inverse_layer_idx", False)):
+        raise UnsupportedModelError(
+            "unsupported config scale_attn_by_inverse_layer_idx=True; the "
+            "Verinoo decoder does not rescale attention by layer index"
+        )
+    if bool(getattr(config, "add_cross_attention", False)):
+        raise UnsupportedModelError(
+            "unsupported config add_cross_attention=True; the Verinoo decoder "
+            "does not implement cross-attention"
+        )
+
+
 def _require_int(config: Any, names: Iterable[str], label: str) -> int:
     for name in names:
         value = getattr(config, name, None)
@@ -153,6 +210,7 @@ def _require_int(config: Any, names: Iterable[str], label: str) -> int:
 
 def shape_from_config(config: Any) -> ModelShape:
     family = detect_family(config)
+    _validate_attention_config(config, family)
     if family == "gpt2":
         hidden = _require_int(config, ("n_embd", "hidden_size"), "hidden size")
         heads = _require_int(config, ("n_head", "num_heads"), "head count")
