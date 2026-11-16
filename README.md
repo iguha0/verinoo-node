@@ -184,13 +184,21 @@ curl -s localhost:7100/v1/verify/<taskId> | jq '{verified, output}'
 ### Batch submission
 
 `POST /v1/infer/batch` accepts `{"transactions":[<signed TxEnvelope>, ...]}` with
-1–32 items. Each item runs the same auth, signature, sampling, encryption and
-policy checks as `POST /v1/infer`. Nonce and balance are checked against a
-batch-local overlay seeded from committed state, so consecutive nonces from
-one sender are accepted in order. The overlay advances only when an item is
-admitted; a rejected item leaves it unchanged. Accepted transactions enter the
-mempool and are gossiped independently; the response reports every item in
-input order:
+1–32 items. The item count is only a transport cap: the batch must also fit in
+one block's gas. A block carries **1000 gas**; `submitInference` costs 60 gas
+(120 for `sampled`, 240 for `full-zk`), so at most 16 optimistic inference
+items fit in one batch. A batch whose total gas exceeds the block limit is
+rejected with `400` before any item is admitted, so accepted items are never
+silently dropped by the producer for gas exhaustion.
+
+Each item runs the same auth, signature, sampling, encryption and policy checks
+as `POST /v1/infer`. Nonce and balance are checked against a batch-local overlay
+seeded from committed state, so consecutive nonces from one sender are accepted
+in order. The overlay advances only when an item is admitted; a rejected item
+leaves it unchanged. That means a rejected middle item cascades to later items
+from the same sender: if nonce 2 fails, a later nonce 3 fails its nonce check
+too. Other senders are unaffected. Accepted transactions enter the mempool and
+are gossiped independently; the response reports every item in input order:
 
 ```json
 {
@@ -203,13 +211,19 @@ input order:
 }
 ```
 
+After request-level checks (shape, size, auth, gas capacity), batch submission
+always returns `200` with per-item results, even when every item is rejected.
 Partial success is intentional: a bad item does not roll back its siblings.
 Batching is not a consensus batch and gives no gas discount; each transaction
 keeps its own task id and receipt. Batch admission is not a reservation: block
 production re-validates against evolving state and may skip an admitted
-transaction if a competing submission wins the nonce or balance. An empty or
-oversized batch is `400`, an unauthenticated request is `401`, and per-item
-failures are reported in `results` with the batch still returning `200`.
+transaction if a competing submission wins the nonce or balance. An empty,
+oversized or over-gas batch is `400`, and an unauthenticated request is `401`.
+
+The mempool is capped at **5000 transactions** across both RPC admission and
+gossip. When it is full, `/v1/infer` returns `429`, and a batch reports a
+per-item `mempool is full` rejection while still returning `200` for the
+request.
 
 ### Task event stream
 
@@ -224,20 +238,26 @@ store about once per second for up to 60 seconds:
 
 Heartbeat comments keep idle proxies open. The stream carries only the
 consensus-committed result; token-level previews from unverified execution are
-not implemented. A missing task returns `404` JSON before the stream starts.
+not implemented. A task row is created only when the block carrying its
+`submitInference` is applied, so a stream requested before that point returns
+`404`; poll `/v1/tasks/:id` (also `404` until then) or retry the stream. A
+global limit of **64 concurrent streams** per process applies; a request beyond
+it returns `429`.
 
 ### Request policy
 
 `VNN_POLICY_FILE` points at a JSON policy (see
-[`docs/policy.md`](docs/policy.md)). It is node-local, applies only to plaintext
-`input` at the submission boundary, and never changes consensus execution or
-committed results. A blocked term or over-limit plaintext returns `422` with
-`reason: "policy"`. Encrypted payloads are opaque: they are allowed unless the
-policy sets `requirePlaintext`, and they are never decrypted or inspected by
-the policy. Because a redacted input cannot be written back into a signed
-transaction, a policy redaction rejects the request with "input requires
-client-side redaction" instead of mutating the signature. An invalid policy
-file fails startup rather than silently falling back to permissive defaults.
+[`docs/policy.md`](docs/policy.md)). It is node-local and never changes
+consensus execution or committed results. Plaintext `input` is inspected for
+blocked content, and `maxInputBytes` applies to the plaintext or the serialized
+`encryptedInput` payload at the submission boundary. A blocked term or
+over-limit payload returns `422` with `reason: "policy"`. Encrypted payloads are
+opaque for content: they are allowed unless the policy sets `requirePlaintext`,
+and they are never decrypted or inspected by the policy. Because a redacted
+input cannot be written back into a signed transaction, a policy redaction
+rejects the request with "input requires client-side redaction" instead of
+mutating the signature. An invalid policy file fails startup rather than
+silently falling back to permissive defaults.
 
 The reference model (`intent-classifier-v1`, 8,196 parameters) is trained from
 the committed corpus with `cargo run --release -p verinoo-model --bin train`.

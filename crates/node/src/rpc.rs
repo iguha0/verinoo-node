@@ -467,6 +467,7 @@ enum SubmitError {
     Invalid(String),
     Policy(policy_gate::GateError),
     Conflict(String),
+    Full(String),
     Internal(String),
 }
 
@@ -477,6 +478,7 @@ impl SubmitError {
             Self::Invalid(_) => StatusCode::BAD_REQUEST,
             Self::Policy(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Full(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -484,9 +486,10 @@ impl SubmitError {
     fn message(&self) -> String {
         match self {
             Self::Auth(error) => error.message(),
-            Self::Invalid(message) | Self::Conflict(message) | Self::Internal(message) => {
-                message.clone()
-            }
+            Self::Invalid(message)
+            | Self::Conflict(message)
+            | Self::Full(message)
+            | Self::Internal(message) => message.clone(),
             Self::Policy(error) => error.message(),
         }
     }
@@ -552,6 +555,17 @@ fn transaction_fee(tx: &verinoo_types::tx::TxEnvelope, base_fee: u64) -> Result<
         None => 1,
     };
     Ok(verinoo_exec::gas::gas_cost_for(&data) * base_fee * multiplier)
+}
+
+fn transaction_gas(tx: &verinoo_types::tx::TxEnvelope) -> Result<u64, String> {
+    let data = serde_json::to_value(&tx.data).map_err(|e| e.to_string())?;
+    let multiplier = match verinoo_exec::gas::policy_of_tx(&data) {
+        Some(policy) => verinoo_exec::gas::policy_multiplier(Some(policy))?,
+        None => 1,
+    };
+    verinoo_exec::gas::gas_cost_for(&data)
+        .checked_mul(multiplier)
+        .ok_or_else(|| "transaction gas overflow".to_string())
 }
 
 fn validate_batch_item(
@@ -655,6 +669,12 @@ async fn admit_tx(
     if mp.iter().any(|t| t.tx_id == tx.tx_id) {
         return Err(SubmitError::Conflict("already in mempool".into()));
     }
+    if mp.len() >= crate::MAX_MEMPOOL_TRANSACTIONS {
+        return Err(SubmitError::Full(format!(
+            "mempool is full ({} transactions); retry later",
+            crate::MAX_MEMPOOL_TRANSACTIONS
+        )));
+    }
     if let Some(caller) = caller {
         if tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference {
             auth.consume_quota(&shared.store, caller, shared.now_ms())
@@ -756,6 +776,9 @@ async fn submit_tx(
     })))
 }
 
+/// Transport cap for batch size. The real capacity limit is gas: a block has
+/// `BLOCK_GAS_LIMIT` (1000) gas and `submitInference` costs 60 (sampled 120,
+/// full-zk 240), so at most 16 optimistic inference items fit in one batch.
 const MAX_BATCH_TRANSACTIONS: usize = 32;
 
 fn invalid_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -789,6 +812,24 @@ async fn v1_submit_batch(
     }
     if transactions.len() > MAX_BATCH_TRANSACTIONS {
         return Err(invalid_request("transactions exceeds the 32 item limit"));
+    }
+
+    // Reject the whole batch before admitting anything when its gas cannot fit
+    // in one block. Otherwise the producer silently drops gas-exhausted items
+    // and the caller sees "accepted" for work that never executes.
+    let mut total_gas = 0u64;
+    for value in transactions {
+        if let Ok(tx) = serde_json::from_value::<verinoo_types::tx::TxEnvelope>(value.clone()) {
+            if let Ok(gas) = transaction_gas(&tx) {
+                total_gas = total_gas.saturating_add(gas);
+            }
+        }
+    }
+    let block_gas_limit = verinoo_exec::gas::block_gas_limit();
+    if total_gas > block_gas_limit {
+        return Err(invalid_request(&format!(
+            "batch gas {total_gas} exceeds the per-block gas limit of {block_gas_limit}; split into smaller batches"
+        )));
     }
 
     let mut results = Vec::with_capacity(transactions.len());
@@ -1010,6 +1051,9 @@ struct TaskEventState {
     last_status: Option<(String, Option<String>, u64)>,
     queue: VecDeque<Event>,
     finished: bool,
+    /// Held for the stream lifetime so the global stream cap cannot be
+    /// exceeded by long-lived connections.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 fn task_status_event(shared: &Shared, task: &verinoo_state::models::InferenceTask) -> Event {
@@ -1057,6 +1101,7 @@ fn task_event_stream(
     task_id: String,
     poll: Duration,
     timeout: Duration,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let state = TaskEventState {
         shared,
@@ -1066,6 +1111,7 @@ fn task_event_stream(
         last_status: None,
         queue: VecDeque::new(),
         finished: false,
+        _permit: permit,
     };
     let stream = stream::unfold(state, |mut state| async move {
         loop {
@@ -1129,11 +1175,27 @@ async fn v1_task_events(
     if shared.store.get_task(&task_id).is_none() {
         return Err(not_found("task not found"));
     }
+    let permit = shared
+        .task_streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "too many active task event streams (limit {})",
+                        crate::MAX_ACTIVE_TASK_STREAMS
+                    )
+                })),
+            )
+        })?;
     Ok(task_event_stream(
         shared,
         task_id,
         TASK_EVENT_POLL,
         TASK_EVENT_TIMEOUT,
+        Some(permit),
     ))
 }
 
@@ -1341,6 +1403,7 @@ mod tests {
             block_time_ms,
             peer_lag_blocks: 2,
             request_policy,
+            task_streams: Arc::new(tokio::sync::Semaphore::new(crate::MAX_ACTIVE_TASK_STREAMS)),
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
     }
@@ -1928,6 +1991,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_rejects_a_request_that_exceeds_one_block_of_gas() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(20);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let items: Vec<_> = (1..=17)
+            .map(|nonce| {
+                let input = format!("prompt {nonce}");
+                serde_json::to_value(signed_inference(
+                    &signing,
+                    &address,
+                    inference_data(&address, "tiny-gpt-v1", &input),
+                    nonce,
+                ))
+                .unwrap()
+            })
+            .collect();
+
+        // 17 optimistic submitInference txs cost 17 * 60 = 1020 gas, above the
+        // 1000 block limit, so the request is rejected before admission.
+        let error = call_batch(&shared, &net, &auth, HeaderMap::new(), items.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let message = error.1 .0["error"].as_str().unwrap();
+        assert!(message.contains("1020"), "{message}");
+        assert!(message.contains("1000"), "{message}");
+        assert!(shared.mempool.lock().await.is_empty());
+
+        // 16 items cost 960 gas and fit.
+        let body = call_batch(&shared, &net, &auth, HeaderMap::new(), items[..16].to_vec())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(body["accepted"], 16);
+        assert_eq!(body["rejected"], 0);
+        assert_eq!(shared.mempool.lock().await.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn admit_tx_refuses_when_the_shared_mempool_cap_is_reached() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(21);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+        let tx = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "cap prompt"),
+            1,
+        );
+
+        {
+            let mut mp = shared.mempool.lock().await;
+            let mut filler = tx.clone();
+            for index in 0..crate::MAX_MEMPOOL_TRANSACTIONS {
+                filler.tx_id = format!("filler-{index}");
+                mp.push(filler.clone());
+            }
+        }
+
+        let error = admit_tx(&shared, &net, &auth, None, tx.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(error.message().contains("mempool is full"));
+        assert_eq!(
+            shared.mempool.lock().await.len(),
+            crate::MAX_MEMPOOL_TRANSACTIONS
+        );
+
+        shared.mempool.lock().await.pop();
+        admit_tx(&shared, &net, &auth, None, tx).await.unwrap();
+        assert_eq!(
+            shared.mempool.lock().await.len(),
+            crate::MAX_MEMPOOL_TRANSACTIONS
+        );
+    }
+
+    #[tokio::test]
     async fn batch_accepts_valid_items_and_reports_per_item_errors() {
         let shared = test_shared();
         let net = test_network(&shared).await;
@@ -2449,6 +2597,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_events_rejects_when_the_global_stream_cap_is_exhausted() {
+        let shared = test_shared();
+        let task_id = "task-stream-cap";
+        shared.store.set_task(&test_task(task_id, "pending"));
+
+        let permits: Vec<_> = (0..crate::MAX_ACTIVE_TASK_STREAMS)
+            .map(|_| shared.task_streams.clone().try_acquire_owned().unwrap())
+            .collect();
+        let error = v1_task_events(
+            State(shared.clone()),
+            axum::extract::Path(task_id.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::TOO_MANY_REQUESTS);
+
+        drop(permits);
+        assert!(v1_task_events(
+            State(shared.clone()),
+            axum::extract::Path(task_id.to_string()),
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
     async fn task_events_emits_status_result_and_done_for_completed_and_failed_tasks() {
         for status in ["completed", "failed"] {
             let shared = test_shared();
@@ -2466,6 +2640,7 @@ mod tests {
                 task_id.clone(),
                 Duration::from_millis(5),
                 Duration::from_millis(500),
+                None,
             ))
             .await;
 
@@ -2496,6 +2671,7 @@ mod tests {
             task_id.to_string(),
             Duration::from_millis(5),
             Duration::from_millis(30),
+            None,
         ))
         .await;
 

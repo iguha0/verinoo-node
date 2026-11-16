@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use verinoo_exec::engine::{current_head, produce_block, set_head, validate_block, Block};
+use verinoo_exec::engine::{
+    current_head, produce_block_with_report, set_head, validate_block, Block,
+};
 use verinoo_network::NetworkEvent;
 use verinoo_state::genesis::GenesisParams;
 use verinoo_state::StateStore;
@@ -55,8 +57,16 @@ pub struct Shared {
     /// Node-local plaintext policy applied at the inference submission
     /// boundary, before a transaction enters the mempool.
     pub request_policy: verinoo_policy::Policy,
+    /// Global cap on concurrent task event streams, shared by every request.
+    pub task_streams: Arc<tokio::sync::Semaphore>,
     policy: std::sync::Mutex<Policy>,
 }
+
+/// Shared admission cap for RPC and gossip, so either path cannot grow the
+/// mempool without bound.
+pub const MAX_MEMPOOL_TRANSACTIONS: usize = 5_000;
+/// Concurrent `/v1/tasks/:id/events` streams allowed per process.
+pub const MAX_ACTIVE_TASK_STREAMS: usize = 64;
 
 /// Funded at genesis on every node, so a drip is a real transfer that
 /// replicates through blocks instead of local-only state.
@@ -210,6 +220,38 @@ fn commit_block(shared: &Shared, block: &Block, producer_address: &str) {
     set_head(&shared.store, block);
 }
 
+/// Put transactions the producer skipped only for gas back at the front of the
+/// mempool, preserving their batch order. Invalid or reverted transactions are
+/// intentionally dropped, and IDs already re-admitted by gossip are not
+/// duplicated.
+fn requeue_gas_skipped(
+    mempool: &mut Vec<verinoo_types::tx::TxEnvelope>,
+    batch: &[verinoo_types::tx::TxEnvelope],
+    skipped: &[(String, String)],
+) {
+    let requeued: Vec<verinoo_types::tx::TxEnvelope> = batch
+        .iter()
+        .filter(|tx| {
+            skipped.iter().any(|(tx_id, reason)| {
+                tx_id == &tx.tx_id && reason == verinoo_exec::engine::GAS_LIMIT_SKIP_REASON
+            })
+        })
+        .filter(|tx| !mempool.iter().any(|existing| existing.tx_id == tx.tx_id))
+        .cloned()
+        .collect();
+    if requeued.is_empty() {
+        return;
+    }
+    let mut merged = Vec::with_capacity(requeued.len() + mempool.len());
+    merged.extend(requeued);
+    for tx in mempool.drain(..) {
+        if !merged.iter().any(|existing| existing.tx_id == tx.tx_id) {
+            merged.push(tx);
+        }
+    }
+    *mempool = merged;
+}
+
 /// Validator loop: produce on interval from the mempool and broadcast.
 async fn validator_loop(
     shared: Arc<Shared>,
@@ -261,10 +303,15 @@ async fn validator_loop(
         let batch: Vec<_> = shared.mempool.lock().await.drain(..).collect();
 
         let _guard = shared.chain_lock.lock().await;
-        match produce_block(&shared.store, &batch, &producer, shared.now_ms()) {
-            Ok(block) => {
+        match produce_block_with_report(&shared.store, &batch, &producer, shared.now_ms()) {
+            Ok(report) => {
+                let block = report.block;
                 let n = block.transactions.len();
                 set_head(&shared.store, &block);
+                {
+                    let mut mempool = shared.mempool.lock().await;
+                    requeue_gas_skipped(&mut mempool, &batch, &report.skipped);
+                }
                 tracing::info!(
                     "produced block #{} | {} txs | {}",
                     block.header.index,
@@ -527,6 +574,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_time_ms,
         peer_lag_blocks,
         request_policy,
+        task_streams: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_TASK_STREAMS)),
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
@@ -635,7 +683,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match serde_json::from_str::<verinoo_types::tx::TxEnvelope>(&payload) {
                         Ok(tx) => {
                             let mut mp = shared.mempool.lock().await;
-                            if !mp.iter().any(|t| t.tx_id == tx.tx_id) && mp.len() < 5_000 {
+                            if !mp.iter().any(|t| t.tx_id == tx.tx_id)
+                                && mp.len() < MAX_MEMPOOL_TRANSACTIONS
+                            {
                                 mp.push(tx);
                             }
                         }
@@ -1129,4 +1179,65 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         _ => eprintln!("Unknown wallet command: {cmd}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tx(id: &str) -> verinoo_types::tx::TxEnvelope {
+        verinoo_types::tx::TxEnvelope {
+            tx_id: id.into(),
+            from: "ai_0123456789abcdef0123456789abcdef01234567".into(),
+            to: String::new(),
+            value: 0,
+            nonce: 1,
+            data: verinoo_types::tx::TxData {
+                r#type: verinoo_types::tx::TxKind::Transfer,
+                data: serde_json::json!({}),
+            },
+            gas_limit: None,
+            gas_price: None,
+            public_key: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    fn gas_limit_skip(id: &str) -> (String, String) {
+        (
+            id.into(),
+            verinoo_exec::engine::GAS_LIMIT_SKIP_REASON.into(),
+        )
+    }
+
+    #[test]
+    fn requeue_gas_skipped_puts_only_gas_skips_at_the_front() {
+        let a = tx("a");
+        let b = tx("b");
+        let c = tx("c");
+        let new_arrival = tx("new");
+        let batch = vec![a, b.clone(), c.clone()];
+        let skipped = vec![gas_limit_skip("b"), ("c".into(), "bad nonce".into())];
+
+        let mut mempool = vec![new_arrival];
+        requeue_gas_skipped(&mut mempool, &batch, &skipped);
+
+        let ids: Vec<_> = mempool.iter().map(|t| t.tx_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "new"]);
+    }
+
+    #[test]
+    fn requeue_gas_skipped_preserves_order_and_dedupes_gossip() {
+        let a = tx("a");
+        let b = tx("b");
+        let c = tx("c");
+        let batch = vec![a, b, c.clone()];
+        let skipped = vec![gas_limit_skip("b"), gas_limit_skip("c")];
+
+        let mut mempool = vec![c, tx("z")];
+        requeue_gas_skipped(&mut mempool, &batch, &skipped);
+
+        let ids: Vec<_> = mempool.iter().map(|t| t.tx_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "z"]);
+    }
 }

@@ -1440,7 +1440,7 @@ pub fn apply_block(
     for tx in &block.transactions {
         let cost = crate::gas::gas_cost_for(&serde_json::to_value(&tx.data).unwrap());
         if cost > gas_left {
-            skipped.push((tx.tx_id.clone(), "block gas limit".into()));
+            skipped.push((tx.tx_id.clone(), GAS_LIMIT_SKIP_REASON.into()));
             continue;
         }
         // Stateful validation + execution; failures skip the tx (reference semantics).
@@ -1515,14 +1515,43 @@ impl ProducerKey {
     }
 }
 
-/// Produce a block: gas-limited execution loop + header construction +
-/// Ed25519 signature over the final header hash. Mirrors produceBlock.
+/// Reason recorded when a transaction is skipped because the block is full.
+pub const GAS_LIMIT_SKIP_REASON: &str = "block gas limit";
+
+/// A produced block plus the transactions the producer did not include.
+///
+/// `skipped` preserves input order and carries the same reasons used by
+/// [`apply_block`], so a node can requeue only gas-limited transactions.
+#[derive(Debug)]
+pub struct ProducedBlock {
+    pub block: Block,
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Produce a block, discarding the skip report. See
+/// [`produce_block_with_report`] for callers that need to requeue gas-limited
+/// transactions.
 pub fn produce_block(
     store: &StateStore,
     txs: &[TxEnvelope],
     producer: &ProducerKey,
     now_ms: u64,
 ) -> Result<Block, EngineError> {
+    Ok(produce_block_with_report(store, txs, producer, now_ms)?.block)
+}
+
+/// Produce a block: gas-limited execution loop + header construction +
+/// Ed25519 signature over the final header hash. Mirrors produceBlock.
+///
+/// Transactions rejected by validation, reverted during execution, or dropped
+/// for the block gas limit are returned in `skipped`; callers that keep a
+/// mempool should requeue only the [`GAS_LIMIT_SKIP_REASON`] entries.
+pub fn produce_block_with_report(
+    store: &StateStore,
+    txs: &[TxEnvelope],
+    producer: &ProducerKey,
+    now_ms: u64,
+) -> Result<ProducedBlock, EngineError> {
     let prev = current_head(store).ok_or(EngineError::Validation("no head".into()))?;
     let height = prev.header.index + 1;
     let base_fee = store.meta_u64_or("baseFee", INITIAL_BASE_FEE);
@@ -1533,17 +1562,20 @@ pub fn produce_block(
     };
 
     let mut executed: Vec<TxEnvelope> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     let mut gas_left = crate::gas::block_gas_limit();
     tracing::debug!(height, txs = txs.len(), "producing block");
     for tx in txs {
         let cost = crate::gas::gas_cost_for(&serde_json::to_value(&tx.data).unwrap());
         if cost > gas_left {
+            skipped.push((tx.tx_id.clone(), GAS_LIMIT_SKIP_REASON.into()));
             continue;
         }
         let v = Validator { store, base_fee };
         match v.validate_transaction(tx) {
             Err(e) => {
-                tracing::warn!(tx = %tx.tx_id, error = %e, "skipping invalid tx")
+                tracing::warn!(tx = %tx.tx_id, error = %e, "skipping invalid tx");
+                skipped.push((tx.tx_id.clone(), e));
             }
             Ok(()) => match execute_transaction(store, tx, &ctx) {
                 Ok(()) => {
@@ -1551,7 +1583,8 @@ pub fn produce_block(
                     gas_left -= cost;
                 }
                 Err(e) => {
-                    tracing::warn!(tx = %tx.tx_id, error = %e, "tx reverted during production")
+                    tracing::warn!(tx = %tx.tx_id, error = %e, "tx reverted during production");
+                    skipped.push((tx.tx_id.clone(), e.to_string()));
                 }
             },
         }
@@ -1615,7 +1648,7 @@ pub fn produce_block(
     );
     store.set_meta_u64("baseFee", next_base_fee);
 
-    Ok(block)
+    Ok(ProducedBlock { block, skipped })
 }
 
 /// Current head pointer stored in meta.

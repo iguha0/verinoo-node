@@ -67,8 +67,10 @@ All fields are optional; `{}` is the permissive default.
 }
 ```
 
-- `maxInputBytes` — byte length limit, checked before any regex work. Must be
-  between 1 and 16 MiB. Default `8192`.
+- `maxInputBytes` — byte length limit, checked before any regex work. It
+  applies to plaintext and to the serialized `encryptedInput` envelope, so
+  ciphertext cannot bypass the limit. Must be between 1 and 16 MiB. Default
+  `8192`.
 - `allowedModels` — exact model ids; empty means every model is allowed.
 - `blockedTerms` — case-insensitive substring matches. Empty terms are
   rejected, and matches are never echoed.
@@ -85,13 +87,15 @@ Unknown config fields are rejected so a typo cannot silently disable a rule.
 
 ## Plaintext-only limitation
 
-The policy can only inspect plaintext. Encrypted payloads arrived from
+The policy can only inspect plaintext content. Encrypted payloads arrived from
 `verinoo-crypto` as ciphertext and opaque payloads are caller-defined blobs;
-searching or rewriting either would corrupt them. With `requirePlaintext`
-false they pass through untouched; with it true they are rejected. A node-side
-policy sees only the plaintext it is given and cannot inspect ciphertext.
-Encryption does not make the operator blind: validators hold the network key
-(see `docs/privacy.md`).
+searching or rewriting either would corrupt them. The byte limit and model
+allowlist still apply: the node measures the serialized `encryptedInput`
+envelope against `maxInputBytes`. With `requirePlaintext` false encrypted
+payloads pass those checks untouched; with it true they are rejected. A
+node-side policy sees only the plaintext it is given and cannot inspect
+ciphertext. Encryption does not make the operator blind: validators hold the
+network key (see `docs/privacy.md`).
 
 ## Output view semantics
 
@@ -130,8 +134,9 @@ The node wiring is implemented at the submission boundary
   `check_input_kind` after signature/nonce/balance/sampling validation and
   before mempool admission:
   - plaintext `input` is checked as `InputKind::Plaintext`;
-  - `encryptedInput` is checked as `InputKind::Encrypted` with an empty
-    payload, so only size, model allowlist and `requirePlaintext` apply;
+  - `encryptedInput` is checked as `InputKind::Encrypted` with the serialized
+    envelope as the payload, so the byte limit applies to the ciphertext and
+    metadata; content checks and redaction are skipped;
   - commitment-only submissions are checked as `InputKind::Opaque`.
 - A policy failure returns HTTP `422` with `reason: "policy"` and a stable
   `policyReason`; blocked terms are not echoed. Batch responses carry the same

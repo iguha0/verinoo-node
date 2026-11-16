@@ -54,8 +54,8 @@ pub fn load_from_path(path: &Path) -> Result<Policy, String> {
 }
 
 /// Check a transaction at the submission boundary. Only `submitInference`
-/// carries request content; encrypted and commitment-only payloads are opaque
-/// to the policy engine.
+/// carries request content; encrypted payloads are byte-limited but not
+/// inspected, and commitment-only payloads are opaque.
 pub fn check_tx(policy: &Policy, tx: &TxEnvelope) -> Result<(), GateError> {
     if tx.data.r#type != TxKind::SubmitInference {
         return Ok(());
@@ -66,17 +66,19 @@ pub fn check_tx(policy: &Policy, tx: &TxEnvelope) -> Result<(), GateError> {
         .get("targetModel")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    let encrypted = data
+    // Serialize the envelope so the byte limit covers the actual ciphertext and
+    // its metadata, not just an empty placeholder.
+    let encrypted_payload = data
         .get("encryptedInput")
-        .map(|value| !value.is_null())
-        .unwrap_or(false);
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::to_string(value).unwrap_or_default());
     let plaintext = data
         .get("input")
         .and_then(|value| value.as_str())
         .unwrap_or("");
 
-    let (kind, input) = if encrypted {
-        (InputKind::Encrypted, "")
+    let (kind, input) = if let Some(payload) = encrypted_payload.as_deref() {
+        (InputKind::Encrypted, payload)
     } else if !plaintext.is_empty() {
         (InputKind::Plaintext, plaintext)
     } else {
@@ -193,6 +195,42 @@ mod tests {
             check_tx(&policy, &tx).unwrap_err().code(),
             "encrypted_input"
         );
+    }
+
+    #[test]
+    fn encrypted_input_obeys_the_byte_limit() {
+        let path = temp_path("encrypted-size.json");
+        std::fs::write(&path, r#"{ "maxInputBytes": 256 }"#).unwrap();
+        let policy = load_from_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let oversized = signed_inference(json!({
+            "targetModel": "m",
+            "encryptedInput": {
+                "ephemeralPublicKey": "ab".repeat(32),
+                "nonce": "00".repeat(12),
+                "ciphertext": "AA".repeat(256),
+            },
+            "inputCommitment": "ab".repeat(32),
+            "maxFee": 100,
+            "deadline": 1000,
+        }));
+        let error = check_tx(&policy, &oversized).unwrap_err();
+        assert_eq!(error.code(), "input_too_long");
+        assert!(error.message().contains("256"));
+
+        let small = signed_inference(json!({
+            "targetModel": "m",
+            "encryptedInput": {
+                "ephemeralPublicKey": "ab".repeat(32),
+                "nonce": "00".repeat(12),
+                "ciphertext": "AAAA",
+            },
+            "inputCommitment": "ab".repeat(32),
+            "maxFee": 100,
+            "deadline": 1000,
+        }));
+        assert!(check_tx(&policy, &small).is_ok());
     }
 
     #[test]

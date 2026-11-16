@@ -3,7 +3,10 @@
 //! the Rust execution core with real Ed25519 identities.
 
 use ed25519_dalek::Signer;
-use verinoo_exec::engine::{current_head, produce_block, validate_block, Block, ProducerKey};
+use verinoo_exec::engine::{
+    current_head, produce_block, produce_block_with_report, validate_block, Block, ProducerKey,
+    GAS_LIMIT_SKIP_REASON,
+};
 use verinoo_state::genesis::CHAIN_ID;
 use verinoo_state::StateStore;
 use verinoo_types::canonical::UnsignedPayload;
@@ -147,6 +150,48 @@ fn mandatory_gas_fee_split_and_transfer() {
         chain.store.account_or_default("treasury").balance as u64,
         50 - 50 * 3 / 4
     );
+}
+
+#[test]
+fn produce_reports_transactions_skipped_for_the_block_gas_limit() {
+    let chain = Chain::fresh();
+    let kp = keypair("gas-skipped-sender");
+    let address = hex_key_address(&kp);
+    chain.fund(&address, 100_000);
+
+    // Transfers cost 50 gas each and the block limit is 1000, so the 21st
+    // transaction cannot fit.
+    let txs: Vec<_> = (1..=21)
+        .map(|nonce| {
+            make_tx(
+                &kp,
+                &address,
+                "recipient",
+                0,
+                TxKind::Transfer,
+                serde_json::json!({}),
+                nonce,
+            )
+        })
+        .collect();
+    let skipped_id = txs[20].tx_id.clone();
+
+    let produced =
+        produce_block_with_report(&chain.store, &txs, &chain.producer, chain.now_ms).unwrap();
+    assert_eq!(produced.block.transactions.len(), 20);
+    assert_eq!(
+        produced.skipped,
+        vec![(skipped_id, GAS_LIMIT_SKIP_REASON.to_string())]
+    );
+
+    let head = current_head(&chain.store).unwrap();
+    validate_block(
+        &produced.block,
+        &head.header,
+        std::slice::from_ref(&chain.producer.address),
+        chain.now_ms,
+    )
+    .expect("produced block must pass its own gate");
 }
 
 fn hex_key_address(kp: &ed25519_dalek::SigningKey) -> String {

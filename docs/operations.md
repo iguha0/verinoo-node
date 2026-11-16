@@ -151,9 +151,11 @@ Full threat model: [`docs/privacy.md`](privacy.md).
 - A missing or invalid file fails startup. There is no implicit fallback to a
   permissive policy; fix the file or unset the variable deliberately.
 - Policy changes require a restart. The file is not reloaded on SIGHUP.
-- Only plaintext `input` is inspected. `encryptedInput` and commitment-only
-  submissions are opaque: with `requirePlaintext: false` they pass, with
-  `requirePlaintext: true` they are rejected.
+- Plaintext `input` is inspected for blocked content. `maxInputBytes` applies
+  to plaintext and to the serialized `encryptedInput` envelope, so ciphertext
+  cannot bypass the byte limit. Encrypted and commitment-only submissions are
+  not content-searched: with `requirePlaintext: false` they pass model/size
+  checks, with `requirePlaintext: true` they are rejected.
 - Rejections are `422` with `reason: "policy"` and a stable `policyReason`
   (`blocked_term`, `blocked_pattern`, `model_not_allowed`, `input_too_long`,
   `encrypted_input`). Blocked terms are never echoed in responses or logs.
@@ -166,16 +168,35 @@ Full threat model: [`docs/privacy.md`](privacy.md).
 ## Batch and task event streams
 
 - `POST /v1/infer/batch` accepts 1–32 signed transaction envelopes and applies
-  the same per-item checks as `/v1/infer`. Nonce and balance use a batch-local
-  overlay seeded from committed state, so consecutive nonces from one sender
-  are admitted in order; the overlay advances only for accepted items.
-  Accepted items are pushed and gossiped; rejected items are reported by
-  index. Admission is not a reservation: block production re-validates against
-  evolving state. Empty or oversized batches are `400`; an unauthenticated
-  request is `401`.
+  the same per-item checks as `/v1/infer`. The 32-item count is a transport
+  cap, not the real capacity: the whole batch must fit one block's gas
+  (`1000`). `submitInference` costs 60 gas (120 for `sampled`, 240 for
+  `full-zk`), so at most 16 optimistic inference items fit in one batch. A
+  batch over the gas limit is rejected with `400` before any item is admitted.
+- Nonce and balance use a batch-local overlay seeded from committed state, so
+  consecutive nonces from one sender are admitted in order; the overlay
+  advances only for accepted items. A rejected middle item therefore cascades:
+  later items from the same sender fail their nonce check until the missing
+  nonce is submitted. Other senders are independent.
+- After request-level checks (shape, size, auth, gas capacity), the endpoint
+  returns `200` with per-item results even if every item is rejected. Accepted
+  items are pushed and gossiped; rejected items are reported by index.
+  Admission is not a reservation: block production re-validates against
+  evolving state. Empty, oversized or over-gas batches are `400`; an
+  unauthenticated request is `401`.
+- The mempool admits at most **5000 transactions** across RPC and gossip. A
+  single submission returns `429` when full; a batch reports a per-item
+  `mempool is full` error and still returns `200`.
+- Gas-limited transactions left out of a produced block are re-queued at the
+  front of the mempool in their original order; invalid or reverted
+  transactions are dropped.
 - `GET /v1/tasks/:id/events` is a Server-Sent Events stream with `status`,
   `result`, `done`, and `timeout` events. It polls about once per second and
-  ends after 60 seconds. A missing task is `404` JSON before streaming.
+  ends after 60 seconds. The task row is created only when the block carrying
+  the `submitInference` is applied, so both the task read and the stream return
+  `404` until then; retry after the transaction is included.
+- At most **64 concurrent event streams** are allowed per process. A request
+  beyond that limit returns `429`; the slot is released when the stream ends.
 - The stream exposes only committed task state and receipts. It does not emit
   token-level previews; unverified execution previews are not implemented.
 - SSE needs proxy buffering disabled (for example nginx
