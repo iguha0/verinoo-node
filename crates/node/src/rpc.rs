@@ -455,6 +455,7 @@ fn auth_error(e: AuthError) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+#[derive(Debug)]
 struct AcceptedTx {
     tx_id: String,
     task_id: Option<String>,
@@ -510,75 +511,146 @@ impl SubmitError {
     }
 }
 
-async fn submit_one(
+#[derive(Debug)]
+struct BatchAccount {
+    next_nonce: u64,
+    available_balance: i128,
+}
+
+#[derive(Debug, Default)]
+struct BatchOverlay {
+    accounts: HashMap<String, BatchAccount>,
+}
+
+impl BatchOverlay {
+    fn account(&mut self, store: &verinoo_state::StateStore, address: &str) -> &mut BatchAccount {
+        self.accounts.entry(address.to_string()).or_insert_with(|| {
+            let account = store.account_or_default(address);
+            BatchAccount {
+                next_nonce: account.nonce + 1,
+                available_balance: account.balance as i128,
+            }
+        })
+    }
+
+    fn record(&mut self, address: &str, value: u64, fee: u64) {
+        if let Some(account) = self.accounts.get_mut(address) {
+            account.next_nonce += 1;
+            account.available_balance -= value as i128 + fee as i128;
+        }
+    }
+}
+
+fn is_stateful_validation_error(error: &str) -> bool {
+    error.starts_with("bad nonce") || error == "insufficient balance for value + gas"
+}
+
+fn transaction_fee(tx: &verinoo_types::tx::TxEnvelope, base_fee: u64) -> Result<u64, String> {
+    let data = serde_json::to_value(&tx.data).unwrap();
+    let multiplier = match verinoo_exec::gas::policy_of_tx(&data) {
+        Some(policy) => verinoo_exec::gas::policy_multiplier(Some(policy))?,
+        None => 1,
+    };
+    Ok(verinoo_exec::gas::gas_cost_for(&data) * base_fee * multiplier)
+}
+
+fn validate_batch_item(
+    store: &verinoo_state::StateStore,
+    base_fee: u64,
+    overlay: &mut BatchOverlay,
+    tx: &verinoo_types::tx::TxEnvelope,
+) -> Result<u64, String> {
+    // Consensus validation runs stateful checks last, so a nonce/balance
+    // rejection means the stateless checks already passed. Re-evaluate only
+    // the stateful rules against the batch overlay.
+    let validator = verinoo_exec::Validator { store, base_fee };
+    match validator.validate_transaction(tx) {
+        Ok(()) => {}
+        Err(error) if is_stateful_validation_error(&error) => {}
+        Err(error) => return Err(error),
+    }
+
+    let account = overlay.account(store, &tx.from);
+    if tx.nonce != account.next_nonce {
+        return Err(format!("bad nonce (have {})", account.next_nonce - 1));
+    }
+    let fee = transaction_fee(tx, base_fee)?;
+    let total = tx.value as i128 + fee as i128;
+    if account.available_balance < total {
+        return Err("insufficient balance for value + gas".into());
+    }
+    Ok(fee)
+}
+
+fn check_caller(
+    caller: Option<&Caller>,
+    tx: &verinoo_types::tx::TxEnvelope,
+) -> Result<(), SubmitError> {
+    if let Some(caller) = caller {
+        if caller.address != tx.from {
+            return Err(SubmitError::Auth(AuthError::AddressMismatch));
+        }
+    }
+    Ok(())
+}
+
+fn check_inference_submission(
+    shared: &Shared,
+    tx: &verinoo_types::tx::TxEnvelope,
+) -> Result<(), SubmitError> {
+    if tx.data.r#type != verinoo_types::tx::TxKind::SubmitInference {
+        return Ok(());
+    }
+
+    let has_encrypted = tx
+        .data
+        .data
+        .get("encryptedInput")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let has_plain = tx
+        .data
+        .data
+        .get("input")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let bad = |msg: &str| SubmitError::Invalid(msg.to_string());
+    if has_encrypted && has_plain {
+        return Err(bad("submit either input or encryptedInput, not both"));
+    }
+    match verinoo_exec::engine::parse_sampling(tx.data.data.get("sampling")) {
+        Err(e) => return Err(SubmitError::Invalid(e)),
+        Ok(Some(spec)) => {
+            let target = tx.data.data["targetModel"].as_str().unwrap_or("");
+            if let Some(model) = verinoo_exec::engine::ExecModel::resolve(target) {
+                if let Err(e) = model.validate_sampling(&spec) {
+                    return Err(SubmitError::Invalid(e));
+                }
+            }
+        }
+        Ok(None) => {}
+    }
+    // Commitment-only submissions are allowed for the manual-claim path.
+    if encrypted_input_required() && !has_encrypted {
+        return Err(bad(
+            "this node requires encrypted input; fetch /v1/input-key and send encryptedInput",
+        ));
+    }
+    if has_encrypted && verinoo_crypto::input_key().is_none() {
+        return Err(bad("this node has no input key configured"));
+    }
+    policy_gate::check_tx(&shared.request_policy, tx).map_err(SubmitError::Policy)?;
+    Ok(())
+}
+
+async fn admit_tx(
     shared: &Shared,
     net: &verinoo_network::NetworkNode,
     auth: &Auth,
     caller: Option<&Caller>,
     tx: verinoo_types::tx::TxEnvelope,
 ) -> Result<AcceptedTx, SubmitError> {
-    if let Some(caller) = caller {
-        if caller.address != tx.from {
-            return Err(SubmitError::Auth(AuthError::AddressMismatch));
-        }
-    }
-
-    // Full validation at submission time — fail fast with the exact reason.
-    // (Stateful rules like nonce/balance are evaluated against current state;
-    // they are re-checked at block production per reference semantics.)
-    let base_fee = shared
-        .store
-        .meta_u64_or("baseFee", shared.params.initial_base_fee);
-    let validator = verinoo_exec::Validator {
-        store: &shared.store,
-        base_fee,
-    };
-    validator
-        .validate_transaction(&tx)
-        .map_err(SubmitError::Invalid)?;
-
-    if tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference {
-        let has_encrypted = tx
-            .data
-            .data
-            .get("encryptedInput")
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
-        let has_plain = tx
-            .data
-            .data
-            .get("input")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        let bad = |msg: &str| SubmitError::Invalid(msg.to_string());
-        if has_encrypted && has_plain {
-            return Err(bad("submit either input or encryptedInput, not both"));
-        }
-        match verinoo_exec::engine::parse_sampling(tx.data.data.get("sampling")) {
-            Err(e) => return Err(SubmitError::Invalid(e)),
-            Ok(Some(spec)) => {
-                let target = tx.data.data["targetModel"].as_str().unwrap_or("");
-                if let Some(model) = verinoo_exec::engine::ExecModel::resolve(target) {
-                    if let Err(e) = model.validate_sampling(&spec) {
-                        return Err(SubmitError::Invalid(e));
-                    }
-                }
-            }
-            Ok(None) => {}
-        }
-        // Commitment-only submissions are allowed for the manual-claim path.
-        if encrypted_input_required() && !has_encrypted {
-            return Err(bad(
-                "this node requires encrypted input; fetch /v1/input-key and send encryptedInput",
-            ));
-        }
-        if has_encrypted && verinoo_crypto::input_key().is_none() {
-            return Err(bad("this node has no input key configured"));
-        }
-        policy_gate::check_tx(&shared.request_policy, &tx).map_err(SubmitError::Policy)?;
-    }
-
     let mut mp = shared.mempool.lock().await;
     if mp.iter().any(|t| t.tx_id == tx.tx_id) {
         return Err(SubmitError::Conflict("already in mempool".into()));
@@ -602,6 +674,51 @@ async fn submit_one(
         tx_id: tx.tx_id,
         task_id,
     })
+}
+
+async fn submit_one(
+    shared: &Shared,
+    net: &verinoo_network::NetworkNode,
+    auth: &Auth,
+    caller: Option<&Caller>,
+    tx: verinoo_types::tx::TxEnvelope,
+) -> Result<AcceptedTx, SubmitError> {
+    check_caller(caller, &tx)?;
+
+    // Full validation at submission time — fail fast with the exact reason.
+    // (Stateful rules like nonce/balance are evaluated against current state;
+    // they are re-checked at block production per reference semantics.)
+    let base_fee = shared
+        .store
+        .meta_u64_or("baseFee", shared.params.initial_base_fee);
+    let validator = verinoo_exec::Validator {
+        store: &shared.store,
+        base_fee,
+    };
+    validator
+        .validate_transaction(&tx)
+        .map_err(SubmitError::Invalid)?;
+
+    check_inference_submission(shared, &tx)?;
+
+    admit_tx(shared, net, auth, caller, tx).await
+}
+
+async fn submit_batch_item(
+    shared: &Shared,
+    net: &verinoo_network::NetworkNode,
+    auth: &Auth,
+    caller: Option<&Caller>,
+    base_fee: u64,
+    overlay: &mut BatchOverlay,
+    tx: verinoo_types::tx::TxEnvelope,
+) -> Result<(AcceptedTx, u64), SubmitError> {
+    check_caller(caller, &tx)?;
+    let fee =
+        validate_batch_item(&shared.store, base_fee, overlay, &tx).map_err(SubmitError::Invalid)?;
+    check_inference_submission(shared, &tx)?;
+    let accepted = admit_tx(shared, net, auth, caller, tx).await?;
+    Ok((accepted, fee))
 }
 
 async fn submit_tx(
@@ -676,6 +793,10 @@ async fn v1_submit_batch(
 
     let mut results = Vec::with_capacity(transactions.len());
     let mut accepted_count = 0usize;
+    let base_fee = shared
+        .store
+        .meta_u64_or("baseFee", shared.params.initial_base_fee);
+    let mut overlay = BatchOverlay::default();
     for (index, value) in transactions.iter().enumerate() {
         let hinted_tx_id = value
             .get("txId")
@@ -695,8 +816,21 @@ async fn v1_submit_batch(
             }
         };
         let tx_id = tx.tx_id.clone();
-        match submit_one(&shared, &net, &auth, caller.as_ref(), tx).await {
-            Ok(accepted) => {
+        let from = tx.from.clone();
+        let value = tx.value;
+        match submit_batch_item(
+            &shared,
+            &net,
+            &auth,
+            caller.as_ref(),
+            base_fee,
+            &mut overlay,
+            tx,
+        )
+        .await
+        {
+            Ok((accepted, fee)) => {
+                overlay.record(&from, value, fee);
                 accepted_count += 1;
                 results.push(serde_json::json!({
                     "index": index,
@@ -1687,6 +1821,16 @@ mod tests {
         shared.store.set_account(&account);
     }
 
+    fn transaction_fee(shared: &Shared, tx: &verinoo_types::tx::TxEnvelope) -> u64 {
+        let data = serde_json::to_value(&tx.data).unwrap();
+        verinoo_exec::gas::gas_cost_for(&data)
+            * shared
+                .store
+                .meta_u64_or("baseFee", shared.params.initial_base_fee)
+            * verinoo_exec::gas::policy_multiplier(verinoo_exec::gas::policy_of_tx(&data))
+                .unwrap_or(1)
+    }
+
     fn signed_inference(
         signing: &ed25519_dalek::SigningKey,
         from: &str,
@@ -2001,6 +2145,257 @@ mod tests {
             .to_lowercase()
             .contains("secretproject"));
         assert_eq!(body["results"][1]["accepted"], true);
+        assert_eq!(shared.mempool.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_accepts_consecutive_nonces_from_one_sender() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(11);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let first = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "first prompt"),
+            1,
+        );
+        let second = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "second prompt"),
+            2,
+        );
+        let first_task = verinoo_exec::engine::task_id_for(&first).unwrap();
+        let second_task = verinoo_exec::engine::task_id_for(&second).unwrap();
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(&second).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(body["accepted"], 2);
+        assert_eq!(body["rejected"], 0);
+        assert_eq!(body["results"][0]["index"], 0);
+        assert_eq!(body["results"][0]["accepted"], true);
+        assert_eq!(body["results"][0]["txId"], first.tx_id);
+        assert_eq!(body["results"][0]["taskId"], first_task);
+        assert_eq!(body["results"][1]["index"], 1);
+        assert_eq!(body["results"][1]["accepted"], true);
+        assert_eq!(body["results"][1]["txId"], second.tx_id);
+        assert_eq!(body["results"][1]["taskId"], second_task);
+        assert_ne!(first_task, second_task);
+        assert_eq!(shared.store.account_or_default(&address).nonce, 0);
+
+        let mp = shared.mempool.lock().await;
+        assert_eq!(mp.len(), 2);
+        assert_eq!(mp[0].tx_id, first.tx_id);
+        assert_eq!(mp[1].tx_id, second.tx_id);
+    }
+
+    #[tokio::test]
+    async fn batch_nonce_gap_rejects_only_that_item_without_advancing_the_overlay() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(12);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let first = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "first prompt"),
+            1,
+        );
+        let gap = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "gap prompt"),
+            3,
+        );
+        let after_gap = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "after gap"),
+            2,
+        );
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(&gap).unwrap(),
+                serde_json::to_value(&after_gap).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(body["accepted"], 2);
+        assert_eq!(body["rejected"], 1);
+        assert_eq!(body["results"][0]["accepted"], true);
+        assert_eq!(body["results"][1]["index"], 1);
+        assert_eq!(body["results"][1]["accepted"], false);
+        assert_eq!(body["results"][1]["txId"], gap.tx_id);
+        assert!(body["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("bad nonce"));
+        assert_eq!(body["results"][2]["index"], 2);
+        assert_eq!(body["results"][2]["accepted"], true);
+        assert_eq!(body["results"][2]["txId"], after_gap.tx_id);
+
+        let mp = shared.mempool.lock().await;
+        assert_eq!(mp.len(), 2);
+        assert_eq!(mp[0].tx_id, first.tx_id);
+        assert_eq!(mp[1].tx_id, after_gap.tx_id);
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_only_the_item_that_exceeds_the_overlay_balance() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(13);
+        let address = key_address(&signing);
+
+        let first = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "first prompt"),
+            1,
+        );
+        let second = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "second prompt"),
+            2,
+        );
+        let mut account = shared.store.account_or_default(&address);
+        account.balance = transaction_fee(&shared, &first) as i64;
+        shared.store.set_account(&account);
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(&second).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(body["accepted"], 1);
+        assert_eq!(body["rejected"], 1);
+        assert_eq!(body["results"][0]["txId"], first.tx_id);
+        assert_eq!(body["results"][0]["accepted"], true);
+        assert_eq!(body["results"][1]["index"], 1);
+        assert_eq!(body["results"][1]["accepted"], false);
+        assert_eq!(body["results"][1]["txId"], second.tx_id);
+        assert_eq!(
+            body["results"][1]["error"],
+            "insufficient balance for value + gas"
+        );
+
+        let mp = shared.mempool.lock().await;
+        assert_eq!(mp.len(), 1);
+        assert_eq!(mp[0].tx_id, first.tx_id);
+    }
+
+    #[tokio::test]
+    async fn batch_overlays_are_independent_per_sender() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let first_signing = test_key(14);
+        let first_address = key_address(&first_signing);
+        let second_signing = test_key(15);
+        let second_address = key_address(&second_signing);
+        fund(&shared, &first_address);
+        fund(&shared, &second_address);
+
+        let first = signed_inference(
+            &first_signing,
+            &first_address,
+            inference_data(&first_address, "tiny-gpt-v1", "first sender"),
+            1,
+        );
+        let second = signed_inference(
+            &second_signing,
+            &second_address,
+            inference_data(&second_address, "tiny-gpt-v1", "second sender"),
+            1,
+        );
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(&first).unwrap(),
+                serde_json::to_value(&second).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(body["accepted"], 2);
+        assert_eq!(body["rejected"], 0);
+        assert_eq!(shared.mempool.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn single_tx_submission_still_validates_against_committed_nonce() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(16);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let first = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "first prompt"),
+            1,
+        );
+        let next_nonce = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "next prompt"),
+            2,
+        );
+        submit_one(&shared, &net, &auth, None, first).await.unwrap();
+        let error = submit_one(&shared, &net, &auth, None, next_nonce)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SubmitError::Invalid(message) if message.starts_with("bad nonce")
+        ));
         assert_eq!(shared.mempool.lock().await.len(), 1);
     }
 

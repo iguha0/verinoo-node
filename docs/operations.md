@@ -166,9 +166,13 @@ Full threat model: [`docs/privacy.md`](privacy.md).
 ## Batch and task event streams
 
 - `POST /v1/infer/batch` accepts 1–32 signed transaction envelopes and applies
-  the same per-item checks as `/v1/infer`. Accepted items are pushed and
-  gossiped; rejected items are reported by index. Empty or oversized batches
-  are `400`; an unauthenticated request is `401`.
+  the same per-item checks as `/v1/infer`. Nonce and balance use a batch-local
+  overlay seeded from committed state, so consecutive nonces from one sender
+  are admitted in order; the overlay advances only for accepted items.
+  Accepted items are pushed and gossiped; rejected items are reported by
+  index. Admission is not a reservation: block production re-validates against
+  evolving state. Empty or oversized batches are `400`; an unauthenticated
+  request is `401`.
 - `GET /v1/tasks/:id/events` is a Server-Sent Events stream with `status`,
   `result`, `done`, and `timeout` events. It polls about once per second and
   ends after 60 seconds. A missing task is `404` JSON before streaming.

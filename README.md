@@ -184,9 +184,12 @@ curl -s localhost:7100/v1/verify/<taskId> | jq '{verified, output}'
 ### Batch submission
 
 `POST /v1/infer/batch` accepts `{"transactions":[<signed TxEnvelope>, ...]}` with
-1–32 items. Each item runs the same auth, signature, nonce/balance, sampling,
-encryption and policy checks as `POST /v1/infer`. Accepted transactions enter
-the mempool and are gossiped independently; the response reports every item in
+1–32 items. Each item runs the same auth, signature, sampling, encryption and
+policy checks as `POST /v1/infer`. Nonce and balance are checked against a
+batch-local overlay seeded from committed state, so consecutive nonces from
+one sender are accepted in order. The overlay advances only when an item is
+admitted; a rejected item leaves it unchanged. Accepted transactions enter the
+mempool and are gossiped independently; the response reports every item in
 input order:
 
 ```json
@@ -202,9 +205,11 @@ input order:
 
 Partial success is intentional: a bad item does not roll back its siblings.
 Batching is not a consensus batch and gives no gas discount; each transaction
-keeps its own task id and receipt. An empty or oversized batch is `400`, an
-unauthenticated request is `401`, and per-item failures are reported in
-`results` with the batch still returning `200`.
+keeps its own task id and receipt. Batch admission is not a reservation: block
+production re-validates against evolving state and may skip an admitted
+transaction if a competing submission wins the nonce or balance. An empty or
+oversized batch is `400`, an unauthenticated request is `401`, and per-item
+failures are reported in `results` with the batch still returning `200`.
 
 ### Task event stream
 
