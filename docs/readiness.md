@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (180 tests) |
+| Test suite | green | `cargo test --workspace --locked` (221 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -53,7 +53,11 @@ claims a technical buyer will test in the first diligence call.
 | Node readiness | works | `/ready` fresh-head, syncing, peer-lag and validator-set consistency; `/status` fields |
 | Per-task sampling | works | temperature/top-k/top-p/seed bound in the tx/task id and receipt; v2 block gate; verify checks it |
 | Protocol v2 blocks | works | v1 historical replay accepted; sampling is v2-only; coordinated validator upgrade required |
-| Policy library | works (library) | deterministic input/output policy, 12 tests; not wired into the RPC yet |
+| Policy library | works (library) | deterministic input/output policy, 12 tests |
+| Policy API boundary | works (plaintext) | `VNN_POLICY_FILE`, byte limits, model allowlist, blocked terms/patterns, redaction rejection; encrypted inputs size-only |
+| Batch inference API | works | `/v1/infer/batch`, 1–32 txs, per-item results, nonce/balance overlay, block-gas cap, gas-skip requeue, mempool cap |
+| Task SSE | works (final-only) | `/v1/tasks/:id/events`, status/result/done, 60s cap, 64-stream limit; no token stream |
+| Snapshot state layer | works (library) | RocksDB checkpoint, manifest, hash verification, TOCTOU-hardened apply/rollback, 18 tests; no node endpoints/signing |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
@@ -183,6 +187,16 @@ claims a technical buyer will test in the first diligence call.
   It is not yet called by the API or SDKs; encrypted inputs are opaque to it.
 - Implementation plans for production LLM serving (GPU, batching, streaming,
   safety) and HA/BFT phases in `docs/plans/`.
+- API batch fan-out and final-only task SSE, with a block-gas precheck, a
+  gas-skip requeue in the producer loop, a 5,000-entry mempool cap and a
+  64-stream SSE limit.
+- The policy crate is wired into `/v1/infer`, `/tx` inference submissions and
+  every batch item. It checks plaintext content and ciphertext size; it never
+  mutates a signed transaction, runs in consensus, or changes receipts.
+- A state-layer snapshot create/verify/apply path with manifest hashing,
+  path-traversal checks, expectation re-verification at apply time and
+  backup/rollback. It is not exposed over RPC and does not verify signatures or
+  recompute the state root; those remain node/exec work.
 - `GET /ready` with `syncing`, peer lag, a canonical validator-set hash and
   fail-closed `validatorSetConsistent`; `/status` exposes the same fields.
   Automatic failover/fencing and snapshot sync remain unimplemented.
@@ -322,6 +336,9 @@ domain still belong to the older reference node.
   binary weights and deterministic sampling runs locally. It is not deployed or
   benchmarked as a service, and there is no GPU executor, batching, streaming,
   safety layer, 7B+ serving or LLaMA/SentencePiece/arbitrary checkpoint import.
-  The policy crate is a library only; it is not wired into the API, and it
-  cannot inspect encrypted inputs. Per-task sampling is v2-only and requires a
-  coordinated validator upgrade. "BFT" — the finality design is not implemented.
+  Batch is API fan-out, not runtime batching; SSE is final-only, not token
+  streaming. Policy checks only the API boundary and cannot inspect encrypted
+  content. Snapshot create/verify/apply is a state library only: no RPC
+  endpoints, manifest signing, state-root recomputation or automatic sync.
+  Per-task sampling is v2-only and requires a coordinated validator upgrade.
+  "BFT" — the finality design is not implemented.
