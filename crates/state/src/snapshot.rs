@@ -4,6 +4,12 @@
 //! recompute `compute_state_root` (that lives in `verinoo-exec`) and it does not
 //! verify signer identity. Callers supply the trusted metadata and verify the
 //! manifest signatures at the node layer.
+//!
+//! A snapshot directory must be immutable and trusted for the whole verify and
+//! apply operation. The state layer re-checks integrity and caller expectations
+//! immediately before the destructive rename and binds the apply to the exact
+//! verified manifest bytes, but path-based checks cannot close the final race
+//! against an attacker who can rewrite the snapshot directory during apply.
 
 use crate::StateStore;
 use serde::{Deserialize, Serialize};
@@ -26,6 +32,8 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 pub type ModelHashes = BTreeMap<String, String>;
 
+type ManifestDigest = [u8; 32];
+
 /// Caller-supplied metadata for a snapshot. The state layer records these
 /// values but cannot derive or validate their truth; `state_root` must come
 /// from `verinoo-exec` and the hashes from the local model/validator registries.
@@ -44,6 +52,9 @@ pub struct SnapshotMetadata {
 }
 
 /// Trusted values a verifier requires the manifest to match.
+///
+/// Every field is a caller-supplied assertion. The state layer compares the
+/// manifest to these values but cannot prove they reflect the canonical chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotExpectations {
     pub chain_id: String,
@@ -51,6 +62,11 @@ pub struct SnapshotExpectations {
     pub block_hash: String,
     pub parent_hash: String,
     pub state_root: String,
+    /// When `Some`, the manifest `baseFee` must equal this value (an absent
+    /// manifest `baseFee` is a mismatch). When `None`, `baseFee` is not
+    /// verified; do not treat that as implicit acceptance of the manifest
+    /// value.
+    pub base_fee: Option<u64>,
     pub model_set_hash: String,
     /// When set, the manifest model map must match exactly. When `None`, only
     /// `model_set_hash` is compared.
@@ -66,6 +82,7 @@ impl SnapshotExpectations {
             block_hash: metadata.block_hash.clone(),
             parent_hash: metadata.parent_hash.clone(),
             state_root: metadata.state_root.clone(),
+            base_fee: metadata.base_fee,
             model_set_hash: metadata.model_set_hash.clone(),
             model_hashes: Some(metadata.model_hashes.clone()),
             validator_set_hash: metadata.validator_set_hash.clone(),
@@ -153,6 +170,8 @@ pub enum SnapshotError {
     ParentHashMismatch { expected: String, actual: String },
     #[error("snapshot state root mismatch: expected {expected}, got {actual}")]
     StateRootMismatch { expected: String, actual: String },
+    #[error("snapshot base fee mismatch: expected {expected}, got {actual:?}")]
+    BaseFeeMismatch { expected: u64, actual: Option<u64> },
     #[error("snapshot model set hash mismatch: expected {expected}, got {actual}")]
     ModelSetHashMismatch { expected: String, actual: String },
     #[error("snapshot model hash mismatch for {model_id}: expected {expected}, got {actual}")]
@@ -165,6 +184,8 @@ pub enum SnapshotError {
     ValidatorSetHashMismatch { expected: String, actual: String },
     #[error("snapshot manifest is invalid: {0}")]
     InvalidManifest(String),
+    #[error("snapshot manifest changed during apply: expected {expected}, got {actual}")]
+    ManifestChanged { expected: String, actual: String },
     #[error("invalid snapshot path {path}: {reason}")]
     InvalidPath { path: String, reason: &'static str },
     #[error("snapshot path is a symlink: {0}")]
@@ -276,12 +297,27 @@ pub fn verify_snapshot(
     snapshot_dir: &Path,
     expected: &SnapshotExpectations,
 ) -> Result<SnapshotManifest, SnapshotError> {
-    let manifest = verify_snapshot_integrity(snapshot_dir)?;
+    let (manifest, _) = verify_snapshot_with_digest(snapshot_dir, expected)?;
+    Ok(manifest)
+}
 
+fn verify_snapshot_with_digest(
+    snapshot_dir: &Path,
+    expected: &SnapshotExpectations,
+) -> Result<(SnapshotManifest, ManifestDigest), SnapshotError> {
+    let (manifest, digest) = verify_snapshot_integrity(snapshot_dir)?;
+    verify_expectations(&manifest, expected)?;
+    Ok((manifest, digest))
+}
+
+fn verify_expectations(
+    manifest: &SnapshotManifest,
+    expected: &SnapshotExpectations,
+) -> Result<(), SnapshotError> {
     if manifest.chain_id != expected.chain_id {
         return Err(SnapshotError::ChainIdMismatch {
             expected: expected.chain_id.clone(),
-            actual: manifest.chain_id,
+            actual: manifest.chain_id.clone(),
         });
     }
     if manifest.height != expected.height {
@@ -293,31 +329,39 @@ pub fn verify_snapshot(
     if manifest.block_hash != expected.block_hash {
         return Err(SnapshotError::BlockHashMismatch {
             expected: expected.block_hash.clone(),
-            actual: manifest.block_hash,
+            actual: manifest.block_hash.clone(),
         });
     }
     if manifest.parent_hash != expected.parent_hash {
         return Err(SnapshotError::ParentHashMismatch {
             expected: expected.parent_hash.clone(),
-            actual: manifest.parent_hash,
+            actual: manifest.parent_hash.clone(),
         });
     }
     if manifest.state_root != expected.state_root {
         return Err(SnapshotError::StateRootMismatch {
             expected: expected.state_root.clone(),
-            actual: manifest.state_root,
+            actual: manifest.state_root.clone(),
         });
+    }
+    if let Some(expected_fee) = expected.base_fee {
+        if manifest.base_fee != Some(expected_fee) {
+            return Err(SnapshotError::BaseFeeMismatch {
+                expected: expected_fee,
+                actual: manifest.base_fee,
+            });
+        }
     }
     if manifest.model_set_hash != expected.model_set_hash {
         return Err(SnapshotError::ModelSetHashMismatch {
             expected: expected.model_set_hash.clone(),
-            actual: manifest.model_set_hash,
+            actual: manifest.model_set_hash.clone(),
         });
     }
     if manifest.validator_set_hash != expected.validator_set_hash {
         return Err(SnapshotError::ValidatorSetHashMismatch {
             expected: expected.validator_set_hash.clone(),
-            actual: manifest.validator_set_hash,
+            actual: manifest.validator_set_hash.clone(),
         });
     }
     if let Some(expected_hashes) = &expected.model_hashes {
@@ -328,8 +372,7 @@ pub fn verify_snapshot(
             ));
         }
     }
-
-    Ok(manifest)
+    Ok(())
 }
 
 /// Apply a snapshot to `target_db` after re-verifying file integrity.
@@ -339,26 +382,69 @@ pub fn verify_snapshot(
 /// must not already exist and is never deleted. A failure after the backup move
 /// renames the backup back. This does not verify trust metadata; use
 /// [`verify_snapshot`] or [`apply_verified_snapshot`] first.
+///
+/// The snapshot directory must be immutable and trusted during apply. Integrity
+/// is re-checked immediately before the state directory is moved, and apply is
+/// bound to the manifest bytes verified at entry.
 pub fn apply_snapshot(
     snapshot_dir: &Path,
     target_db: &Path,
     backup_dir: &Path,
 ) -> Result<(), SnapshotError> {
-    verify_snapshot_integrity(snapshot_dir)?;
-    apply_verified_state_dir(snapshot_dir, target_db, backup_dir, || Ok(()))
+    let (_, digest) = verify_snapshot_integrity(snapshot_dir)?;
+    verify_manifest_unchanged(snapshot_dir, &digest)?;
+    apply_verified_state_dir(snapshot_dir, target_db, backup_dir, || {
+        let (_, actual) = verify_snapshot_integrity(snapshot_dir).map_err(io::Error::other)?;
+        ensure_manifest_unchanged(&digest, &actual).map_err(io::Error::other)?;
+        Ok(())
+    })
 }
 
 /// Verify with caller expectations and then apply. Returns the verified
 /// manifest that was applied.
+///
+/// Full expectations are re-verified immediately before the state directory is
+/// moved, not just file integrity. Apply is bound to the exact manifest bytes
+/// seen by the first verification, so a snapshot swapped for a different valid
+/// snapshot is rejected. The snapshot directory must still be immutable and
+/// trusted: an attacker who can rewrite it between the final check and the
+/// rename can still race the apply.
 pub fn apply_verified_snapshot(
     snapshot_dir: &Path,
     expected: &SnapshotExpectations,
     target_db: &Path,
     backup_dir: &Path,
 ) -> Result<SnapshotManifest, SnapshotError> {
-    let manifest = verify_snapshot(snapshot_dir, expected)?;
-    apply_snapshot(snapshot_dir, target_db, backup_dir)?;
+    let (manifest, digest) = verify_snapshot_with_digest(snapshot_dir, expected)?;
+    verify_manifest_unchanged(snapshot_dir, &digest)?;
+    apply_verified_state_dir(snapshot_dir, target_db, backup_dir, || {
+        let (_, actual) =
+            verify_snapshot_with_digest(snapshot_dir, expected).map_err(io::Error::other)?;
+        ensure_manifest_unchanged(&digest, &actual).map_err(io::Error::other)?;
+        Ok(())
+    })?;
     Ok(manifest)
+}
+
+fn verify_manifest_unchanged(
+    snapshot_dir: &Path,
+    expected_digest: &ManifestDigest,
+) -> Result<(), SnapshotError> {
+    let (_, actual_digest) = read_manifest(snapshot_dir)?;
+    ensure_manifest_unchanged(expected_digest, &actual_digest)
+}
+
+fn ensure_manifest_unchanged(
+    expected: &ManifestDigest,
+    actual: &ManifestDigest,
+) -> Result<(), SnapshotError> {
+    if expected != actual {
+        return Err(SnapshotError::ManifestChanged {
+            expected: hex::encode(expected),
+            actual: hex::encode(actual),
+        });
+    }
+    Ok(())
 }
 
 /// Deterministic node-signing bytes: [`SIGNING_DOMAIN`], a newline, then
@@ -431,7 +517,7 @@ fn write_manifest(snapshot_dir: &Path, manifest: &SnapshotManifest) -> Result<()
     fs::rename(&tmp, &target).map_err(|e| io_err(&target, e))
 }
 
-fn read_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, SnapshotError> {
+fn read_manifest(snapshot_dir: &Path) -> Result<(SnapshotManifest, ManifestDigest), SnapshotError> {
     let path = snapshot_dir.join(MANIFEST_NAME);
     let meta = fs::symlink_metadata(&path).map_err(|e| io_err(&path, e))?;
     if meta.file_type().is_symlink() || !meta.is_file() {
@@ -441,6 +527,7 @@ fn read_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, SnapshotError>
         return Err(SnapshotError::ManifestTooLarge(meta.len()));
     }
     let bytes = fs::read(&path).map_err(|e| io_err(&path, e))?;
+    let digest = sha256_digest(&bytes);
     let manifest: SnapshotManifest = serde_json::from_slice(&bytes)?;
     if manifest.v != SNAPSHOT_VERSION {
         return Err(SnapshotError::UnsupportedVersion {
@@ -454,11 +541,22 @@ fn read_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, SnapshotError>
             actual: manifest.kind,
         });
     }
-    Ok(manifest)
+    Ok((manifest, digest))
 }
 
-fn verify_snapshot_integrity(snapshot_dir: &Path) -> Result<SnapshotManifest, SnapshotError> {
-    let manifest = read_manifest(snapshot_dir)?;
+fn sha256_digest(bytes: &[u8]) -> ManifestDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn verify_snapshot_integrity(
+    snapshot_dir: &Path,
+) -> Result<(SnapshotManifest, ManifestDigest), SnapshotError> {
+    let (manifest, digest) = read_manifest(snapshot_dir)?;
     let state_dir = snapshot_dir.join(STATE_DIR);
     let actual = collect_state_files(&state_dir)?;
     if actual.is_empty() {
@@ -496,7 +594,7 @@ fn verify_snapshot_integrity(snapshot_dir: &Path) -> Result<SnapshotManifest, Sn
     if let Some((path, _)) = listed.into_iter().next() {
         return Err(SnapshotError::FileMissingFromDisk(path));
     }
-    Ok(manifest)
+    Ok((manifest, digest))
 }
 
 fn first_model_hash_mismatch(expected: &ModelHashes, actual: &ModelHashes) -> SnapshotError {
@@ -920,6 +1018,17 @@ mod tests {
         ));
 
         let mut wrong = base.clone();
+        wrong.base_fee = Some(4);
+        assert!(matches!(
+            verify_snapshot(&snapshot_dir, &wrong),
+            Err(SnapshotError::BaseFeeMismatch { .. })
+        ));
+
+        let mut unchecked = base.clone();
+        unchecked.base_fee = None;
+        verify_snapshot(&snapshot_dir, &unchecked).unwrap();
+
+        let mut wrong = base.clone();
         wrong.model_set_hash = "00".into();
         assert!(matches!(
             verify_snapshot(&snapshot_dir, &wrong),
@@ -938,6 +1047,25 @@ mod tests {
         assert!(matches!(
             verify_snapshot(&snapshot_dir, &wrong),
             Err(SnapshotError::ValidatorSetHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn absent_manifest_base_fee_fails_a_some_expectation() {
+        let (_root, meta, snapshot_dir) = fixture("base-fee-absent");
+        let path = snapshot_dir.join(MANIFEST_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("baseFee");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let expected = SnapshotExpectations::from_metadata(&meta);
+        assert!(matches!(
+            verify_snapshot(&snapshot_dir, &expected),
+            Err(SnapshotError::BaseFeeMismatch {
+                expected: 3,
+                actual: None
+            })
         ));
     }
 
@@ -1092,6 +1220,135 @@ mod tests {
         apply_snapshot(&snapshot_dir, &target, &backup).unwrap();
         assert!(target.join("CURRENT").exists());
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn apply_replaces_existing_target_and_keeps_backup_intact() {
+        let (root, meta, snapshot_dir) = fixture("replace-target");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        {
+            let old = StateStore::open(&target).unwrap();
+            old.set_account(&Account {
+                address: "ai_old".into(),
+                public_key: "old-pk".into(),
+                nonce: 7,
+                balance: 11,
+                updated_at: 12,
+            });
+            old.set_meta_u64("baseFee", 99);
+        }
+
+        let expected = SnapshotExpectations::from_metadata(&meta);
+        let applied = apply_verified_snapshot(&snapshot_dir, &expected, &target, &backup).unwrap();
+        assert_eq!(applied.height, meta.height);
+        assert!(!snapshot_dir.join(STATE_DIR).exists());
+        assert!(backup.is_dir());
+
+        {
+            let old = StateStore::open(&backup).unwrap();
+            assert_eq!(old.get_account("ai_old").unwrap().balance, 11);
+            assert!(old.get_account("ai_alice").is_none());
+            assert_eq!(old.meta_u64_or("baseFee", 0), 99);
+        }
+
+        let new = StateStore::open(&target).unwrap();
+        assert_eq!(new.get_account("ai_alice").unwrap().balance, 500);
+        assert!(new.get_account("ai_old").is_none());
+        assert_eq!(new.get_task("task-1").unwrap().status, "pending");
+        assert_eq!(new.meta_u64_or("baseFee", 0), 3);
+    }
+
+    #[test]
+    fn apply_rejects_overlapping_snapshot_target_and_backup_paths() {
+        let (root, _meta, snapshot_dir) = fixture("overlap-paths");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&target).unwrap();
+        let state_dir = snapshot_dir.join(STATE_DIR);
+
+        let cases = [
+            (state_dir.clone(), backup.clone()),
+            (snapshot_dir.clone(), backup.clone()),
+            (target.clone(), state_dir.join("backup")),
+            (target.clone(), target.clone()),
+            (target.clone(), target.join("backup")),
+        ];
+        for (target_path, backup_path) in cases {
+            let err = apply_snapshot(&snapshot_dir, &target_path, &backup_path).unwrap_err();
+            assert!(
+                matches!(err, SnapshotError::OverlappingPaths(_)),
+                "{target_path:?} / {backup_path:?}: {err:?}"
+            );
+        }
+
+        let nested = root.path().join("backup-parent");
+        fs::create_dir_all(&nested).unwrap();
+        let err = apply_snapshot(&snapshot_dir, &nested.join("target"), &nested).unwrap_err();
+        assert!(matches!(err, SnapshotError::OverlappingPaths(_)));
+
+        assert!(state_dir.exists());
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn apply_verified_snapshot_rejects_manifest_changed_after_verify() {
+        let (root, meta, snapshot_dir) = fixture("toctou-manifest");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"old").unwrap();
+
+        let expected = SnapshotExpectations::from_metadata(&meta);
+        verify_snapshot(&snapshot_dir, &expected).unwrap();
+
+        let manifest_path = snapshot_dir.join(MANIFEST_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        value["stateRoot"] = json!("00");
+        fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let err = apply_verified_snapshot(&snapshot_dir, &expected, &target, &backup).unwrap_err();
+        assert!(matches!(
+            err,
+            SnapshotError::ManifestChanged { .. } | SnapshotError::StateRootMismatch { .. }
+        ));
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"old");
+        assert!(!backup.exists());
+        assert!(snapshot_dir.join(STATE_DIR).exists());
+    }
+
+    #[test]
+    fn apply_verified_snapshot_rejects_state_changed_after_verify() {
+        let (root, meta, snapshot_dir) = fixture("toctou-state");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"old").unwrap();
+
+        let expected = SnapshotExpectations::from_metadata(&meta);
+        let manifest = verify_snapshot(&snapshot_dir, &expected).unwrap();
+        let victim = manifest
+            .files
+            .iter()
+            .find(|file| file.size > 0)
+            .expect("checkpoint has a non-empty file");
+        let path = snapshot_dir.join(&victim.path);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+
+        let err = apply_verified_snapshot(&snapshot_dir, &expected, &target, &backup).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SnapshotError::HashMismatch { .. } | SnapshotError::SizeMismatch { .. }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"old");
+        assert!(!backup.exists());
+        assert!(snapshot_dir.join(STATE_DIR).exists());
     }
 
     #[test]

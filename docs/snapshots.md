@@ -13,7 +13,7 @@ certificates yet. See ADR 006 and "What remains" below.
 - Manifest parsing and structural validation.
 - File-set completeness, path, symlink, size, and hash checks.
 - Comparison against caller-supplied trusted metadata.
-- Atomic rename-based apply with a mandatory backup and rollback.
+- Atomic rename-based apply with rollback and a backup when the target exists.
 
 It does **not** own:
 
@@ -66,7 +66,9 @@ Field notes:
 
 - `v` must be `1`; `kind` must be `verinoo-state-snapshot`.
 - `baseFee` is optional. When absent it is omitted from serialization and
-  signing bytes.
+  signing bytes. It is not trusted implicitly: callers that care must set
+  `SnapshotExpectations.base_fee` to `Some(value)`, which requires an exact
+  match (an absent manifest value is a mismatch). `None` skips the check.
 - `files` lists every regular file under `state/`, sorted by path. Paths are
   relative, slash-separated, and must begin with `state/`.
 - `size` and `sha256` describe the bytes on disk, not the manifest.
@@ -92,12 +94,18 @@ or validate them.
 
 ## Trust boundaries
 
-The state layer verifies **file integrity**, not chain truth.
+The state layer verifies **file integrity**, not chain truth. `stateRoot`,
+`modelSetHash`, `modelHashes`, `validatorSetHash`, and `baseFee` are
+caller/node-level trust assertions: the state layer only checks that the
+manifest bytes equal the expected values supplied by the caller. It does not
+recompute the state root, derive model or validator hashes, or authenticate the
+source of those values. Signatures are never verified here.
 
 | Value | Source of truth for verify |
 |---|---|
 | `chainId`, `height`, `blockHash`, `parentHash` | Caller's expected checkpoint/head |
 | `stateRoot` | Caller-supplied value from `verinoo-exec`; never recomputed here |
+| `baseFee` | Caller-supplied expected value when `SnapshotExpectations.base_fee` is `Some`; not trusted implicitly |
 | `modelSetHash`, `modelHashes` | Caller's local model registry |
 | `validatorSetHash` | Caller's expected genesis or state-derived set |
 | `signatures` | Not trusted or verified by the state layer |
@@ -150,8 +158,8 @@ Checks performed before returning success:
 - Every on-disk file is listed, and every listed file exists.
 - Size and SHA-256 match for every file.
 - Caller expectations match for chain id, height, block hash, parent hash,
-  state root, model set hash, model hashes (when supplied), and validator set
-  hash.
+  state root, base fee (when supplied), model set hash, model hashes (when
+  supplied), and validator set hash.
 
 Signatures are returned in the manifest but are ignored by verification. A
 manifest with missing, empty, or arbitrary signatures can pass; signer identity
@@ -167,15 +175,25 @@ apply_verified_snapshot(&snapshot_dir, &expected, &target_db, &backup_dir)?;
 
 Requirements and semantics:
 
-- The target database **must not be open** by the node or any other process.
-  RocksDB keeps locks and in-memory state; renaming an open database is unsafe.
-- `apply_snapshot` re-runs full file-integrity verification immediately before
-  moving anything. `apply_verified_snapshot` additionally checks caller
-  expectations first.
-- Snapshot, target, and backup paths must not overlap; backups inside the
-  snapshot or target are rejected.
+- The target database **must not be open** by the node or any other process
+  that can read or write it. RocksDB keeps locks and in-memory state; renaming
+  an open database is unsafe. Stop the node before calling apply.
+- The snapshot directory **must be immutable and trusted** for the whole verify
+  and apply operation. The state layer re-verifies and binds apply to the exact
+  manifest bytes seen at entry, but it cannot stop an attacker who controls the
+  snapshot directory from racing the final check against the rename.
+- `apply_snapshot` re-runs full file-integrity verification, and
+  `apply_verified_snapshot` re-runs the full caller-expectations verification,
+  immediately before `snapshot_dir/state` is moved. Both also re-read the
+  manifest before touching the target and reject a changed manifest, so a
+  snapshot swapped for a different valid snapshot is not applied. A failure in
+  the final check after the target was moved to the backup rolls the target
+  back.
+- Snapshot, target, and backup paths must not overlap; a target that is or
+  contains `snapshot_dir/state`, a backup inside the snapshot or target, and
+  equal target/backup paths are rejected.
 - If `target_db` does not exist, `snapshot_dir/state` is renamed directly to
-  `target_db`. No backup is created.
+  `target_db`. No backup is created and `backup_dir` is not touched.
 - If `target_db` exists, it must be a real directory. `backup_dir` must not
   exist. The target is renamed to the backup first, then
   `snapshot_dir/state` is renamed to the target.

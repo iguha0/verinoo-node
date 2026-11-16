@@ -8,11 +8,12 @@ format.** `GET /ready`, the `syncing` flag, `peerCount`, `validatorSetHash`, and
 checks, DNS, and load balancer". The state layer also implements local snapshot
 create/verify/apply (`crates/state/src/snapshot.rs`, documented in
 `docs/snapshots.md`): RocksDB checkpointing, a hashed file manifest, strict
-path and file verification, and atomic apply with a mandatory backup and
-rollback. Node snapshot endpoints, manifest signing and signature verification,
-state-root recomputation for snapshots using `crates/exec`, and BFT
-certificates remain unimplemented. The rest of this document remains a target
-design: no code in this repository implements automatic failover, split-brain
+path and file verification, and atomic apply with rollback and a backup when
+replacing an existing database. Node snapshot endpoints, manifest signing and
+signature verification, state-root recomputation for snapshots using
+`crates/exec`, and BFT certificates remain unimplemented. The rest of this
+document remains a target design: no code in this repository implements
+automatic failover, split-brain
 protection, state snapshot transfer over the network, or a consensus
 validator-set change. Do not cite anything else here as shipped behavior.
 
@@ -320,16 +321,25 @@ genesis; it is not a substitute for the commit certificate.
 
 The apply step must be atomic from the node's perspective: a crash before the
 rename leaves the old database intact; a crash after the rename leaves the new
-snapshot. Keep the old directory until the node has applied at least one new
-block and produced a matching state root.
+snapshot. The database must be closed before apply and the snapshot directory
+must be immutable and trusted for the whole verify/apply operation. Keep the
+old directory until the node has applied at least one new block and produced a
+matching state root.
 
 State-layer scope today: `verify_snapshot` performs the local file-set checks
-from steps 3-4 (size/SHA-256, path safety, metadata comparison) for an
+from steps 3-4 (size/SHA-256, path safety, metadata comparison, and
+`baseFee` when the caller supplies `SnapshotExpectations.base_fee`) for an
 already-downloaded snapshot. `apply_snapshot` implements the rename and
-rollback portion of step 8 and consumes `state/`, leaving the backup in place.
-Network download/resume, state-root recomputation (step 4), signature
-verification (step 2), certificate verification (step 7), and head/catch-up
-setup (step 9) are not implemented.
+rollback portion of step 8 and consumes `state/`, leaving the backup in place
+when it replaces an existing database. Apply re-runs integrity or full
+expectations immediately before the state rename and is bound to the manifest
+bytes verified at entry, but the snapshot directory must still be immutable and
+trusted; the target database must be closed. Network download/resume,
+state-root recomputation (step 4), signature verification (step 2), certificate
+verification (step 7), and head/catch-up setup (step 9) are not implemented.
+The state layer treats `stateRoot`, `modelSetHash`, `modelHashes`,
+`validatorSetHash`, and `baseFee` as caller/node-level assertions; it does not
+derive or cryptographically verify them.
 
 ### Trust and rollback
 
@@ -556,11 +566,13 @@ external audit and a multi-operator testnet.
 Snapshot tests (the state-layer cases run in `crates/state/src/snapshot.rs`;
 the remaining cases are integration or node-level):
 
-The state-layer suite covers create/verify/apply, tampered files, metadata
-mismatches, path traversal/absolute paths/duplicates/missing files,
-backup/rollback, and stable signing bytes. The cases below that require a
-network endpoint, signature policy, state-root recomputation, or BFT remain
-unimplemented.
+The state-layer suite covers create/verify/apply, tampered files (including a
+manifest or state file changed between verify and apply), metadata mismatches
+(including `baseFee` expectations), path traversal/absolute paths/duplicates/
+missing files, successful replacement with an intact readable backup, rejected
+overlapping snapshot/target/backup paths, backup/rollback, and stable signing
+bytes. The cases below that require a network endpoint, signature policy,
+state-root recomputation, or BFT remain unimplemented.
 
 1. Build a store at height H, checkpoint it, write a manifest, apply it to a
    fresh temp store. Assert the state root, head hash, height, base fee, model
