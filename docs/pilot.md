@@ -90,7 +90,7 @@ curl -s http://localhost:7100/v1/verify/<taskId> | jq '{verified, outputMatches,
   DistilGPT-2 model is imported and parity-tested locally. It is not deployed on
   the public 1-CPU node and is slower than a 1 s block there. There is still no
   GPU executor, batching, streaming, safety layer, large-model (7B+) serving or
-  arbitrary-checkpoint import, so a Llama-class checkpoint cannot be served yet.
+  LLaMA/SentencePiece and other checkpoint import, so a Llama-class checkpoint cannot be served yet.
 - **Not ZK-proven.** The attention/matmul dispute path falls back to hash
   equality (ADR 003); `full-zk` is not what it sounds like.
 - **Catch-up, not snapshot sync.** A late node replays blocks from genesis via

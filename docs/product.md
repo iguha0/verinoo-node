@@ -79,7 +79,7 @@ the chain itself is inconsistent — that is the invariant a validator protects.
   largest tested model is Apache-2.0 DistilGPT-2 (81.9M parameters, 1,024-token
   context), imported and parity-tested locally but not served on the public
   node. There is still no GPU executor, batching, streaming, safety layer,
-  large-model (7B+) serving or arbitrary-checkpoint import, and the live demo is
+  large-model (7B+) serving or LLaMA/SentencePiece/other checkpoint import, and the live demo is
   still a 3.75M-parameter GPT-Neo. See
   [`docs/decoder.md`](decoder.md). Tasks for models a node has not loaded fall
   back to the manual claim → submit result flow and are **not** verified by the
@@ -196,6 +196,6 @@ GPT-style decoder also run in consensus, including a real 3.75M-parameter
 pretrained model with the GPT-2 tokenizer, a licensed 82M-parameter DistilGPT-2
 import with 1,024-token context and deterministic sampling. What is missing is
 production LLM serving: GPU execution, batching, streaming, safety and
-arbitrary-checkpoint import. DistilGPT-2 is local-only and slower than a 1 s
+LLaMA/SentencePiece and other checkpoint import. DistilGPT-2 is local-only and slower than a 1 s
 block on CPU. Everything around it — receipts, verification, metering,
 settlement — already works.

@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (124 tests) |
+| Test suite | green | `cargo test --workspace --locked` (155 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -48,6 +48,9 @@ claims a technical buyer will test in the first diligence call.
 | Binary decoder weights | works | `.vnnw` header + SHA-256 payload, tamper test; DistilGPT-2 328 MB |
 | Deterministic sampling | works | temperature/top-k/top-p + SplitMix64 seed; cold sampling equals greedy |
 | Licensed large decoder import | works (local) | Apache-2.0 DistilGPT-2, 81.9M params, 1,024 context, 16-token parity on 3 prompts; not public |
+| Zero-copy decoder weights | works | `.vnnw` mmap with SHA-256, tamper/negative tests, owned fallback |
+| Generic decoder import | works | config-driven GPT-2/GPT-Neo importer; 24 offline tests |
+| Node readiness | works | `/ready` fresh-head, syncing, peer-lag and validator-set consistency; `/status` fields |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
@@ -59,8 +62,9 @@ claims a technical buyer will test in the first diligence call.
    binary `.vnnw` weight format, and a licensed 81.9M-parameter DistilGPT-2 with
    1,024-token context is imported and matches its float reference locally. What
    is missing is serving: GPU execution, batching, streaming, safety filters, a
-   request queue, arbitrary-checkpoint import (LLaMA/SentencePiece) and 7B+
-   models. On the 1-CPU VPS DistilGPT-2 is slower than a 1 s consensus block, so
+   request queue and 7B+ models. The generic importer now covers GPT-2/GPT-Neo
+   checkpoints, but LLaMA/SentencePiece and other architectures are still
+   unsupported. On the 1-CPU VPS DistilGPT-2 is slower than a 1 s consensus block, so
    the public node still serves the small demo. Dense classifiers from ONNX/GGUF
    continue to work. This is the main product gap.
 2. **No finality.** `RoundRobin` selects producers; there are no prevote /
@@ -163,6 +167,13 @@ claims a technical buyer will test in the first diligence call.
   See [`docs/decoder.md`](decoder.md). DistilGPT-2 and TinyStories weights are
   downloaded locally and are not redistributed; TinyStories has no stated
   license, DistilGPT-2 is Apache 2.0 per its model card.
+- Zero-copy `.vnnw` loading with mmap, a required `weightsSha256` pin, atomic
+  writers and an owned fallback when mapping or alignment is unavailable.
+- A config-driven GPT-2/GPT-Neo importer (`scripts/import_hf_gpt.py`) with
+  offline shape/config tests; LLaMA/SentencePiece remains unsupported.
+- `GET /ready` with `syncing`, peer lag, a canonical validator-set hash and
+  fail-closed `validatorSetConsistent`; `/status` exposes the same fields.
+  Automatic failover/fencing and snapshot sync remain unimplemented.
 - A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
 
 ## Verified end-to-end (2-node product run)
@@ -298,5 +309,5 @@ domain still belong to the older reference node.
   128-token context; a licensed 81.9M DistilGPT-2 with 1,024-token context,
   binary weights and deterministic sampling runs locally. It is not deployed or
   benchmarked as a service, and there is no GPU executor, batching, streaming,
-  safety layer, 7B+ serving or arbitrary-checkpoint import. "BFT" — the finality
-  design is not implemented.
+  safety layer, 7B+ serving or LLaMA/SentencePiece/arbitrary checkpoint import.
+  "BFT" — the finality design is not implemented.

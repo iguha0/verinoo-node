@@ -107,6 +107,7 @@ def write_weights(path: Path, arrays: Sequence[np.ndarray]) -> str:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary.name, 0o644)
         os.replace(temporary.name, path)
     except BaseException:
         try:
