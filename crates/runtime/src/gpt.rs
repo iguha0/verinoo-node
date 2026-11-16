@@ -968,6 +968,10 @@ impl GptModel {
         &self.spec.sampling
     }
 
+    pub fn vocab_size(&self) -> usize {
+        self.spec.vocab.len()
+    }
+
     pub fn descriptor(&self) -> serde_json::Value {
         serde_json::json!({
             "modelId": self.spec.model_id,

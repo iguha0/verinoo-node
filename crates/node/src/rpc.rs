@@ -518,14 +518,11 @@ async fn submit_tx(
         }
         match verinoo_exec::engine::parse_sampling(tx.data.data.get("sampling")) {
             Err(e) => return Err(bad(&e)),
-            Ok(Some(_)) => {
+            Ok(Some(spec)) => {
                 let target = tx.data.data["targetModel"].as_str().unwrap_or("");
                 if let Some(model) = verinoo_exec::engine::ExecModel::resolve(target) {
-                    if !model.supports_sampling() {
-                        return Err(bad(&format!(
-                            "model `{}` does not support per-task sampling",
-                            model.model_id()
-                        )));
+                    if let Err(e) = model.validate_sampling(&spec) {
+                        return Err(bad(&e));
                     }
                 }
             }
@@ -744,6 +741,7 @@ async fn v1_verify(
             })))
         }
     };
+    let effective_sampling = model.effective_sampling_json(task.sampling.as_ref());
     let recomputed = match model.result_json_with_sampling(&plaintext, task.sampling.as_ref()) {
         Ok(output) => output,
         Err(reason) => {
@@ -759,10 +757,28 @@ async fn v1_verify(
     let on_chain = task.result_hash.clone().unwrap_or_default();
     let receipt = verinoo_exec::engine::receipt_for(&shared.store, &task_id);
     let matches = recomputed_hash == on_chain;
+    let receipt_output_matches = receipt
+        .as_ref()
+        .and_then(|r| r.get("outputHash"))
+        .and_then(|v| v.as_str())
+        == Some(recomputed_hash.as_str());
+    let expected_sampling_hash = effective_sampling
+        .as_ref()
+        .and_then(|value| verinoo_types::canonical::canonical_json(value).ok())
+        .map(|canonical| verinoo_model::sha256_hex(&canonical));
+    let receipt_sampling_hash = receipt
+        .as_ref()
+        .and_then(|r| r.get("samplingHash"))
+        .and_then(|v| v.as_str());
+    let sampling_matches = match receipt_sampling_hash {
+        None => true,
+        Some(actual) => expected_sampling_hash.as_deref() == Some(actual),
+    };
+    let receipt_matches = receipt_output_matches && sampling_matches;
 
     Ok(Json(serde_json::json!({
         "taskId": task_id,
-        "verified": matches && receipt.is_some(),
+        "verified": matches && receipt_matches,
         "outputMatches": matches,
         "anchored": receipt.is_some(),
         "recomputedHash": recomputed_hash,
@@ -770,7 +786,8 @@ async fn v1_verify(
         "output": recomputed,
         "modelId": model.model_id(),
         "weightsHash": model.weights_hash(),
-        "sampling": task.sampling,
+        "sampling": effective_sampling,
+        "samplingHash": expected_sampling_hash,
         "receipt": receipt,
     })))
 }
@@ -883,6 +900,73 @@ mod tests {
             peer_lag_blocks: 2,
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
+    }
+
+    static INSTALL_DECODER: std::sync::Once = std::sync::Once::new();
+
+    fn install_decoder() {
+        INSTALL_DECODER.call_once(|| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../models/tiny-gpt-v1.json");
+            let bytes = std::fs::read(path).expect("committed decoder model");
+            let model = verinoo_runtime::GptModel::from_bytes(&bytes).expect("valid decoder");
+            let mut decoders = verinoo_runtime::GptRegistry::empty();
+            decoders.insert(model).unwrap();
+            verinoo_runtime::gpt::install_gpt_once(decoders);
+        });
+    }
+
+    fn completed_decoder_task(
+        task_id: &str,
+        prompt: &str,
+        sampling: Option<verinoo_types::SamplingSpec>,
+    ) -> verinoo_state::models::InferenceTask {
+        let model = verinoo_exec::engine::ExecModel::resolve("tiny-gpt-v1").unwrap();
+        let output = model
+            .result_json_with_sampling(prompt, sampling.as_ref())
+            .unwrap();
+        verinoo_state::models::InferenceTask {
+            task_id: task_id.into(),
+            requester: ADDR.into(),
+            target_model: "tiny-gpt-v1".into(),
+            input_commitment: verinoo_model::sha256_hex(prompt),
+            input: prompt.into(),
+            encrypted_input: None,
+            max_fee: 100,
+            deadline: 1_000,
+            sampling,
+            verification_type: "optimistic".into(),
+            status: "completed".into(),
+            assigned_to: None,
+            collateral: 0,
+            result_hash: Some(verinoo_model::sha256_hex(&output)),
+            result_output: Some(output),
+            proof_data: None,
+            challenge_window_end: None,
+            game_id: None,
+            executed_at: 1,
+        }
+    }
+
+    fn stamp_test_receipts(shared: &Shared) {
+        let block = verinoo_exec::engine::Block {
+            header: verinoo_exec::engine::BlockHeader {
+                hash: "ab".repeat(32),
+                version: verinoo_exec::engine::HEADER_VERSION,
+                index: 1,
+                timestamp: 1_000,
+                previous_hash: "00".repeat(32),
+                validator: "validator".into(),
+                validator_pub_key: String::new(),
+                validator_signature: "sig".into(),
+                state_root: "00".repeat(32),
+                tx_root: "00".repeat(32),
+                inference_tasks_root: "00".repeat(32),
+                compute_root: "00".repeat(32),
+            },
+            transactions: vec![],
+        };
+        verinoo_exec::engine::stamp_receipts(&shared.store, &block);
     }
 
     fn set_test_head(shared: &Shared, index: u64, timestamp: u64) {
@@ -1180,5 +1264,100 @@ mod tests {
         )
         .await;
         assert!(other.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_reports_effective_sampling_and_rejects_tampered_receipts() {
+        install_decoder();
+        let shared = test_shared();
+        let spec = verinoo_types::SamplingSpec {
+            temperature_milli: 800,
+            top_k: 40,
+            top_p_milli: 900,
+            seed: 7,
+        };
+        let prompt = "please cancel";
+        let override_task_id = "verify-sampling-override";
+        let default_task_id = "verify-sampling-default";
+        shared.store.set_task(&completed_decoder_task(
+            override_task_id,
+            prompt,
+            Some(spec),
+        ));
+        shared
+            .store
+            .set_task(&completed_decoder_task(default_task_id, prompt, None));
+        stamp_test_receipts(&shared);
+
+        let Json(override_body) = v1_verify(
+            State(shared.clone()),
+            axum::extract::Path(override_task_id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(override_body["verified"], true);
+        assert_eq!(
+            override_body["sampling"],
+            serde_json::to_value(spec).unwrap()
+        );
+        let receipt = verinoo_exec::engine::receipt_for(&shared.store, override_task_id).unwrap();
+        assert_eq!(receipt["samplingHash"], override_body["samplingHash"]);
+
+        let Json(default_body) = v1_verify(
+            State(shared.clone()),
+            axum::extract::Path(default_task_id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(default_body["verified"], true);
+        let model = verinoo_exec::engine::ExecModel::resolve("tiny-gpt-v1").unwrap();
+        assert_eq!(
+            default_body["sampling"],
+            model.effective_sampling_json(None).unwrap()
+        );
+        let default_receipt =
+            verinoo_exec::engine::receipt_for(&shared.store, default_task_id).unwrap();
+        assert!(default_receipt.get("samplingHash").is_none());
+
+        let receipt_key = format!("receipt:{override_task_id}");
+        let mut tampered = receipt.clone();
+        tampered["outputHash"] = serde_json::json!("00".repeat(32));
+        shared.store.set_meta(&receipt_key, &tampered);
+        let Json(body) = v1_verify(
+            State(shared.clone()),
+            axum::extract::Path(override_task_id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["verified"], false);
+
+        let mut tampered = receipt.clone();
+        tampered["samplingHash"] = serde_json::json!("00".repeat(32));
+        shared.store.set_meta(&receipt_key, &tampered);
+        let Json(body) = v1_verify(
+            State(shared.clone()),
+            axum::extract::Path(override_task_id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body["verified"], false);
+
+        let mut legacy = receipt.clone();
+        if let Some(object) = legacy.as_object_mut() {
+            object.remove("sampling");
+            object.remove("samplingHash");
+            object.remove("samplingSource");
+        }
+        shared.store.set_meta(&receipt_key, &legacy);
+        let Json(body) = v1_verify(
+            State(shared.clone()),
+            axum::extract::Path(override_task_id.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body["verified"], true,
+            "old receipts without sampling fields stay compatible"
+        );
     }
 }

@@ -128,19 +128,41 @@ by adding the same object to `submitInference` data:
 ```
 
 The optional `sampling` object is canonical transaction data, so it changes
-`txId` and is bound to the derived task id. The task stores it, every validator
-uses it during deterministic execution, and `/v1/verify` recomputes with it.
-The receipt includes `sampling` and `samplingHash = sha256(canonical_json(
-sampling))`; `samplingSource` is `task` for an override and `model-default`
-when no override was supplied. Tasks without sampling keep the model default,
-so old tasks and receipts are unchanged.
+`txId` and is bound to the derived task id. The task stores it and every
+validator uses it during deterministic execution. Omitting the object keeps
+the model's default. Supplying it means the client chooses every field:
+omitted fields are zero, so `"sampling": {}` is a greedy override and does
+**not** inherit the model default.
 
-Range validation is enforced before execution: `temperatureMilli` `0..=100000`,
-`topK` `0..=1000000`, `topPMilli` `0..=1000`, and `seed` is any `u64`. Only
-decoder models accept sampling; submitting one for a classifier fails instead
-of being silently ignored. Every node and verifier must still load the same
-model file. If you change the model's default sampling for a published model,
-treat it as a new model version.
+Consensus validation (`Validator::validate_transaction`) parses and range-checks
+`sampling` before any state mutation or gas debit. A resolved non-decoder model
+rejects an override there, so a classifier task with sampling cannot enter a
+block even if a caller bypasses the RPC. If this node cannot resolve the model,
+the transaction is accepted and the task stays `pending`, exactly as for any
+other task this node cannot execute; no funds move and no failure is recorded.
+The RPC applies the same check early as a convenience, not as the authority.
+
+Ranges: `temperatureMilli` `0..=100000`, `topK` low end `0` and at most both
+`1_000_000` and the resolved decoder vocabulary, `topPMilli` `0..=1000`, and
+`seed` is any `u64`. Every node and verifier must still load the same model
+file. If you change the model's default sampling for a published model, treat
+it as a new model version.
+
+A receipt adds `sampling`, `samplingHash = sha256(canonical_json(sampling))`
+and `samplingSource: "task"` **only** when the task carries a per-task
+override. Receipts for tasks without an override keep the historical shape
+byte-for-byte. `/v1/verify` reports the effective sampling (the override, or
+the decoder's model default when there is no override) and marks a result
+verified only when the receipt's `outputHash` equals the recomputed hash and,
+when present, its `samplingHash` equals the effective sampling hash. Old
+receipts without sampling fields remain verifiable.
+
+Per-task sampling changes transaction and execution semantics, so it is gated
+on block format version 2. This code produces v2 blocks and still validates and
+replays historical v1 blocks; a v1 block carrying a sampling transaction is
+rejected. This is a coordinated protocol upgrade: old binaries reject v2
+blocks, so every validator and replica must upgrade before any producer emits
+v2. Older tasks, receipts and v1 blocks without sampling are unchanged.
 
 ## Binary weights (`.vnnw`)
 
@@ -271,9 +293,11 @@ uniqueness, head dimension, context limit and sampling range.
 }
 ```
 
-The receipt binds `modelId`, `weightsHash` and the effective `sampling`
-configuration; `/v1/verify` regenerates the text with the same sampling and
-compares the output hash. A verifier must load the same model file.
+The receipt binds `modelId`, `weightsHash` and, when the task carries an
+override, `sampling` plus `samplingHash`. `/v1/verify` regenerates the text
+with the effective sampling (override or model default), compares the output
+hash and checks the receipt's sampling commitment. A verifier must load the
+same model file.
 
 ## Import or train
 

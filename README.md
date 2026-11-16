@@ -163,8 +163,11 @@ re-runs the model over the task input in integer arithmetic, so the output is
 part of state transition rather than the producer's claim. Each finished task
 gets a receipt anchored to the block that carried it. Decoder tasks may include
 an optional `sampling` object (`temperatureMilli`, `topK`, `topPMilli`,
-`seed`) in the signed transaction data; it is bound to the task id and exposed
-in the receipt. Without it the model's fixed default is used.
+`seed`) in the signed transaction data; it is bound to the task id and a
+per-task override adds `sampling`/`samplingHash` to the receipt. Without it the
+model's fixed default is used and the receipt keeps its historical shape.
+Sampling requires block format v2, so validators and replicas must be upgraded
+together before it is used.
 
 ```bash
 cargo build --workspace

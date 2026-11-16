@@ -57,8 +57,12 @@ client.infer(
 )
 ```
 
-Omitting `sampling` keeps the model's default. Only decoder models accept an
-override; classifier submissions with `sampling` are rejected.
+Omitting `sampling` keeps the model's default. Supplying it sets every field:
+omitted members are zero, so `sampling={}` means greedy rather than inheriting
+model defaults. Only decoder models accept an override; consensus validation
+rejects classifier and out-of-range/unknown sampling (the RPC also rejects it
+early), and the receipt only adds `sampling`/`samplingHash` when an override is
+present.
 
 `private_key` in `infer` accepts a wallet dict, a Rust-CLI key-file path, a
 base64/hex seed, or an `Ed25519PrivateKey`. The wallet file shape is the same

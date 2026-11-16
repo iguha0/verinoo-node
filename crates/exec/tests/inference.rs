@@ -785,7 +785,7 @@ fn decoder_task_without_sampling_keeps_the_model_default() {
         }),
         1,
     );
-    produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
 
     let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
     assert_eq!(tasks.len(), 1);
@@ -803,15 +803,35 @@ fn decoder_task_without_sampling_keeps_the_model_default() {
         .get("tiny-gpt-v1")
         .expect("decoder installed");
     assert_eq!(
-        receipt["sampling"],
-        serde_json::to_value(decoder.default_sampling()).unwrap()
+        serde_json::to_value(decoder.default_sampling()).unwrap(),
+        serde_json::json!({
+            "temperatureMilli": 0,
+            "topK": 0,
+            "topPMilli": 0,
+            "seed": 0,
+        })
     );
-    assert_eq!(receipt["samplingSource"], "model-default");
+    assert!(receipt.get("sampling").is_none());
+    assert!(receipt.get("samplingHash").is_none());
+    assert!(receipt.get("samplingSource").is_none());
+    assert_eq!(
+        receipt,
+        serde_json::json!({
+            "taskId": task.task_id,
+            "modelId": "tiny-gpt-v1",
+            "weightsHash": model.weights_hash(),
+            "inputHash": task.input_commitment,
+            "outputHash": task.result_hash,
+            "height": 1,
+            "blockHash": block.header.hash,
+            "validator": block.header.validator,
+            "validatorSignature": block.header.validator_signature,
+        })
+    );
 }
 
 #[test]
-fn sampling_on_a_non_decoder_fails_clearly() {
-    install_test_models();
+fn sampling_on_a_non_decoder_is_rejected_before_inclusion() {
     let spec = sampling_spec();
     let model = verinoo_exec::engine::ExecModel::resolve(verinoo_model::MODEL_ID).unwrap();
     let err = model
@@ -846,52 +866,421 @@ fn sampling_on_a_non_decoder_fails_clearly() {
         }),
         1,
     );
-    produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    let err = verinoo_exec::engine::Validator {
+        store: &store,
+        base_fee: 1,
+    }
+    .validate_transaction(&tx)
+    .unwrap_err();
+    assert!(err.contains("does not support per-task sampling"), "{err}");
 
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    assert!(block.transactions.is_empty());
     let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].status, "failed");
-    assert!(tasks[0]
-        .proof_data
-        .as_deref()
-        .unwrap()
-        .contains("does not support per-task sampling"));
-    assert!(verinoo_exec::engine::receipt_for(&store, &tasks[0].task_id).is_none());
+    assert!(tasks.is_empty());
+    assert_eq!(store.account_or_default(&addr(&user)).balance, 10_000);
 }
 
 #[test]
-fn malformed_sampling_reverts_before_a_task_is_created() {
+fn invalid_sampling_is_rejected_by_consensus_validation_without_state_changes() {
+    install_test_models();
     let store = fresh_chain();
     let user = keypair("bad-sampling");
     let mut acc = store.account_or_default(&addr(&user));
     acc.balance = 10_000;
     store.set_account(&acc);
+    let before = verinoo_exec::engine::compute_state_root(&store);
 
+    let cases = [
+        serde_json::json!(42),
+        serde_json::json!({"temperatureMilli": -1}),
+        serde_json::json!({"seed": "1.5"}),
+        serde_json::json!({"temperatureMilli": 100_001}),
+        serde_json::json!({"topPMilli": 1_001}),
+        serde_json::json!({"topK": 1_000_001}),
+        serde_json::json!({"topK": 321}),
+        serde_json::json!({"temperature": 800}),
+    ];
+    for sampling in cases {
+        let input = "please cancel";
+        let tx = make_tx(
+            &user,
+            TxKind::SubmitInference,
+            serde_json::json!({
+                "requester": addr(&user),
+                "targetModel": "tiny-gpt-v1",
+                "input": input,
+                "inputCommitment": verinoo_model::sha256_hex(input),
+                "maxFee": 100,
+                "deadline": 1_000,
+                "sampling": sampling,
+            }),
+            1,
+        );
+        let err = verinoo_exec::engine::Validator {
+            store: &store,
+            base_fee: 1,
+        }
+        .validate_transaction(&tx)
+        .unwrap_err();
+        assert!(err.contains("sampling"), "{sampling}: {err}");
+    }
+
+    // A float cannot be encoded by canonical JSON, so no signed transaction can
+    // carry one. The raw envelope is still rejected by the validator, and the
+    // parser rejects it directly.
+    let float_sampling = serde_json::json!({"seed": 1.5});
+    assert!(verinoo_exec::engine::parse_sampling(Some(&float_sampling))
+        .unwrap_err()
+        .contains("malformed sampling"));
+    let input = "please cancel";
+    let data = TxData {
+        r#type: TxKind::SubmitInference,
+        data: serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": "tiny-gpt-v1",
+            "input": input,
+            "inputCommitment": verinoo_model::sha256_hex(input),
+            "maxFee": 100,
+            "deadline": 1_000,
+            "sampling": float_sampling,
+        }),
+    };
+    let tx_id = "00".repeat(32);
+    let signature = user.sign(tx_id.as_bytes());
+    let float_tx = TxEnvelope {
+        tx_id: tx_id.clone(),
+        from: addr(&user),
+        to: String::new(),
+        value: 0,
+        nonce: 1,
+        data,
+        gas_limit: None,
+        gas_price: None,
+        public_key: hex::encode(user.verifying_key().to_bytes()),
+        signature: hex::encode(signature.to_bytes()),
+    };
+    assert!(verinoo_exec::engine::Validator {
+        store: &store,
+        base_fee: 1,
+    }
+    .validate_transaction(&float_tx)
+    .is_err());
+
+    assert_eq!(verinoo_exec::engine::compute_state_root(&store), before);
+    assert_eq!(store.account_or_default(&addr(&user)).balance, 10_000);
+    let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
+    assert!(tasks.is_empty());
+}
+
+#[test]
+fn invalid_sampling_is_skipped_without_debiting_gas() {
+    install_test_models();
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-bad-sampling", 13);
+    let user = keypair("bad-sampling-gas");
+    let mut acc = store.account_or_default(&addr(&user));
+    acc.balance = 10_000;
+    store.set_account(&acc);
+
+    let input = "please cancel";
     let tx = make_tx(
         &user,
         TxKind::SubmitInference,
         serde_json::json!({
             "requester": addr(&user),
             "targetModel": "tiny-gpt-v1",
-            "input": "please cancel",
-            "inputCommitment": verinoo_model::sha256_hex("please cancel"),
+            "input": input,
+            "inputCommitment": verinoo_model::sha256_hex(input),
             "maxFee": 100,
             "deadline": 1_000,
-            "sampling": { "temperatureMilli": 100_001 },
+            "sampling": {"temperatureMilli": 100_001},
         }),
         1,
     );
-    let err = verinoo_exec::engine::execute_transaction(
-        &store,
-        &tx,
-        &verinoo_exec::engine::BlockContext {
-            height: 1,
-            validator_address: "validator".into(),
-            base_fee: 1,
-        },
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("invalid sampling"), "{err}");
+    let block = produce_block(&store, &[tx], &producer, 1_000_000).unwrap();
+    assert!(block.transactions.is_empty());
+    assert_eq!(store.account_or_default(&addr(&user)).balance, 10_000);
     let tasks: Vec<verinoo_state::models::InferenceTask> = store.iter_prefix("task:");
     assert!(tasks.is_empty());
+}
+
+#[test]
+fn a_claimed_non_decoder_sampling_task_does_not_mint_or_release_capacity() {
+    install_test_models();
+    let store = fresh_chain();
+    let producer = ProducerKey::deterministic("validator-mint", 14);
+    let requester = keypair("mint-requester");
+    let node_key = keypair("mint-node");
+    let node_address = addr(&node_key);
+    for signer in [&requester, &node_key] {
+        let mut acc = store.account_or_default(&addr(signer));
+        acc.balance = 10_000;
+        store.set_account(&acc);
+    }
+
+    let input = "my parcel was never delivered";
+    let spec = sampling_spec();
+    let task_id = "sampling-mint-task";
+    store.set_task(&verinoo_state::models::InferenceTask {
+        task_id: task_id.into(),
+        requester: addr(&requester),
+        target_model: verinoo_model::MODEL_ID.into(),
+        input_commitment: verinoo_model::sha256_hex(input),
+        input: input.into(),
+        encrypted_input: None,
+        max_fee: 100,
+        deadline: 1_000,
+        sampling: Some(spec),
+        verification_type: "optimistic".into(),
+        status: "pending".into(),
+        assigned_to: None,
+        collateral: 0,
+        result_hash: None,
+        result_output: None,
+        proof_data: None,
+        challenge_window_end: None,
+        game_id: None,
+        executed_at: 0,
+    });
+    let pending_id = "sampling-pending-task";
+    let mut pending = store.get_task(task_id).unwrap();
+    pending.task_id = pending_id.into();
+    store.set_task(&pending);
+
+    let register = make_tx(
+        &node_key,
+        TxKind::RegisterNode,
+        serde_json::json!({
+            "supportedModels": [verinoo_model::MODEL_ID],
+            "availableCapacity": 1,
+            "maxCapacity": 1,
+            "stakedAmount": 0,
+        }),
+        1,
+    );
+    let claim = make_tx(
+        &node_key,
+        TxKind::ClaimTask,
+        serde_json::json!({"taskId": task_id}),
+        2,
+    );
+    produce_block(&store, &[register, claim], &producer, 1_000_000).unwrap();
+
+    let task = store.get_task(task_id).unwrap();
+    assert_eq!(task.status, "assigned");
+    assert_eq!(task.assigned_to.as_deref(), Some(node_address.as_str()));
+    assert!(verinoo_exec::engine::receipt_for(&store, task_id).is_none());
+
+    let node = store.get_node(&node_address).unwrap();
+    assert_eq!(node.available_capacity, 0);
+    assert_eq!(node.active_tasks, 1);
+    assert_eq!(node.failed_inferences, 0);
+    assert_eq!(store.account_or_default(&addr(&requester)).balance, 10_000);
+
+    produce_block(&store, &[], &producer, 2_000_000).unwrap();
+
+    let task = store.get_task(task_id).unwrap();
+    assert_eq!(task.status, "assigned");
+    assert_eq!(task.proof_data, None);
+    let node = store.get_node(&node_address).unwrap();
+    assert_eq!(node.available_capacity, 0);
+    assert_eq!(node.active_tasks, 1);
+    assert_eq!(node.failed_inferences, 0);
+    assert_eq!(store.account_or_default(&addr(&requester)).balance, 10_000);
+    let pending = store.get_task(pending_id).unwrap();
+    assert_eq!(pending.status, "pending");
+    assert!(verinoo_exec::engine::receipt_for(&store, pending_id).is_none());
+}
+
+fn fund(store: &StateStore, signer: &ed25519_dalek::SigningKey, balance: i64) {
+    let mut account = store.account_or_default(&addr(signer));
+    account.balance = balance;
+    store.set_account(&account);
+}
+
+fn run_decoder_example(
+    store: &StateStore,
+    producer: &ProducerKey,
+    requester: &str,
+    prompt: &str,
+    sampling: Option<verinoo_types::SamplingSpec>,
+) -> Block {
+    install_test_models();
+    let user = keypair(requester);
+    fund(store, &user, 10_000);
+    let mut data = serde_json::json!({
+        "requester": addr(&user),
+        "targetModel": "tiny-gpt-v1",
+        "input": prompt,
+        "inputCommitment": verinoo_model::sha256_hex(prompt),
+        "maxFee": 100,
+        "deadline": 1_000,
+    });
+    if let Some(spec) = sampling {
+        data["sampling"] = serde_json::to_value(spec).unwrap();
+    }
+    let tx = make_tx(&user, TxKind::SubmitInference, data, 1);
+    let head = current_head(store).unwrap();
+    let block = produce_block(store, &[tx], producer, 1_000_000).unwrap();
+    verinoo_exec::engine::validate_block(
+        &block,
+        &head.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .expect("produced block must pass its own gate");
+    set_head(store, &block);
+    block
+}
+
+fn with_version(mut block: Block, version: u32, producer: &ProducerKey) -> Block {
+    block.header.version = version;
+    block.header.hash = verinoo_exec::engine::hash_header(&block.header);
+    let signature = producer.signing.sign(block.header.hash.as_bytes());
+    block.header.validator_signature = hex::encode(signature.to_bytes());
+    block
+}
+
+#[test]
+fn sampling_block_replays_identically_on_two_stores() {
+    let spec = sampling_spec();
+    let prompt = "please cancel";
+    let a = fresh_chain();
+    let b = fresh_chain();
+    let block_a = run_decoder_example(
+        &a,
+        &ProducerKey::deterministic("validator-replay-sampling", 15),
+        "replay-sampling",
+        prompt,
+        Some(spec),
+    );
+    let block_b = run_decoder_example(
+        &b,
+        &ProducerKey::deterministic("validator-replay-sampling", 15),
+        "replay-sampling",
+        prompt,
+        Some(spec),
+    );
+    assert_eq!(block_a.header.state_root, block_b.header.state_root);
+    assert_eq!(block_a.header.hash, block_b.header.hash);
+
+    let task_a = a.iter_prefix::<verinoo_state::models::InferenceTask>("task:")[0].clone();
+    let task_b = b.iter_prefix::<verinoo_state::models::InferenceTask>("task:")[0].clone();
+    assert_eq!(task_a.result_output, task_b.result_output);
+    assert_eq!(task_a.result_hash, task_b.result_hash);
+    let receipt_a = verinoo_exec::engine::receipt_for(&a, &task_a.task_id).unwrap();
+    let receipt_b = verinoo_exec::engine::receipt_for(&b, &task_b.task_id).unwrap();
+    assert_eq!(receipt_a, receipt_b);
+    assert_eq!(receipt_a["sampling"], serde_json::to_value(spec).unwrap());
+}
+
+#[test]
+fn different_seeds_produce_different_token_ids() {
+    install_test_models();
+    let model = verinoo_exec::engine::ExecModel::resolve("tiny-gpt-v1").unwrap();
+    let prompt = "please cancel";
+    let seed_one = verinoo_types::SamplingSpec {
+        temperature_milli: 1_000,
+        top_k: 0,
+        top_p_milli: 0,
+        seed: 1,
+    };
+    let seed_two = verinoo_types::SamplingSpec {
+        seed: 2,
+        ..seed_one
+    };
+    let first = model
+        .result_json_with_sampling(prompt, Some(&seed_one))
+        .unwrap();
+    let second = model
+        .result_json_with_sampling(prompt, Some(&seed_two))
+        .unwrap();
+    let ids = |output: &str| {
+        serde_json::from_str::<serde_json::Value>(output).unwrap()["tokenIds"].clone()
+    };
+    assert_ne!(ids(&first), ids(&second));
+}
+
+#[test]
+fn v1_blocks_replay_without_sampling_and_reject_sampling() {
+    install_test_models();
+    let producer = ProducerKey::deterministic("validator-v1", 16);
+
+    let source = fresh_chain();
+    let genesis = current_head(&source).unwrap();
+    let user = keypair("v1-replay");
+    fund(&source, &user, 10_000);
+    let input = "my parcel was never delivered";
+    let tx = make_tx(
+        &user,
+        TxKind::SubmitInference,
+        serde_json::json!({
+            "requester": addr(&user),
+            "targetModel": verinoo_model::MODEL_ID,
+            "input": input,
+            "inputCommitment": verinoo_model::sha256_hex(input),
+            "maxFee": 100,
+            "deadline": 1_000,
+        }),
+        1,
+    );
+    let v2 = produce_block(&source, std::slice::from_ref(&tx), &producer, 1_000_000).unwrap();
+    assert_eq!(
+        v2.header.version,
+        verinoo_exec::engine::HEADER_VERSION,
+        "new blocks must use the current format"
+    );
+
+    let v1 = with_version(v2, 1, &producer);
+    verinoo_exec::engine::validate_block(
+        &v1,
+        &genesis.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .expect("historical v1 block must still validate");
+
+    let replay = fresh_chain();
+    fund(&replay, &user, 10_000);
+    verinoo_exec::engine::apply_block(&replay, &v1, 1, &producer.address).unwrap();
+    assert_eq!(
+        verinoo_exec::engine::compute_state_root(&replay),
+        v1.header.state_root
+    );
+    let tasks = replay.iter_prefix::<verinoo_state::models::InferenceTask>("task:");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].status, "completed");
+
+    let sampled_source = fresh_chain();
+    let sampled_genesis = current_head(&sampled_source).unwrap();
+    let sampled = run_decoder_example(
+        &sampled_source,
+        &producer,
+        "v1-sampled",
+        "please cancel",
+        Some(sampling_spec()),
+    );
+    let sampled_v1 = with_version(sampled, 1, &producer);
+    let err = verinoo_exec::engine::validate_block(
+        &sampled_v1,
+        &sampled_genesis.header,
+        std::slice::from_ref(&producer.address),
+        1_000_000,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("version 1 block cannot contain sampling"),
+        "{err}"
+    );
+    let apply_err =
+        verinoo_exec::engine::apply_block(&fresh_chain(), &sampled_v1, 1, &producer.address)
+            .unwrap_err();
+    assert!(
+        apply_err
+            .to_string()
+            .contains("version 1 block cannot contain sampling"),
+        "{apply_err}"
+    );
 }

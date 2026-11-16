@@ -21,8 +21,8 @@ pub fn sha256_hex(input: &str) -> String {
 }
 
 /// Parse the optional `sampling` object from `submitInference` data. Shared by
-/// consensus execution and the node's submission boundary so both reject the
-/// same inputs.
+/// consensus validation, execution and the node's submission boundary so all
+/// three reject the same inputs.
 pub fn parse_sampling(value: Option<&serde_json::Value>) -> Result<Option<SamplingSpec>, String> {
     match value {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -34,6 +34,15 @@ pub fn parse_sampling(value: Option<&serde_json::Value>) -> Result<Option<Sampli
             Ok(Some(spec))
         }
     }
+}
+
+fn tx_carries_sampling(tx: &TxEnvelope) -> bool {
+    tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference
+        && tx
+            .data
+            .data
+            .get("sampling")
+            .is_some_and(|value| !value.is_null())
 }
 
 /// Ed25519 address: `ai_` + sha256(publicKey)[0..20] hex — mirrors reference.
@@ -122,6 +131,13 @@ impl<'a> Validator<'a> {
 
         // Policy validation (submitInference only).
         if as_kind_str(&tx.data) == "submitInference" {
+            let sampling = parse_sampling(tx.data.data.get("sampling"))?;
+            if let Some(spec) = sampling.as_ref() {
+                let target = tx.data.data["targetModel"].as_str().unwrap_or("");
+                if let Some(model) = ExecModel::resolve(target) {
+                    model.validate_sampling(spec)?;
+                }
+            }
             let declared = tx.data.data["verificationType"].as_str();
             if let Some(d) = declared {
                 gas::policy_multiplier(Some(d))?;
@@ -230,7 +246,14 @@ pub fn merkle_root(hashes: &[String]) -> String {
     row[0].clone()
 }
 
-pub const HEADER_VERSION: u32 = 1;
+/// Current block format. Version 2 adds per-task sampling: a v1 block may not
+/// carry a `sampling` field, while a v2 block may. This is a coordinated
+/// protocol upgrade: v1 binaries reject v2 blocks, so every validator and
+/// replica must upgrade before a producer emits v2.
+pub const HEADER_VERSION: u32 = 2;
+
+/// Oldest block format accepted for replay and catch-up.
+pub const MIN_HEADER_VERSION: u32 = 1;
 
 /// Structural + cryptographic block gate. Stateless checks that MUST hold
 /// before anything touches state. Stateful rules (nonce/balance) are
@@ -259,7 +282,7 @@ pub fn validate_block_with_policy(
     now_ms: u64,
     policy: &dyn crate::leader::LeaderPolicy,
 ) -> Result<(), EngineError> {
-    if block.header.version != HEADER_VERSION {
+    if block.header.version < MIN_HEADER_VERSION || block.header.version > HEADER_VERSION {
         return Err(EngineError::Validation(format!(
             "unknown block version {}",
             block.header.version
@@ -342,6 +365,13 @@ pub fn validate_block_with_policy(
     if unique.len() != ids.len() {
         return Err(EngineError::Validation(
             "duplicate transaction in block".into(),
+        ));
+    }
+    // Sampling is a v2 transaction semantic. Reject it in v1 blocks so replay
+    // of the historical chain keeps the old execution rules.
+    if block.header.version == 1 && block.transactions.iter().any(tx_carries_sampling) {
+        return Err(EngineError::Validation(
+            "version 1 block cannot contain sampling".into(),
         ));
     }
     // Per-tx signature + canonical binding (stateless subset).
@@ -1143,25 +1173,15 @@ impl ExecModel {
         input: &str,
         sampling: Option<&SamplingSpec>,
     ) -> Result<String, String> {
+        if let Some(spec) = sampling {
+            self.validate_sampling(spec)?;
+        }
         match self {
-            ExecModel::Builtin => {
-                reject_sampling(self, sampling)?;
-                Ok(verinoo_model::result_json(input))
-            }
-            ExecModel::Runtime(m) => {
-                reject_sampling(self, sampling)?;
-                Ok(m.result_json(input))
-            }
-            ExecModel::Transformer(m) => {
-                reject_sampling(self, sampling)?;
-                m.result_json(input)
-            }
+            ExecModel::Builtin => Ok(verinoo_model::result_json(input)),
+            ExecModel::Runtime(m) => Ok(m.result_json(input)),
+            ExecModel::Transformer(m) => m.result_json(input),
             ExecModel::Decoder(m) => match sampling {
-                Some(spec) => {
-                    spec.validate()
-                        .map_err(|e| format!("invalid sampling: {e}"))?;
-                    m.result_json_with_sampling(input, &runtime_sampling(spec))
-                }
+                Some(spec) => m.result_json_with_sampling(input, &runtime_sampling(spec)),
                 None => m.result_json(input),
             },
         }
@@ -1169,6 +1189,29 @@ impl ExecModel {
 
     pub fn supports_sampling(&self) -> bool {
         matches!(self, ExecModel::Decoder(_))
+    }
+
+    /// Consensus rule shared by `Validator` and execution: ranges are checked
+    /// by `SamplingSpec`, `topK` must fit the resolved decoder vocabulary, and
+    /// non-decoder models reject every override.
+    pub fn validate_sampling(&self, spec: &SamplingSpec) -> Result<(), String> {
+        spec.validate()
+            .map_err(|e| format!("invalid sampling: {e}"))?;
+        match self {
+            ExecModel::Decoder(model) => {
+                if spec.top_k as usize > model.vocab_size() {
+                    return Err(format!(
+                        "invalid sampling: sampling.topK must be at most the model vocabulary ({})",
+                        model.vocab_size()
+                    ));
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "model `{}` does not support per-task sampling",
+                other.model_id()
+            )),
+        }
     }
 
     /// The sampling object used for this task: the request override on a
@@ -1194,16 +1237,6 @@ fn runtime_sampling(spec: &SamplingSpec) -> verinoo_runtime::gpt::Sampling {
         top_p_milli: spec.top_p_milli,
         seed: spec.seed,
     }
-}
-
-fn reject_sampling(model: &ExecModel, sampling: Option<&SamplingSpec>) -> Result<(), String> {
-    if sampling.is_some() {
-        return Err(format!(
-            "model `{}` does not support per-task sampling",
-            model.model_id()
-        ));
-    }
-    Ok(())
 }
 
 /// Every model this node can execute, for `/v1/models`.
@@ -1252,11 +1285,14 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
             continue;
         };
         if task.sampling.is_some() && !model.supports_sampling() {
-            let reason = format!(
-                "model `{}` does not support per-task sampling",
-                model.model_id()
+            // Consensus validation rejects these submissions. If one reaches
+            // state anyway, leave it untouched: there is no escrow to refund
+            // and no payment to unwind.
+            tracing::warn!(
+                task = %task.task_id,
+                model = %model.model_id(),
+                "sampling on a non-decoder task; leaving it pending"
             );
-            fail_task(store, task, height, reason);
             continue;
         }
         // A matched task has already paid the requester at assignment time;
@@ -1311,28 +1347,6 @@ fn execute_deterministic_tasks(store: &StateStore, height: u64, executor: &str) 
     }
 }
 
-/// Permanently unexecutable task: mark it failed, release a matched executor
-/// and return its withheld fee instead of retrying every block forever.
-fn fail_task(store: &StateStore, mut task: InferenceTask, height: u64, reason: String) {
-    tracing::warn!(task = %task.task_id, error = %reason, "task failed during deterministic execution");
-    if let Some(node_id) = task.assigned_to.clone() {
-        let mut requester = store.account_or_default(&task.requester);
-        requester.balance += task.max_fee as i64;
-        requester.updated_at = height;
-        store.set_account(&requester);
-        if let Some(mut node) = store.get_node(&node_id) {
-            node.available_capacity += 1;
-            node.active_tasks = node.active_tasks.saturating_sub(1);
-            node.failed_inferences += 1;
-            store.set_node(&node);
-        }
-    }
-    task.status = "failed".into();
-    task.executed_at = height;
-    task.proof_data = Some(reason);
-    store.set_task(&task);
-}
-
 /// Anchor every task executed in this block to the block that carries it.
 /// The receipt is the block signature plus the recomputable output hash, so a
 /// third party can verify without trusting the operator's API.
@@ -1349,34 +1363,28 @@ pub fn stamp_receipts(store: &StateStore, block: &Block) {
         } else {
             verinoo_model::sha256_hex(&task.input)
         };
-        let sampling = model
-            .as_ref()
-            .and_then(|m| m.effective_sampling_json(task.sampling.as_ref()));
-        let sampling_hash = sampling
-            .as_ref()
-            .and_then(|value| verinoo_types::canonical::canonical_json(value).ok())
-            .map(|canonical| sha256_hex(&canonical));
-        let sampling_source = sampling.as_ref().map(|_| {
-            if task.sampling.is_some() {
-                "task"
-            } else {
-                "model-default"
-            }
-        });
-        let receipt = json!({
+        let mut receipt = json!({
             "taskId": task.task_id,
             "modelId": task.target_model,
             "weightsHash": weights_hash,
             "inputHash": input_hash,
             "outputHash": task.result_hash,
-            "sampling": sampling,
-            "samplingHash": sampling_hash,
-            "samplingSource": sampling_source,
             "height": height,
             "blockHash": block.header.hash,
             "validator": block.header.validator,
             "validatorSignature": block.header.validator_signature,
         });
+        // Only an explicit per-task override adds fields. Receipts for tasks
+        // without one keep their historical bytes.
+        if let Some(spec) = task.sampling.as_ref() {
+            if let Ok(effective) = serde_json::to_value(spec) {
+                if let Ok(canonical) = verinoo_types::canonical::canonical_json(&effective) {
+                    receipt["sampling"] = effective;
+                    receipt["samplingHash"] = json!(sha256_hex(&canonical));
+                    receipt["samplingSource"] = json!("task");
+                }
+            }
+        }
         store.set_meta(&format!("receipt:{}", task.task_id), &receipt);
     }
 }
@@ -1401,6 +1409,17 @@ pub fn apply_block(
     base_fee: u64,
     validator_address: &str,
 ) -> Result<AppliedBlock, EngineError> {
+    if block.header.version < MIN_HEADER_VERSION || block.header.version > HEADER_VERSION {
+        return Err(EngineError::Validation(format!(
+            "unknown block version {}",
+            block.header.version
+        )));
+    }
+    if block.header.version == 1 && block.transactions.iter().any(tx_carries_sampling) {
+        return Err(EngineError::Validation(
+            "version 1 block cannot contain sampling".into(),
+        ));
+    }
     let height = block.header.index;
     let ctx = BlockContext {
         height,

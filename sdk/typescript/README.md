@@ -44,8 +44,17 @@ await client.infer({
 });
 ```
 
-Omitting `sampling` keeps the model's default. Only decoder models accept an
-override; classifier submissions with `sampling` are rejected.
+Omitting `sampling` keeps the model's default. Supplying it sets every field:
+omitted members are zero, so `sampling: {}` means greedy rather than inheriting
+model defaults. Only decoder models accept an override; consensus validation
+rejects classifier and out-of-range/unknown sampling (the RPC also rejects it
+early), and the receipt only adds `sampling`/`samplingHash` when an override is
+present.
+
+Node seeds are `u64` (0 to 18446744073709551615). JavaScript numbers are
+IEEE-754 doubles, so values above `2^53 - 1` (9007199254740991) lose precision
+before the transaction is signed. Use seeds at or below `2^53 - 1` from this
+SDK; the node itself accepts any `u64`.
 
 `privateKey` in `infer` accepts a wallet object, a Rust-CLI key-file path,
 a base64/hex seed, or a Node `KeyObject`. The wallet file shape is the same as

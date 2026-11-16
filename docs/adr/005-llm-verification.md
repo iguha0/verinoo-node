@@ -4,11 +4,13 @@
 
 **Proposed — partially implemented.** The deterministic decoder now has
 integer temperature/top-k/top-p sampling with a seeded SplitMix64 RNG, a
-SHA-256-bound binary weight format, per-task sampling bound in the transaction,
-task and receipt, and a locally imported 81.9M DistilGPT-2 with 1,024-token
-context. Not implemented: an optimistic LLM executor, a bonded challenger, a
-TEE attestation path, task-derived seeds and repetition penalties. Nothing else
-here may be cited as shipped behavior.
+SHA-256-bound binary weight format, a locally imported 81.9M DistilGPT-2 with
+1,024-token context, and client-supplied per-task sampling bound in the
+transaction and task, with `sampling`/`samplingHash` added to the receipt only
+when an override is present. Sampling transactions require block version 2.
+Not implemented: an optimistic LLM executor, a bonded challenger, a TEE
+attestation path, task-derived seeds, repetition penalties and `maxNewTokens`.
+Nothing else here may be cited as shipped behavior.
 
 Date: 2026-11-15
 Scope: `crates/exec`, `crates/runtime`, `crates/node`, `crates/network`,
@@ -282,7 +284,7 @@ party verify the claim without reconstructing the transaction envelope.
     "maxNewTokens": 256,
     "repetitionPenaltyMilli": 1000,
     "clientSeed": "<64 hex or empty>",
-    "paramsHash": "<sha256 of the canonical sampling object>"
+    "samplingHash": "<sha256 of the canonical sampling object>"
   },
   "seed": "<64 hex, derived; see below>",
   "tokenIds": [11, 612, "..."],
@@ -313,21 +315,30 @@ derive to its address using `public_key_to_address`
 
 ### Sampling commitment and determinism
 
-**Per-task commitment (implemented).** Sampling is integer and reproducible
-(`SamplingSpec` in `crates/types/src/sampling.rs`, `Sampling` in
+**Per-task commitment (implemented, limited scope).** Sampling is integer and
+reproducible (`SamplingSpec` in `crates/types/src/sampling.rs`, `Sampling` in
 `crates/runtime/src/gpt.rs`; see `docs/decoder.md`). The implemented object is
 `{temperatureMilli, topK, topPMilli, seed}`, supplied as an optional
 `sampling` field in `submitInference` data. Because it is canonical transaction
 data, it changes `txId` and the derived task id (`task_id_for`,
 `crates/exec/src/engine.rs`). The task stores it, every validator executes with
-it, `/v1/verify` recomputes with it, and the receipt carries `sampling` plus
-`samplingHash = sha256(canonical_json(sampling))`. If absent, the model's fixed
-default is used, preserving old tasks. Only decoder models accept an override;
-a classifier task with sampling fails deterministically instead of ignoring it.
+it, and `/v1/verify` recomputes with it. A receipt carries `sampling` and
+top-level `samplingHash = sha256(canonical_json(sampling))` only when the task
+has an override; tasks without one keep the model's fixed default and the
+historical receipt shape. Supplying `sampling` chooses every field: omitted
+members default to zero, so `{}` is a greedy override rather than an
+inheritance of model defaults.
+
+Consensus validation (`Validator::validate_transaction`) parses and range-checks
+the object before any state mutation or gas debit. A resolved non-decoder model
+rejects an override; a model this node cannot resolve leaves the task pending,
+with no refund or failure bookkeeping. `topK` is additionally bounded by the
+resolved decoder vocabulary.
 
 Implemented validation ranges: `temperatureMilli` in `0..=100000`
 (`0` = greedy), `topK` in `0..=1000000` (`0` disables top-k), `topPMilli` in
 `0..=1000` (`0` or `1000` disables the nucleus), and `seed` is any `u64`.
+Sampling requires block version 2; v1 blocks may not carry it.
 
 **Remaining design work.** `maxNewTokens`, `repetitionPenaltyMilli` and the
 task-derived seed below are not implemented. The current `seed` is chosen by
@@ -356,7 +367,7 @@ executor does not choose the seed. Both the executor and a challenger derive:
 
 ```text
 seed = sha256("verinoo/llm-sampling/v1" || chain_id || task_id ||
-              inputCommitment || paramsHash || modelHash || tokenizerHash)
+              inputCommitment || samplingHash || modelHash || tokenizerHash)
 ```
 
 `task_id` already commits the transaction contents (`task_id_for`,
@@ -822,8 +833,9 @@ security audit.
 
 - **Not implemented.** No optimistic LLM executor, verifier panel, bond,
   challenge window, TEE attestation or ZK proof exists in this repository. The
-  integer sampler, per-task sampling commitment and deterministic replay do
-  exist.
+  integer sampler, client-supplied per-task sampling (`{temperatureMilli,
+  topK, topPMilli, seed}`) and deterministic replay do exist. A receipt carries
+  `sampling`/`samplingHash` only when the task has an override.
 - **No production LLM support.** The largest model that runs in consensus is
   the 3.75M-parameter `tiny-stories-1m`; 7B/70B serving, long context,
   batching, streaming, and a production tokenizer are not implemented.
