@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (155 tests) |
+| Test suite | green | `cargo test --workspace --locked` (180 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -51,6 +51,9 @@ claims a technical buyer will test in the first diligence call.
 | Zero-copy decoder weights | works | `.vnnw` mmap with SHA-256, tamper/negative tests, owned fallback |
 | Generic decoder import | works | config-driven GPT-2/GPT-Neo importer; 24 offline tests |
 | Node readiness | works | `/ready` fresh-head, syncing, peer-lag and validator-set consistency; `/status` fields |
+| Per-task sampling | works | temperature/top-k/top-p/seed bound in the tx/task id and receipt; v2 block gate; verify checks it |
+| Protocol v2 blocks | works | v1 historical replay accepted; sampling is v2-only; coordinated validator upgrade required |
+| Policy library | works (library) | deterministic input/output policy, 12 tests; not wired into the RPC yet |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
@@ -171,6 +174,15 @@ claims a technical buyer will test in the first diligence call.
   writers and an owned fallback when mapping or alignment is unavailable.
 - A config-driven GPT-2/GPT-Neo importer (`scripts/import_hf_gpt.py`) with
   offline shape/config tests; LLaMA/SentencePiece remains unsupported.
+- Per-task sampling (`sampling` in `submitInference`), bound by the canonical
+  transaction/task id and a v2 block gate. `/v1/verify` recomputes with the
+  task override and checks the receipt's output and sampling hashes. Old
+  no-sampling tasks and receipts keep their original shape.
+- A deterministic `verinoo-policy` library for byte limits, model allowlists,
+  blocked terms/patterns and email/phone/SSN redaction, with 12 offline tests.
+  It is not yet called by the API or SDKs; encrypted inputs are opaque to it.
+- Implementation plans for production LLM serving (GPU, batching, streaming,
+  safety) and HA/BFT phases in `docs/plans/`.
 - `GET /ready` with `syncing`, peer lag, a canonical validator-set hash and
   fail-closed `validatorSetConsistent`; `/status` exposes the same fields.
   Automatic failover/fencing and snapshot sync remain unimplemented.
@@ -310,4 +322,6 @@ domain still belong to the older reference node.
   binary weights and deterministic sampling runs locally. It is not deployed or
   benchmarked as a service, and there is no GPU executor, batching, streaming,
   safety layer, 7B+ serving or LLaMA/SentencePiece/arbitrary checkpoint import.
-  "BFT" — the finality design is not implemented.
+  The policy crate is a library only; it is not wired into the API, and it
+  cannot inspect encrypted inputs. Per-task sampling is v2-only and requires a
+  coordinated validator upgrade. "BFT" — the finality design is not implemented.
