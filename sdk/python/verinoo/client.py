@@ -653,7 +653,8 @@ class Client:
         Each request is either an input string or a dict with ``input`` plus
         optional ``model``, ``max_fee``/``maxFee``, ``encrypt``, ``deadline``,
         ``nonce``, and ``sampling`` overrides. Transactions without an
-        explicit nonce use consecutive nonces starting at the account nonce.
+        explicit nonce use consecutive nonces; after an explicit nonce the
+        next implicit nonce continues from that value (``nonce + 1``).
         """
         if isinstance(requests, (str, bytes, dict)) or not isinstance(
             requests, (list, tuple)
@@ -682,6 +683,7 @@ class Client:
         key_info = self._input_key_or_none()
 
         transactions = []
+        next_nonce = base_nonce
         for index, request in enumerate(items):
             item = request if isinstance(request, dict) else {"input": request}
             input_text = item.get("input")
@@ -696,7 +698,10 @@ class Client:
             item_sampling = (
                 item["sampling"] if "sampling" in item else sampling
             )
-            item_nonce = item.get("nonce", base_nonce + index)
+            item_nonce = item.get("nonce")
+            if item_nonce is None:
+                item_nonce = next_nonce
+            next_nonce = item_nonce + 1
             transactions.append(
                 self._build_inference_envelope(
                     wallet,

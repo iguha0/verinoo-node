@@ -2,7 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 
-import Client, { MAX_BATCH_SIZE, loadWallet } from './src/index.js';
+import Client, {
+  DEFAULT_STREAM_TIMEOUT_MS,
+  MAX_BATCH_SIZE,
+  VerinooError,
+  loadWallet,
+} from './src/index.js';
 
 const SEED = Buffer.from(
   '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
@@ -144,6 +149,108 @@ test('inferBatch signs one transaction per request and returns results', async (
   }
 });
 
+test('inferBatch continues implicit nonces from the last explicit nonce', async () => {
+  let batchBody;
+  const { server, baseUrl } = await listen(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/account/')) {
+      sendJson(res, { balance: 1_000_000, nonce: 4 });
+      return;
+    }
+    if (url.pathname === '/v1/input-key') {
+      sendJson(res, { error: 'not found' }, 404);
+      return;
+    }
+    if (url.pathname === '/v1/infer/batch') {
+      batchBody = JSON.parse(await readBody(req));
+      sendJson(res, {
+        accepted: batchBody.transactions.length,
+        rejected: 0,
+        results: batchBody.transactions.map((tx, index) => ({
+          index,
+          accepted: true,
+          txId: tx.txId,
+          taskId: `task-${index}`,
+        })),
+      });
+      return;
+    }
+    sendJson(res, { error: `unexpected ${url.pathname}` }, 500);
+  });
+
+  try {
+    const client = new Client({ baseUrl });
+    const wallet = loadWallet({ privateKey: SEED.toString('base64') });
+    await client.inferBatch(
+      [
+        'implicit-first',
+        { input: 'explicit-mid', nonce: 20 },
+        'implicit-after',
+        { input: 'explicit-later', nonce: 30 },
+        'implicit-last',
+      ],
+      { privateKey: wallet },
+    );
+
+    assert.deepEqual(
+      batchBody.transactions.map((tx) => tx.nonce),
+      [5, 20, 21, 30, 31],
+    );
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('inferBatch resolves with per-item errors when all items are rejected', async () => {
+  const { server, baseUrl } = await listen(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/account/')) {
+      sendJson(res, { balance: 1_000_000, nonce: 4 });
+      return;
+    }
+    if (url.pathname === '/v1/input-key') {
+      sendJson(res, { error: 'not found' }, 404);
+      return;
+    }
+    if (url.pathname === '/v1/infer/batch') {
+      const body = JSON.parse(await readBody(req));
+      sendJson(res, {
+        accepted: 0,
+        rejected: body.transactions.length,
+        results: body.transactions.map((tx, index) => ({
+          index,
+          accepted: false,
+          error: 'policy rejected',
+          txId: tx.txId,
+        })),
+      });
+      return;
+    }
+    sendJson(res, { error: `unexpected ${url.pathname}` }, 500);
+  });
+
+  try {
+    const client = new Client({ baseUrl });
+    const wallet = loadWallet({ privateKey: SEED.toString('base64') });
+    const response = await client.inferBatch(['first', 'second'], {
+      privateKey: wallet,
+    });
+
+    assert.equal(response.accepted, 0);
+    assert.equal(response.rejected, 2);
+    assert.deepEqual(
+      response.results.map((result) => result.accepted),
+      [false, false],
+    );
+    assert.deepEqual(
+      response.results.map((result) => result.error),
+      ['policy rejected', 'policy rejected'],
+    );
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test('inferBatch rejects batches outside 1..32 before any request', async () => {
   const client = new Client({
     baseUrl: 'http://127.0.0.1:1',
@@ -187,9 +294,11 @@ test('streamTask parses CRLF/LF SSE frames and heartbeats in order', async () =>
     res.write(': keep-alive\r\n\r\n');
     res.write('event: result\r\n');
     res.write('data: {"taskId":"task-1",\r\n');
-    res.write('data: "resultOutput":"hello"}\r\n\r\n');
+    res.write('data: "task":{"taskId":"task-1","status":"completed",\r\n');
+    res.write('data: "resultOutput":"hello"},\r\n');
+    res.write('data: "receipt":{"taskId":"task-1","outputHash":"aa"}}\r\n\r\n');
     res.write('event: done\r\n');
-    res.write('data: {"taskId":"task-1","finalized":true}\r\n\r\n');
+    res.write('data: {"taskId":"task-1"}\r\n\r\n');
     res.end();
   });
 
@@ -205,22 +314,28 @@ test('streamTask parses CRLF/LF SSE frames and heartbeats in order', async () =>
         order.push(`status:${data.status}`);
       },
       onResult(data) {
-        order.push(`result:${data.resultOutput}`);
+        order.push(`result:${data.task.resultOutput}`);
       },
       onDone(data) {
-        order.push(`done:${data.finalized}`);
+        order.push(`done:${data.taskId}`);
       },
     });
 
-    assert.deepEqual(order, ['status:pending', 'result:hello', 'done:true']);
+    assert.deepEqual(order, ['status:pending', 'result:hello', 'done:task-1']);
     assert.deepEqual(
       seenEvents.map((entry) => entry.event),
       ['status', 'result', 'done'],
     );
     assert.deepEqual(seenEvents[1].data, {
       taskId: 'task-1',
-      resultOutput: 'hello',
+      task: {
+        taskId: 'task-1',
+        status: 'completed',
+        resultOutput: 'hello',
+      },
+      receipt: { taskId: 'task-1', outputHash: 'aa' },
     });
+    assert.equal(seenEvents[1].data.resultOutput, undefined);
     assert.equal(result.taskId, 'task-1');
     assert.equal(result.done, true);
     assert.equal(result.timedOut, false);
@@ -228,7 +343,7 @@ test('streamTask parses CRLF/LF SSE frames and heartbeats in order', async () =>
       result.events.map((entry) => entry.event),
       ['status', 'result', 'done'],
     );
-    assert.equal(result.events[2].data.finalized, true);
+    assert.equal(result.events[2].data.taskId, 'task-1');
     assert.equal(seenHeaders[0].authorization, 'Bearer sse-key');
     assert.equal(seenHeaders[0].accept, 'text/event-stream');
   } finally {
@@ -277,6 +392,50 @@ test('streamTask aborts an open SSE stream via AbortSignal', async () => {
       return true;
     });
     assert.equal(statuses, 1);
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    await closeServer(server);
+  }
+});
+
+test('streamTask enforces an overall timeout on an idle SSE stream', async () => {
+  let heartbeat;
+  const { server, baseUrl } = await listen((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname !== '/v1/tasks/task-timeout/events') {
+      sendJson(res, { error: 'not found' }, 404);
+      return;
+    }
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      connection: 'keep-alive',
+    });
+    res.write('event: status\r\n');
+    res.write('data: {"taskId":"task-timeout","status":"pending"}\r\n\r\n');
+    heartbeat = setInterval(() => {
+      try {
+        res.write(': ping\r\n\r\n');
+      } catch {
+        // The client closed the stream.
+      }
+    }, 25);
+    res.on('close', () => clearInterval(heartbeat));
+  });
+
+  try {
+    assert.ok(DEFAULT_STREAM_TIMEOUT_MS > 60_000);
+    const client = new Client({ baseUrl });
+    const started = Date.now();
+    await assert.rejects(
+      () => client.streamTask('task-timeout', {}, { timeoutMs: 75 }),
+      (error) => {
+        assert.ok(error instanceof VerinooError);
+        assert.equal(error.timedOut, true);
+        assert.match(error.message, /timed out after 75ms/);
+        return true;
+      },
+    );
+    assert.ok(Date.now() - started < 2_000);
   } finally {
     if (heartbeat) clearInterval(heartbeat);
     await closeServer(server);

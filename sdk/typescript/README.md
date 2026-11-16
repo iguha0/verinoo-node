@@ -137,16 +137,30 @@ for (const result of batch.results) {
 Each `requests` entry is either an input string or an object with `input` plus
 optional `model`, `maxFee`, `encrypt`, `deadline`, `nonce`, and `sampling`
 overrides. The options object supplies defaults. Signing, input encryption,
-auth, and input-key discovery are identical to `infer`. When an item omits
-`nonce`, the SDK signs consecutive nonces starting at `account.nonce + 1` (or
-the explicit `nonce` option), because batch items execute as separate
-transactions from the same account.
+auth, and input-key discovery are identical to `infer`.
 
-The endpoint returns HTTP 200 when at least one item is accepted. Partial
-failure is reported per item: `{"index":1,"accepted":false,"error":"...",
-"txId":"..."}`. Inspect each `results` entry; the SDK does not throw for
-rejected items. Transport, auth, and non-2xx failures still throw
-`VerinooError`.
+Nonces are assigned in request order from `account.nonce + 1` (or the explicit
+`nonce` option). An item with an explicit `nonce` is used as-is, and the next
+implicit item continues from it (`prev_nonce + 1`); implicit items never
+restart from the batch base after an explicit item. For example, with account
+nonce `4` and items `[implicit, {nonce: 20}, implicit]` the signed nonces are
+`[5, 20, 21]`. Pass explicit nonces for every item if you need a different
+sequence; the SDK does not reorder or fill gaps.
+
+The endpoint returns HTTP 200 after per-item processing even when every item is
+rejected. Only request-level failures (malformed body, empty or oversized
+batch, auth) return a non-2xx status. Partial failure is reported per item:
+`{"index":1,"accepted":false,"error":"...","txId":"..."}`. Inspect each
+`results` entry; the SDK does not throw for rejected items. Transport, auth,
+and other non-2xx failures still throw `VerinooError`.
+
+A rejected middle item does not stop later items from being submitted, but it
+does leave later nonces from the same sender invalid: the node accepted no
+nonce for that item, so every subsequent same-sender item in the batch is out
+of sequence and will be rejected too unless it was signed with the correct
+continuation nonce. The SDK does not auto-repair or re-sign sequences after a
+partial failure; resubmit the affected items with fresh nonces from the
+account's current state.
 
 ## Task event streams
 
@@ -164,12 +178,12 @@ const outcome = await client.streamTask(
   {
     signal: controller.signal,
     onStatus: (data) => console.log('status', data.status),
-    onResult: (data) => console.log('result', data.resultOutput),
+    onResult: (data) => console.log('result', data.task.resultOutput),
     onDone: (data) => console.log('done', data),
     onTimeout: (data) => console.log('stream timeout', data),
     onEvent: (event, data, id) => console.log('event', event),
   },
-  { apiKey: 'tenant-key' }, // optional; defaults to the client key
+  { apiKey: 'tenant-key', timeoutMs: 65_000 },
 );
 // { taskId, events: [{event, data, id?}], done, timedOut }
 ```
@@ -182,6 +196,20 @@ stream and resolves the returned promise. Pass an `AbortSignal` as `signal` to
 cancel; the promise rejects with the abort error (`AbortError`). Non-2xx
 responses throw `VerinooError` with `.status`, `.body`, and `.bodyText`. SSE
 data is decoded as JSON; non-JSON data is returned as a string.
+
+The `result` event payload is `{taskId, task, receipt}`. The output is nested
+on the redacted task (`data.task.resultOutput`), not a flat `data.resultOutput`.
+The task view has `input`/`encryptedInput` removed and replaced by `inputHash`
+and `encrypted`; `receipt` is `null` until a successful task has a receipt.
+`done` carries `{taskId}`.
+
+`streamTask` also enforces an overall client-side deadline. `timeoutMs`
+defaults to `65_000` (exported as `DEFAULT_STREAM_TIMEOUT_MS`), just above the
+node's 60 s SSE cap. When the deadline passes, the request is aborted and the
+promise rejects with a `VerinooError` whose message is
+`task <id> stream timed out after <timeoutMs>ms` and whose `.timedOut` is
+`true`. Set `timeoutMs: 0` to disable the client deadline. A caller-supplied
+`signal` still takes precedence and rejects with the abort error.
 
 ## API
 
@@ -217,5 +245,7 @@ The suite covers canonical JSON against the repo conformance fixture, a fixed
 transaction vector shared with the Python SDK, Ed25519 signing verification,
 wallet key-file loading, encryption shape/commitment, a full X25519 +
 HKDF + ChaCha20-Poly1305 round-trip, plaintext/encrypted `infer` selection,
-and offline local-server tests for `inferBatch` and `streamTask` SSE parsing,
-heartbeats, CRLF/LF frames, and abort handling.
+and offline local-server tests for `inferBatch` nonce sequencing (including
+mixed explicit/implicit nonces and all-rejected batches), the real SSE result
+shape, heartbeats, CRLF/LF frames, stream abort handling, and the overall
+stream timeout.

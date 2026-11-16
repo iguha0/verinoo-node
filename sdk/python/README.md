@@ -147,15 +147,30 @@ for result in batch["results"]:
 Each request is either an input string or a dict with `input` plus optional
 `model`, `max_fee`/`maxFee`, `encrypt`, `deadline`, `nonce`, and `sampling`
 overrides. Keyword arguments supply defaults. Signing, input encryption, auth,
-and input-key discovery are identical to `infer`. When an item omits `nonce`,
-the SDK signs consecutive nonces starting at `account.nonce + 1` (or the
-explicit `nonce` argument), because batch items execute as separate
-transactions from the same account.
+and input-key discovery are identical to `infer`.
 
-The endpoint returns HTTP 200 when at least one item is accepted. Partial
-failure is reported per item with `accepted: false` and an `error`. Inspect
-each `results` entry; the SDK does not raise for rejected items. Transport,
-auth, and non-2xx failures still raise `VerinooError`.
+Nonces are assigned in request order from `account.nonce + 1` (or the explicit
+`nonce` argument). An item with an explicit `nonce` is used as-is, and the next
+implicit item continues from it (`prev_nonce + 1`); implicit items never
+restart from the batch base after an explicit item. For example, with account
+nonce `4` and items `[implicit, {"nonce": 20}, implicit]` the signed nonces are
+`[5, 20, 21]`. Pass explicit nonces for every item if you need a different
+sequence; the SDK does not reorder or fill gaps.
+
+The endpoint returns HTTP 200 after per-item processing even when every item is
+rejected. Only request-level failures (malformed body, empty or oversized
+batch, auth) return a non-2xx status. Partial failure is reported per item with
+`accepted: false` and an `error`. Inspect each `results` entry; the SDK does
+not raise for rejected items. Transport, auth, and other non-2xx failures still
+raise `VerinooError`.
+
+A rejected middle item does not stop later items from being submitted, but it
+does leave later nonces from the same sender invalid: the node accepted no
+nonce for that item, so every subsequent same-sender item in the batch is out
+of sequence and will be rejected too unless it was signed with the correct
+continuation nonce. The SDK does not auto-repair or re-sign sequences after a
+partial failure; resubmit the affected items with fresh nonces from the
+account's current state.
 
 ## Task event streams
 
@@ -174,7 +189,7 @@ for event, data in client.stream_task(task_id, callback=on_event):
     if event == "status":
         print("status", data["status"])
     elif event == "result":
-        print("result", data["resultOutput"])
+        print("result", data["task"]["resultOutput"])
     elif event == "timeout":
         print("stream timeout", data)
     elif event == "done":
@@ -182,6 +197,12 @@ for event, data in client.stream_task(task_id, callback=on_event):
 ```
 
 `data` is the decoded JSON payload; non-JSON data is returned as a string.
+The `result` payload is `{"taskId", "task", "receipt"}`: the output is nested
+on the redacted task (`data["task"]["resultOutput"]`), not a flat
+`data["resultOutput"]`. The task view has `input`/`encryptedInput` removed and
+replaced by `inputHash` and `encrypted`; `receipt` is `None` until a successful
+task has a receipt. `done` carries `{"taskId"}`.
+
 When `callback` is supplied it receives `(event, data)` before each tuple is
 yielded. The parser accepts CRLF and LF line endings, joins multi-line `data:`
 fields with newlines, ignores comments/heartbeats (`: ...`), and emits a final
@@ -223,5 +244,7 @@ The suite covers canonical JSON against the repo conformance fixture, a fixed
 transaction vector shared with the TypeScript SDK, Ed25519 signing
 verification, wallet key-file loading, encryption shape/commitment, a full
 X25519 + HKDF + ChaCha20-Poly1305 round-trip, plaintext/encrypted `infer`
-selection, and offline local-server tests for `infer_batch` and `stream_task`
-SSE parsing, heartbeats, CRLF/LF frames, and EOF handling.
+selection, and offline local-server tests for `infer_batch` nonce sequencing
+(including mixed explicit/implicit nonces and all-rejected batches) and
+`stream_task` SSE parsing of the real nested result shape, heartbeats, CRLF/LF
+frames, and EOF handling.

@@ -17,6 +17,7 @@ export const DEFAULT_MODEL = 'intent-classifier-v1';
 export const DEFAULT_MAX_FEE = 100;
 export const INPUT_KEY_INFO = 'verinoo-input-v1';
 export const MAX_BATCH_SIZE = 32;
+export const DEFAULT_STREAM_TIMEOUT_MS = 65_000;
 
 const ED25519_PKCS8_PREFIX = Buffer.from(
   '302e020100300506032b657004220420',
@@ -28,12 +29,22 @@ const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 const HEX_RE = /^[0-9a-fA-F]*$/;
 
 export class VerinooError extends Error {
-  constructor(message, { status = null, body = null, bodyText = '', cause } = {}) {
+  constructor(
+    message,
+    {
+      status = null,
+      body = null,
+      bodyText = '',
+      cause,
+      timedOut = false,
+    } = {},
+  ) {
     super(message);
     this.name = 'VerinooError';
     this.status = status;
     this.body = body;
     this.bodyText = bodyText;
+    this.timedOut = timedOut;
     if (cause !== undefined) this.cause = cause;
   }
 }
@@ -687,7 +698,9 @@ export class Client {
       deadline ?? Math.floor(Date.now() / 1000) + 3_600;
     const keyInfo = await this._inputKeyOrNull();
 
-    const transactions = requests.map((request, index) => {
+    const transactions = [];
+    let nextNonce = baseNonce;
+    requests.forEach((request, index) => {
       const item =
         typeof request === 'string' ? { input: request } : request;
       if (!item || typeof item !== 'object' || typeof item.input !== 'string') {
@@ -695,17 +708,21 @@ export class Client {
           `batch request ${index} must be a string or an object with a string input`,
         );
       }
-      return this._buildInferenceEnvelope({
-        wallet,
-        keyInfo,
-        input: item.input,
-        model: item.model ?? model,
-        maxFee: item.maxFee ?? maxFee,
-        deadline: item.deadline ?? defaultDeadline,
-        encrypt: item.encrypt ?? encrypt,
-        sampling: item.sampling === undefined ? sampling : item.sampling,
-        nonce: item.nonce ?? baseNonce + index,
-      });
+      const itemNonce = item.nonce ?? nextNonce;
+      nextNonce = itemNonce + 1;
+      transactions.push(
+        this._buildInferenceEnvelope({
+          wallet,
+          keyInfo,
+          input: item.input,
+          model: item.model ?? model,
+          maxFee: item.maxFee ?? maxFee,
+          deadline: item.deadline ?? defaultDeadline,
+          encrypt: item.encrypt ?? encrypt,
+          sampling: item.sampling === undefined ? sampling : item.sampling,
+          nonce: itemNonce,
+        }),
+      );
     });
 
     return this._request('POST', '/v1/infer/batch', {
@@ -714,102 +731,144 @@ export class Client {
     });
   }
 
-  async streamTask(taskId, handlers = {}, { apiKey } = {}) {
+  async streamTask(
+    taskId,
+    handlers = {},
+    { apiKey, timeoutMs = DEFAULT_STREAM_TIMEOUT_MS } = {},
+  ) {
     const { onEvent, onStatus, onResult, onDone, onTimeout, signal } =
       handlers;
     const url = `${this.baseUrl}/v1/tasks/${encodeURIComponent(taskId)}/events`;
     const headers = { accept: 'text/event-stream' };
     const key = apiKey ?? this.apiKey;
     if (key) headers.authorization = `Bearer ${key}`;
-    const init = { method: 'GET', headers };
-    if (signal) init.signal = signal;
 
-    let response;
-    try {
-      response = await this.fetchImpl(url, init);
-    } catch (error) {
-      if (error?.name === 'AbortError') throw error;
-      throw new VerinooError(`request failed: ${error.message}`, {
-        cause: error,
-      });
+    const controller = new AbortController();
+    let deadlineExpired = false;
+    let timer = null;
+    const abortFromCaller = () => controller.abort(signal?.reason);
+    if (signal) {
+      if (signal.aborted) abortFromCaller();
+      else signal.addEventListener('abort', abortFromCaller, { once: true });
     }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        deadlineExpired = true;
+        controller.abort();
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+    const timeoutError = () =>
+      new VerinooError(
+        `task ${taskId} stream timed out after ${timeoutMs}ms`,
+        { timedOut: true },
+      );
 
-    if (!response.ok) {
-      const text = await response.text();
-      let parsed = null;
+    try {
+      let response;
       try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
-        parsed = null;
+        response = await this.fetchImpl(url, {
+          method: 'GET',
+          headers,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (deadlineExpired) throw timeoutError();
+        if (error?.name === 'AbortError') throw error;
+        throw new VerinooError(`request failed: ${error.message}`, {
+          cause: error,
+        });
       }
-      throw new VerinooError(`HTTP ${response.status}: ${text}`, {
-        status: response.status,
-        body: parsed,
-        bodyText: text,
-      });
-    }
-    if (!response.body) {
-      throw new VerinooError('stream response has no body');
-    }
 
-    const events = [];
-    let done = false;
-    let timedOut = false;
-
-    const handleEvent = (entry) => {
-      if (done) return;
-      events.push(entry);
-      if (typeof onEvent === 'function') {
-        onEvent(entry.event, entry.data, entry.id);
+      if (!response.ok) {
+        let text;
+        try {
+          text = await response.text();
+        } catch (error) {
+          if (deadlineExpired) throw timeoutError();
+          throw error;
+        }
+        let parsed = null;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
+        throw new VerinooError(`HTTP ${response.status}: ${text}`, {
+          status: response.status,
+          body: parsed,
+          bodyText: text,
+        });
       }
-      if (entry.event === 'status' && typeof onStatus === 'function') {
-        onStatus(entry.data);
-      } else if (entry.event === 'result' && typeof onResult === 'function') {
-        onResult(entry.data);
-      } else if (entry.event === 'done' && typeof onDone === 'function') {
-        onDone(entry.data);
-      } else if (entry.event === 'timeout' && typeof onTimeout === 'function') {
-        onTimeout(entry.data);
+      if (!response.body) {
+        throw new VerinooError('stream response has no body');
       }
-      if (entry.event === 'done') done = true;
-      if (entry.event === 'timeout') timedOut = true;
-    };
 
-    const parser = createSseEventParser(handleEvent);
-    const lines = createSseLineReader((line) => parser.line(line));
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+      const events = [];
+      let done = false;
+      let timedOut = false;
 
-    try {
-      while (!done) {
-        const { value, done: ended } = await reader.read();
-        if (ended) break;
-        const text = decoder.decode(value, { stream: true });
-        if (text) {
-          lines.push(text);
-          if (done) break;
+      const handleEvent = (entry) => {
+        if (done) return;
+        events.push(entry);
+        if (typeof onEvent === 'function') {
+          onEvent(entry.event, entry.data, entry.id);
+        }
+        if (entry.event === 'status' && typeof onStatus === 'function') {
+          onStatus(entry.data);
+        } else if (entry.event === 'result' && typeof onResult === 'function') {
+          onResult(entry.data);
+        } else if (entry.event === 'done' && typeof onDone === 'function') {
+          onDone(entry.data);
+        } else if (entry.event === 'timeout' && typeof onTimeout === 'function') {
+          onTimeout(entry.data);
+        }
+        if (entry.event === 'done') done = true;
+        if (entry.event === 'timeout') timedOut = true;
+      };
+
+      const parser = createSseEventParser(handleEvent);
+      const lines = createSseLineReader((line) => parser.line(line));
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      try {
+        while (!done) {
+          const { value, done: ended } = await reader.read();
+          if (ended) break;
+          const text = decoder.decode(value, { stream: true });
+          if (text) {
+            lines.push(text);
+            if (done) break;
+          }
+        }
+        if (!done) {
+          const tail = decoder.decode();
+          if (tail) lines.push(tail);
+          lines.push('', true);
+          parser.end();
+        }
+      } catch (error) {
+        if (deadlineExpired) throw timeoutError();
+        throw error;
+      } finally {
+        try {
+          await reader.cancel();
+        } catch {
+          // The stream is already closed or was aborted.
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // Ignore release errors after an aborted stream.
         }
       }
-      if (!done) {
-        const tail = decoder.decode();
-        if (tail) lines.push(tail);
-        lines.push('', true);
-        parser.end();
-      }
-    } finally {
-      try {
-        await reader.cancel();
-      } catch {
-        // The stream is already closed or was aborted.
-      }
-      try {
-        reader.releaseLock();
-      } catch {
-        // Ignore release errors after an aborted stream.
-      }
-    }
 
-    return { taskId, events, done, timedOut };
+      return { taskId, events, done, timedOut };
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abortFromCaller);
+    }
   }
 }
 

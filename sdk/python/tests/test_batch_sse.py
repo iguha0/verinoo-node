@@ -142,6 +142,123 @@ def test_infer_batch_signs_transactions_and_returns_results():
     assert len({tx["txId"] for tx in transactions}) == 3
 
 
+def test_infer_batch_continues_implicit_nonces_from_explicit_items():
+    batch = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/account/"):
+                _send_json(self, 200, {"balance": 1_000_000, "nonce": 4})
+            elif self.path == "/v1/input-key":
+                _send_json(self, 404, {"error": "not found"})
+            else:
+                _send_json(self, 500, {"error": self.path})
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            batch["body"] = body
+            if self.path != "/v1/infer/batch":
+                _send_json(self, 500, {"error": self.path})
+                return
+            _send_json(
+                self,
+                200,
+                {
+                    "accepted": len(body["transactions"]),
+                    "rejected": 0,
+                    "results": [
+                        {
+                            "index": index,
+                            "accepted": True,
+                            "txId": tx["txId"],
+                            "taskId": f"task-{index}",
+                        }
+                        for index, tx in enumerate(body["transactions"])
+                    ],
+                },
+            )
+
+    with _serve(Handler) as base_url:
+        client = Client(base_url=base_url)
+        wallet = load_wallet({"privateKey": SEED_B64})
+        client.infer_batch(
+            [
+                "implicit-first",
+                {"input": "explicit-mid", "nonce": 20},
+                "implicit-after",
+                {"input": "explicit-later", "nonce": 30},
+                "implicit-last",
+            ],
+            wallet,
+        )
+
+    assert [tx["nonce"] for tx in batch["body"]["transactions"]] == [
+        5,
+        20,
+        21,
+        30,
+        31,
+    ]
+
+
+def test_infer_batch_returns_per_item_errors_when_all_items_are_rejected():
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/account/"):
+                _send_json(self, 200, {"balance": 1_000_000, "nonce": 4})
+            elif self.path == "/v1/input-key":
+                _send_json(self, 404, {"error": "not found"})
+            else:
+                _send_json(self, 500, {"error": self.path})
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path != "/v1/infer/batch":
+                _send_json(self, 500, {"error": self.path})
+                return
+            _send_json(
+                self,
+                200,
+                {
+                    "accepted": 0,
+                    "rejected": len(body["transactions"]),
+                    "results": [
+                        {
+                            "index": index,
+                            "accepted": False,
+                            "error": "policy rejected",
+                            "txId": tx["txId"],
+                        }
+                        for index, tx in enumerate(body["transactions"])
+                    ],
+                },
+            )
+
+    with _serve(Handler) as base_url:
+        client = Client(base_url=base_url)
+        wallet = load_wallet({"privateKey": SEED_B64})
+        response = client.infer_batch(["first", "second"], wallet)
+
+    assert response["accepted"] == 0
+    assert response["rejected"] == 2
+    assert [item["accepted"] for item in response["results"]] == [
+        False,
+        False,
+    ]
+    assert [item["error"] for item in response["results"]] == [
+        "policy rejected",
+        "policy rejected",
+    ]
+
+
 def test_infer_batch_validates_size_before_any_request():
     client = Client(base_url="http://127.0.0.1:1")
     wallet = load_wallet({"privateKey": SEED_B64})
@@ -181,11 +298,16 @@ def test_stream_task_parses_crlf_and_lf_frames_in_order():
             self.wfile.write(b": keep-alive\n\n")
             self.wfile.write(b"event: result\r\n")
             self.wfile.write(b'data: {"taskId":"task-1",\r\n')
-            self.wfile.write(b'data: "resultOutput":"hello"}\r\n\r\n')
-            self.wfile.write(b"event: done\r\n")
             self.wfile.write(
-                b'data: {"taskId":"task-1","finalized":true}\r\n'
+                b'data: "task":{"taskId":"task-1","status":"completed",\r\n'
             )
+            self.wfile.write(b'data: "resultOutput":"hello"},\r\n')
+            self.wfile.write(
+                b'data: "receipt":{"taskId":"task-1","outputHash":"aa"}}\r\n'
+            )
+            self.wfile.write(b"\r\n")
+            self.wfile.write(b"event: done\r\n")
+            self.wfile.write(b'data: {"taskId":"task-1"}\r\n')
             self.wfile.flush()
 
     with _serve(Handler) as base_url:
@@ -206,8 +328,18 @@ def test_stream_task_parses_crlf_and_lf_frames_in_order():
         "done",
     ]
     assert events[0][1] == {"taskId": "task-1", "status": "pending"}
-    assert events[1][1] == {"taskId": "task-1", "resultOutput": "hello"}
-    assert events[2][1] == {"taskId": "task-1", "finalized": True}
+    assert events[1][1] == {
+        "taskId": "task-1",
+        "task": {
+            "taskId": "task-1",
+            "status": "completed",
+            "resultOutput": "hello",
+        },
+        "receipt": {"taskId": "task-1", "outputHash": "aa"},
+    }
+    assert events[1][1]["task"]["resultOutput"] == "hello"
+    assert "resultOutput" not in events[1][1]
+    assert events[2][1] == {"taskId": "task-1"}
     assert callback_events == events
     assert seen_headers[0].get("Authorization") == "Bearer sse-key"
     assert seen_headers[0].get("Accept") == "text/event-stream"
