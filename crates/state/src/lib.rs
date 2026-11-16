@@ -11,6 +11,7 @@
 
 pub mod genesis;
 pub mod models;
+pub mod snapshot;
 pub mod validators;
 
 use crate::models::{Account, AgentAccount, ComputeNode, InferenceTask, ModelRegistryEntry};
@@ -42,6 +43,14 @@ impl StateStore {
         let dir =
             std::env::temp_dir().join(format!("verinoo-state-test-{}-{n}", std::process::id()));
         Self::open(&dir)
+    }
+
+    /// Create a consistent RocksDB checkpoint at `dir`.
+    ///
+    /// `dir` must not already exist; RocksDB creates it. The database may stay
+    /// open while the checkpoint is taken.
+    pub fn checkpoint(&self, dir: &Path) -> Result<(), rocksdb::Error> {
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(dir)
     }
 
     fn del_raw(&self, key: &str) {

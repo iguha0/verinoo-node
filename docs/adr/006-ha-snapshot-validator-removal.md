@@ -2,15 +2,22 @@
 
 ## Status
 
-**Partially implemented — readiness observability only.** `GET /ready`, the
-`syncing` flag, `peerCount`, `validatorSetHash`, and `validatorSetConsistent`
-are implemented as described in "API failover, health checks, DNS, and load
-balancer". The rest of this document remains a target design: no code in this
-repository implements automatic failover, split-brain protection, state
-snapshot transfer, or a consensus validator-set change. Do not cite anything
-else here as shipped behavior.
+**Partially implemented — readiness observability and the state-layer snapshot
+format.** `GET /ready`, the `syncing` flag, `peerCount`, `validatorSetHash`, and
+`validatorSetConsistent` are implemented as described in "API failover, health
+checks, DNS, and load balancer". The state layer also implements local snapshot
+create/verify/apply (`crates/state/src/snapshot.rs`, documented in
+`docs/snapshots.md`): RocksDB checkpointing, a hashed file manifest, strict
+path and file verification, and atomic apply with a mandatory backup and
+rollback. Node snapshot endpoints, manifest signing and signature verification,
+state-root recomputation for snapshots using `crates/exec`, and BFT
+certificates remain unimplemented. The rest of this document remains a target
+design: no code in this repository implements automatic failover, split-brain
+protection, state snapshot transfer over the network, or a consensus
+validator-set change. Do not cite anything else here as shipped behavior.
 
-Date: 2026-11-15 (readiness surface implemented 2026-11-15; hardened 2026-11-16)
+Date: 2026-11-15 (readiness surface implemented 2026-11-15; hardened 2026-11-16;
+state-layer snapshot create/verify/apply added 2026-11-17)
 Scope: `crates/node`, `crates/state`, `crates/exec`, `crates/network`,
 `scripts/`, and operations documentation.
 
@@ -214,7 +221,10 @@ stop/start with a fencing requirement.
 ### Snapshot format
 
 A snapshot is a RocksDB checkpoint at a finalized head plus a signed manifest.
-Proposed layout:
+The state-layer v1 implementation covers the checkpoint, file hashes, and the
+manifest fields below except `finalized`, `commitCertificate`, `validatorSet`,
+`compression`, and `signers`; `docs/snapshots.md` records the exact implemented
+schema. Proposed layout:
 
 ```text
 snapshot-<height>/
@@ -312,6 +322,14 @@ The apply step must be atomic from the node's perspective: a crash before the
 rename leaves the old database intact; a crash after the rename leaves the new
 snapshot. Keep the old directory until the node has applied at least one new
 block and produced a matching state root.
+
+State-layer scope today: `verify_snapshot` performs the local file-set checks
+from steps 3-4 (size/SHA-256, path safety, metadata comparison) for an
+already-downloaded snapshot. `apply_snapshot` implements the rename and
+rollback portion of step 8 and consumes `state/`, leaving the backup in place.
+Network download/resume, state-root recomputation (step 4), signature
+verification (step 2), certificate verification (step 7), and head/catch-up
+setup (step 9) are not implemented.
 
 ### Trust and rollback
 
@@ -500,10 +518,12 @@ Do the prerequisites before the visible features:
    still the configured list, so the node does not refuse to run with a
    mismatched set. This coverage is a prerequisite for on-chain removal and for
    BFT.
-2. **Snapshot format, manifest, and verifier (1-2 wk).** Add
-   `StateStore::checkpoint_to`, a manifest builder/signer, a download/verify/
-   apply tool, and tests. Do not serve snapshots until the verifier rejects
-   tampered files and a stale height.
+2. **Snapshot format, manifest, and verifier (1-2 wk).** The state layer now has
+   `StateStore::checkpoint`, a manifest builder/verifier, and atomic
+   apply/rollback (`crates/state/src/snapshot.rs`; `docs/snapshots.md`).
+   Signing, node download/verify orchestration, state-root recomputation, and
+   serving endpoints remain. Do not serve snapshots until the node verifier
+   rejects tampered files, stale heights, and unauthorized signatures.
 3. **Catch-up from a snapshot (0.5-1 wk).** Start `sync_once` at the snapshot
    height; keep `/blocks/since` unchanged. Add `/snapshot/manifest` and a file
    endpoint behind a flag.
@@ -533,7 +553,14 @@ external audit and a multi-operator testnet.
 
 ## Test plan
 
-Snapshot tests (in-process, `StateStore::open_temp()`):
+Snapshot tests (the state-layer cases run in `crates/state/src/snapshot.rs`;
+the remaining cases are integration or node-level):
+
+The state-layer suite covers create/verify/apply, tampered files, metadata
+mismatches, path traversal/absolute paths/duplicates/missing files,
+backup/rollback, and stable signing bytes. The cases below that require a
+network endpoint, signature policy, state-root recomputation, or BFT remain
+unimplemented.
 
 1. Build a store at height H, checkpoint it, write a manifest, apply it to a
    fresh temp store. Assert the state root, head hash, height, base fee, model
@@ -609,7 +636,8 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
   the configured list. These signals do not elect a leader, fence a host,
   transfer state, or change consensus membership.
 - **Not implemented.** There is no automatic failover, leader lease, fencing
-  primitive, snapshot endpoint, snapshot verifier, epoch activation,
+  primitive, snapshot HTTP endpoint, node-level manifest signing/verification,
+  state-root recomputation during snapshot verification, epoch activation,
   `BindValidatorKey`, or state-derived consensus set in this repository.
 - **No automatic HA.** Promotion is manual and requires an external fencing
   step. Running the same validator key on two hosts is not prevented by the
@@ -618,9 +646,16 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
   leader election. `/ready`, `peerCount`, and `validatorSetHash` make a
   divergent head or set visible, but they do not prevent it. ADR 004's evidence
   collection is not a prevention mechanism.
-- **No snapshot transfer today.** A late node replays from genesis via
-  `VNN_SYNC_URLS`; join time is O(chain length). A snapshot is a proposed
-  format, not a served endpoint.
+- **No snapshot transfer over the network today.** The state layer can create,
+  verify, and apply a local snapshot (`crates/state/src/snapshot.rs`,
+  `docs/snapshots.md`), but no endpoint serves one and no node downloads one. A
+  late node still replays from genesis via `VNN_SYNC_URLS`; join time is
+  O(chain length).
+- **No signature or state-root verification in the state layer.** Snapshot
+  metadata is caller-provided. The state layer compares `stateRoot`,
+  `modelSetHash`, `modelHashes`, and `validatorSetHash` to expected values and
+  hashes the files; it does not recompute the state root and does not verify
+  that a signature belongs to a signer. Those checks remain node/`exec` work.
 - **No trustless snapshot without a trust anchor.** With BFT, a commit
   certificate and quorum signatures; without BFT, a pinned operator signer.
   A snapshot does not replace block validation for blocks after its height.
