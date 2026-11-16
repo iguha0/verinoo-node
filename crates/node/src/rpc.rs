@@ -6,16 +6,20 @@
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Extension, Json, Router,
 };
-use std::collections::HashMap;
+use futures::stream::{self, Stream};
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::auth::{Auth, AuthError, SelfServeError};
+use crate::auth::{Auth, AuthError, Caller, SelfServeError};
+use crate::policy_gate;
 use crate::readiness::{self, ReadinessInput};
 use crate::Shared;
 
@@ -58,7 +62,9 @@ fn app(shared: Arc<Shared>, net: verinoo_network::NetworkNode, auth: Auth) -> Ro
         .route("/v1/input-key", get(v1_input_key))
         .route("/v1/keys", post(v1_issue_key))
         .route("/v1/infer", post(submit_tx))
+        .route("/v1/infer/batch", post(v1_submit_batch))
         .route("/v1/tasks/:task_id", get(v1_task))
+        .route("/v1/tasks/:task_id/events", get(v1_task_events))
         .route("/v1/verify/:task_id", get(v1_verify))
         .route("/v1/usage/:address", get(v1_usage))
         .route("/v1/usage/:address/csv", get(v1_usage_csv))
@@ -449,32 +455,73 @@ fn auth_error(e: AuthError) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-async fn submit_tx(
-    State(shared): State<Arc<Shared>>,
-    Extension(net): Extension<verinoo_network::NetworkNode>,
-    Extension(auth): Extension<Auth>,
-    headers: HeaderMap,
-    Json(tx): Json<verinoo_types::tx::TxEnvelope>,
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
-    // Authentication is opt-in: a node with no key file accepts any funded
-    // sender (public demo). When keys are configured, a key may only submit for
-    // the address it was issued to.
-    let caller = if auth.is_enabled() {
-        let caller = auth
-            .authorize_with_store(&headers, &shared.store)
-            .map_err(auth_error)?;
-        if caller.address != tx.from {
-            return Err(auth_error(AuthError::AddressMismatch));
+struct AcceptedTx {
+    tx_id: String,
+    task_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum SubmitError {
+    Auth(AuthError),
+    Invalid(String),
+    Policy(policy_gate::GateError),
+    Conflict(String),
+    Internal(String),
+}
+
+impl SubmitError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Auth(error) => error.status(),
+            Self::Invalid(_) => StatusCode::BAD_REQUEST,
+            Self::Policy(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
-        tracing::debug!(
-            tenant = %caller.tenant,
-            address = %caller.address,
-            "api key authorized"
-        );
-        Some(caller)
-    } else {
-        None
-    };
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Auth(error) => error.message(),
+            Self::Invalid(message) | Self::Conflict(message) | Self::Internal(message) => {
+                message.clone()
+            }
+            Self::Policy(error) => error.message(),
+        }
+    }
+
+    fn policy_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Policy(error) => Some(error.code()),
+            _ => None,
+        }
+    }
+
+    fn into_rejection(self) -> (StatusCode, Json<serde_json::Value>) {
+        let status = self.status();
+        let message = self.message();
+        let policy_code = self.policy_code();
+        let mut body = serde_json::json!({ "error": message });
+        if let Some(code) = policy_code {
+            body["reason"] = serde_json::json!(policy_gate::POLICY_REASON);
+            body["policyReason"] = serde_json::json!(code);
+        }
+        (status, Json(body))
+    }
+}
+
+async fn submit_one(
+    shared: &Shared,
+    net: &verinoo_network::NetworkNode,
+    auth: &Auth,
+    caller: Option<&Caller>,
+    tx: verinoo_types::tx::TxEnvelope,
+) -> Result<AcceptedTx, SubmitError> {
+    if let Some(caller) = caller {
+        if caller.address != tx.from {
+            return Err(SubmitError::Auth(AuthError::AddressMismatch));
+        }
+    }
 
     // Full validation at submission time — fail fast with the exact reason.
     // (Stateful rules like nonce/balance are evaluated against current state;
@@ -486,12 +533,9 @@ async fn submit_tx(
         store: &shared.store,
         base_fee,
     };
-    if let Err(e) = validator.validate_transaction(&tx) {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        ));
-    }
+    validator
+        .validate_transaction(&tx)
+        .map_err(SubmitError::Invalid)?;
 
     if tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference {
         let has_encrypted = tx
@@ -507,22 +551,17 @@ async fn submit_tx(
             .and_then(|v| v.as_str())
             .map(|s| !s.is_empty())
             .unwrap_or(false);
-        let bad = |msg: &str| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": msg })),
-            )
-        };
+        let bad = |msg: &str| SubmitError::Invalid(msg.to_string());
         if has_encrypted && has_plain {
             return Err(bad("submit either input or encryptedInput, not both"));
         }
         match verinoo_exec::engine::parse_sampling(tx.data.data.get("sampling")) {
-            Err(e) => return Err(bad(&e)),
+            Err(e) => return Err(SubmitError::Invalid(e)),
             Ok(Some(spec)) => {
                 let target = tx.data.data["targetModel"].as_str().unwrap_or("");
                 if let Some(model) = verinoo_exec::engine::ExecModel::resolve(target) {
                     if let Err(e) = model.validate_sampling(&spec) {
-                        return Err(bad(&e));
+                        return Err(SubmitError::Invalid(e));
                     }
                 }
             }
@@ -537,27 +576,21 @@ async fn submit_tx(
         if has_encrypted && verinoo_crypto::input_key().is_none() {
             return Err(bad("this node has no input key configured"));
         }
+        policy_gate::check_tx(&shared.request_policy, &tx).map_err(SubmitError::Policy)?;
     }
 
     let mut mp = shared.mempool.lock().await;
     if mp.iter().any(|t| t.tx_id == tx.tx_id) {
-        return Err((
-            axum::http::StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "already in mempool" })),
-        ));
+        return Err(SubmitError::Conflict("already in mempool".into()));
     }
-    if let Some(caller) = &caller {
+    if let Some(caller) = caller {
         if tx.data.r#type == verinoo_types::tx::TxKind::SubmitInference {
             auth.consume_quota(&shared.store, caller, shared.now_ms())
-                .map_err(auth_error)?;
+                .map_err(SubmitError::Auth)?;
         }
     }
-    let payload = serde_json::to_string(&tx).map_err(|e| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-    })?;
+    let payload = serde_json::to_string(&tx).map_err(|e| SubmitError::Internal(e.to_string()))?;
+    let task_id = verinoo_exec::engine::task_id_for(&tx);
     mp.push(tx.clone());
     drop(mp);
 
@@ -565,10 +598,133 @@ async fn submit_tx(
     // leaves the process and is silently lost.
     net.publish_tx(&payload);
 
+    Ok(AcceptedTx {
+        tx_id: tx.tx_id,
+        task_id,
+    })
+}
+
+async fn submit_tx(
+    State(shared): State<Arc<Shared>>,
+    Extension(net): Extension<verinoo_network::NetworkNode>,
+    Extension(auth): Extension<Auth>,
+    headers: HeaderMap,
+    Json(tx): Json<verinoo_types::tx::TxEnvelope>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    // Authentication is opt-in: a node with no key file accepts any funded
+    // sender (public demo). When keys are configured, a key may only submit for
+    // the address it was issued to.
+    let caller = if auth.is_enabled() {
+        let caller = auth
+            .authorize_with_store(&headers, &shared.store)
+            .map_err(auth_error)?;
+        tracing::debug!(
+            tenant = %caller.tenant,
+            address = %caller.address,
+            "api key authorized"
+        );
+        Some(caller)
+    } else {
+        None
+    };
+
+    let accepted = submit_one(&shared, &net, &auth, caller.as_ref(), tx)
+        .await
+        .map_err(SubmitError::into_rejection)?;
+
     Ok(Json(serde_json::json!({
         "accepted": true,
-        "txId": tx.tx_id,
-        "taskId": verinoo_exec::engine::task_id_for(&tx),
+        "txId": accepted.tx_id,
+        "taskId": accepted.task_id,
+    })))
+}
+
+const MAX_BATCH_TRANSACTIONS: usize = 32;
+
+fn invalid_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": message })),
+    )
+}
+
+async fn v1_submit_batch(
+    State(shared): State<Arc<Shared>>,
+    Extension(net): Extension<verinoo_network::NetworkNode>,
+    Extension(auth): Extension<Auth>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let caller = if auth.is_enabled() {
+        Some(
+            auth.authorize_with_store(&headers, &shared.store)
+                .map_err(auth_error)?,
+        )
+    } else {
+        None
+    };
+
+    let Some(transactions) = body.get("transactions").and_then(|value| value.as_array()) else {
+        return Err(invalid_request("missing transactions array"));
+    };
+    if transactions.is_empty() {
+        return Err(invalid_request("transactions must not be empty"));
+    }
+    if transactions.len() > MAX_BATCH_TRANSACTIONS {
+        return Err(invalid_request("transactions exceeds the 32 item limit"));
+    }
+
+    let mut results = Vec::with_capacity(transactions.len());
+    let mut accepted_count = 0usize;
+    for (index, value) in transactions.iter().enumerate() {
+        let hinted_tx_id = value
+            .get("txId")
+            .and_then(|tx_id| tx_id.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tx = match serde_json::from_value::<verinoo_types::tx::TxEnvelope>(value.clone()) {
+            Ok(tx) => tx,
+            Err(_) => {
+                results.push(serde_json::json!({
+                    "index": index,
+                    "accepted": false,
+                    "error": "malformed transaction",
+                    "txId": hinted_tx_id,
+                }));
+                continue;
+            }
+        };
+        let tx_id = tx.tx_id.clone();
+        match submit_one(&shared, &net, &auth, caller.as_ref(), tx).await {
+            Ok(accepted) => {
+                accepted_count += 1;
+                results.push(serde_json::json!({
+                    "index": index,
+                    "accepted": true,
+                    "txId": accepted.tx_id,
+                    "taskId": accepted.task_id,
+                }));
+            }
+            Err(error) => {
+                let mut result = serde_json::json!({
+                    "index": index,
+                    "accepted": false,
+                    "error": error.message(),
+                    "txId": tx_id,
+                });
+                if let Some(code) = error.policy_code() {
+                    result["reason"] = serde_json::json!(policy_gate::POLICY_REASON);
+                    result["policyReason"] = serde_json::json!(code);
+                }
+                results.push(result);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "accepted": accepted_count,
+        "rejected": results.len() - accepted_count,
+        "results": results,
     })))
 }
 
@@ -666,23 +822,12 @@ async fn v1_issue_key(
     }
 }
 
-async fn v1_task(
-    State(shared): State<Arc<Shared>>,
-    axum::extract::Path(task_id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
-    let task = shared
-        .store
-        .get_task(&task_id)
-        .ok_or_else(|| not_found("task not found"))?;
-    let receipt = verinoo_exec::engine::receipt_for(&shared.store, &task_id);
+fn redacted_task_json(
+    task: &verinoo_state::models::InferenceTask,
+) -> Result<serde_json::Value, serde_json::Error> {
     let input_commitment = task.input_commitment.clone();
     let encrypted = task.encrypted_input.is_some();
-    let mut task_json = serde_json::to_value(&task).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-    })?;
+    let mut task_json = serde_json::to_value(task)?;
     if let Some(obj) = task_json.as_object_mut() {
         // Inputs and ciphertext are not part of the public task view. The
         // commitment is enough to match a receipt; verification recomputes
@@ -695,11 +840,167 @@ async fn v1_task(
         );
         obj.insert("encrypted".into(), serde_json::Value::Bool(encrypted));
     }
+    Ok(task_json)
+}
+
+async fn v1_task(
+    State(shared): State<Arc<Shared>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    let task = shared
+        .store
+        .get_task(&task_id)
+        .ok_or_else(|| not_found("task not found"))?;
+    let receipt = verinoo_exec::engine::receipt_for(&shared.store, &task_id);
+    let task_json = redacted_task_json(&task).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
     Ok(Json(serde_json::json!({
         "task": task_json,
         "receipt": receipt,
         "anchored": receipt.is_some(),
     })))
+}
+
+const TASK_EVENT_POLL: Duration = Duration::from_secs(1);
+const TASK_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct TaskEventState {
+    shared: Arc<Shared>,
+    task_id: String,
+    ticker: tokio::time::Interval,
+    deadline: Instant,
+    last_status: Option<(String, Option<String>, u64)>,
+    queue: VecDeque<Event>,
+    finished: bool,
+}
+
+fn task_status_event(shared: &Shared, task: &verinoo_state::models::InferenceTask) -> Event {
+    let height = if task.executed_at > 0 {
+        task.executed_at
+    } else {
+        shared.head().map(|block| block.header.index).unwrap_or(0)
+    };
+    Event::default().event("status").data(
+        serde_json::json!({
+            "taskId": task.task_id,
+            "status": task.status,
+            "height": height,
+            "resultHash": task.result_hash,
+            "updatedAt": shared.now_ms(),
+        })
+        .to_string(),
+    )
+}
+
+fn task_result_event(state: &mut TaskEventState, task: &verinoo_state::models::InferenceTask) {
+    let receipt = verinoo_exec::engine::receipt_for(&state.shared.store, &state.task_id);
+    let task_json =
+        redacted_task_json(task).unwrap_or_else(|_| serde_json::json!({ "taskId": state.task_id }));
+    state.queue.push_back(
+        Event::default().event("result").data(
+            serde_json::json!({
+                "taskId": state.task_id,
+                "task": task_json,
+                "receipt": receipt,
+            })
+            .to_string(),
+        ),
+    );
+    state.queue.push_back(
+        Event::default()
+            .event("done")
+            .data(serde_json::json!({ "taskId": state.task_id }).to_string()),
+    );
+    state.finished = true;
+}
+
+fn task_event_stream(
+    shared: Arc<Shared>,
+    task_id: String,
+    poll: Duration,
+    timeout: Duration,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let state = TaskEventState {
+        shared,
+        task_id,
+        ticker: tokio::time::interval(poll),
+        deadline: Instant::now() + timeout,
+        last_status: None,
+        queue: VecDeque::new(),
+        finished: false,
+    };
+    let stream = stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                return Some((Ok(event), state));
+            }
+            if state.finished {
+                return None;
+            }
+            if Instant::now() >= state.deadline {
+                state.queue.push_back(
+                    Event::default().event("timeout").data(
+                        serde_json::json!({
+                            "taskId": state.task_id,
+                            "reason": "timeout",
+                        })
+                        .to_string(),
+                    ),
+                );
+                state.queue.push_back(
+                    Event::default()
+                        .event("done")
+                        .data(serde_json::json!({ "taskId": state.task_id }).to_string()),
+                );
+                state.finished = true;
+                continue;
+            }
+
+            state.ticker.tick().await;
+
+            if let Some(task) = state.shared.store.get_task(&state.task_id) {
+                let status_key = (
+                    task.status.clone(),
+                    task.result_hash.clone(),
+                    task.executed_at,
+                );
+                if state.last_status.as_ref() != Some(&status_key) {
+                    state.last_status = Some(status_key);
+                    state
+                        .queue
+                        .push_back(task_status_event(&state.shared, &task));
+                }
+                if task.status == "completed" || task.status == "failed" {
+                    task_result_event(&mut state, &task);
+                }
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+async fn v1_task_events(
+    State(shared): State<Arc<Shared>>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<serde_json::Value>)>
+{
+    if shared.store.get_task(&task_id).is_none() {
+        return Err(not_found("task not found"));
+    }
+    Ok(task_event_stream(
+        shared,
+        task_id,
+        TASK_EVENT_POLL,
+        TASK_EVENT_TIMEOUT,
+    ))
 }
 
 /// Independent verification: re-run the model and compare against the value
@@ -880,6 +1181,13 @@ mod tests {
     }
 
     fn test_shared_with(params: GenesisParams) -> Arc<Shared> {
+        test_shared_with_policy(params, verinoo_policy::Policy::default())
+    }
+
+    fn test_shared_with_policy(
+        params: GenesisParams,
+        request_policy: verinoo_policy::Policy,
+    ) -> Arc<Shared> {
         let store = StateStore::open_temp().unwrap();
         let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let address = verinoo_exec::engine::public_key_to_address(&hex::encode(
@@ -898,6 +1206,7 @@ mod tests {
             best_peer_height: std::sync::atomic::AtomicU64::new(0),
             block_time_ms,
             peer_lag_blocks: 2,
+            request_policy,
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
     }
@@ -1359,5 +1668,446 @@ mod tests {
             body["verified"], true,
             "old receipts without sampling fields stay compatible"
         );
+    }
+
+    fn test_key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn key_address(signing: &ed25519_dalek::SigningKey) -> String {
+        verinoo_exec::engine::public_key_to_address(&hex::encode(
+            signing.verifying_key().to_bytes(),
+        ))
+        .unwrap()
+    }
+
+    fn fund(shared: &Shared, address: &str) {
+        let mut account = shared.store.account_or_default(address);
+        account.balance = 10_000_000;
+        shared.store.set_account(&account);
+    }
+
+    fn signed_inference(
+        signing: &ed25519_dalek::SigningKey,
+        from: &str,
+        data: serde_json::Value,
+        nonce: u64,
+    ) -> verinoo_types::tx::TxEnvelope {
+        use ed25519_dalek::Signer as _;
+        let data = serde_json::json!({ "type": "submitInference", "data": data });
+        let payload = serde_json::json!({
+            "data": data,
+            "from": from,
+            "nonce": nonce,
+            "to": "",
+            "value": 0,
+        });
+        let tx_id =
+            verinoo_model::sha256_hex(&verinoo_types::canonical::canonical_json(&payload).unwrap());
+        let signature = signing.sign(tx_id.as_bytes());
+        serde_json::from_value(serde_json::json!({
+            "txId": tx_id,
+            "from": from,
+            "to": "",
+            "value": 0,
+            "nonce": nonce,
+            "data": data,
+            "publicKey": hex::encode(signing.verifying_key().to_bytes()),
+            "signature": hex::encode(signature.to_bytes()),
+        }))
+        .unwrap()
+    }
+
+    fn inference_data(requester: &str, model: &str, input: &str) -> serde_json::Value {
+        serde_json::json!({
+            "requester": requester,
+            "targetModel": model,
+            "input": input,
+            "inputCommitment": verinoo_crypto::sha256_hex(input),
+            "maxFee": 100,
+            "deadline": 1000,
+            "verificationType": "optimistic",
+        })
+    }
+
+    async fn test_network(shared: &Shared) -> verinoo_network::NetworkNode {
+        let (net, _events) =
+            verinoo_network::NetworkNode::new(0, [7u8; 32], &[], &shared.params.chain_id)
+                .await
+                .unwrap();
+        net
+    }
+
+    async fn call_batch(
+        shared: &Arc<Shared>,
+        net: &verinoo_network::NetworkNode,
+        auth: &Auth,
+        headers: HeaderMap,
+        transactions: Vec<serde_json::Value>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        v1_submit_batch(
+            State(shared.clone()),
+            Extension(net.clone()),
+            Extension(auth.clone()),
+            headers,
+            Json(serde_json::json!({ "transactions": transactions })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_empty_and_oversized_requests() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+
+        let error = call_batch(&shared, &net, &auth, HeaderMap::new(), vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let signing = test_key(4);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+        let tx = serde_json::to_value(signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "hello"),
+            1,
+        ))
+        .unwrap();
+        let error = call_batch(&shared, &net, &auth, HeaderMap::new(), vec![tx; 33])
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(shared.mempool.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_accepts_valid_items_and_reports_per_item_errors() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(5);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let good = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "first prompt"),
+            1,
+        );
+        let expected_task = verinoo_exec::engine::task_id_for(&good).unwrap();
+        let mut bad = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "second prompt"),
+            1,
+        );
+        bad.signature = "00".repeat(64);
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(&good).unwrap(),
+                serde_json::to_value(&bad).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(body["accepted"], 1);
+        assert_eq!(body["rejected"], 1);
+        assert_eq!(body["results"][0]["index"], 0);
+        assert_eq!(body["results"][0]["accepted"], true);
+        assert_eq!(body["results"][0]["txId"], good.tx_id);
+        assert_eq!(body["results"][0]["taskId"], expected_task);
+        assert_eq!(body["results"][1]["index"], 1);
+        assert_eq!(body["results"][1]["accepted"], false);
+        assert_eq!(body["results"][1]["txId"], bad.tx_id);
+        assert!(body["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("sig"));
+        assert_eq!(shared.mempool.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_auth_mismatch_is_per_item_and_missing_auth_fails_the_request() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+
+        let allowed_signing = test_key(6);
+        let allowed = key_address(&allowed_signing);
+        let other_signing = test_key(7);
+        let other = key_address(&other_signing);
+        fund(&shared, &allowed);
+        fund(&shared, &other);
+
+        let path = std::env::temp_dir().join(format!(
+            "verinoo-batch-auth-{}-keys.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let raw_key = crate::auth::add_key(&path, "acme", &allowed, 0).unwrap();
+        let auth = Auth::load(&path).unwrap();
+
+        let allowed_tx = signed_inference(
+            &allowed_signing,
+            &allowed,
+            inference_data(&allowed, "tiny-gpt-v1", "allowed"),
+            1,
+        );
+        let other_tx = signed_inference(
+            &other_signing,
+            &other,
+            inference_data(&other, "tiny-gpt-v1", "other"),
+            1,
+        );
+        let items = vec![
+            serde_json::to_value(&allowed_tx).unwrap(),
+            serde_json::to_value(&other_tx).unwrap(),
+        ];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {raw_key}").parse().unwrap(),
+        );
+        let body = call_batch(&shared, &net, &auth, headers.clone(), items.clone())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(body["accepted"], 1);
+        assert_eq!(body["rejected"], 1);
+        assert!(body["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not authorized"));
+        assert_eq!(shared.mempool.lock().await.len(), 1);
+
+        let fresh = test_shared();
+        let fresh_net = test_network(&fresh).await;
+        let error = call_batch(&fresh, &fresh_net, &auth, HeaderMap::new(), items)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        assert!(fresh.mempool.lock().await.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn batch_still_enforces_sampling_and_encryption_rules() {
+        let shared = test_shared();
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(8);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let mut sampling_data = inference_data(&address, "intent-classifier-v1", "hello");
+        sampling_data["sampling"] = serde_json::json!({
+            "temperatureMilli": 800,
+            "topK": 40,
+            "topPMilli": 900,
+            "seed": 7,
+        });
+        let sampling_tx = signed_inference(&signing, &address, sampling_data, 1);
+
+        let mut both_data = inference_data(&address, "tiny-gpt-v1", "hello");
+        both_data["encryptedInput"] = serde_json::json!({
+            "ephemeralPublicKey": "ab".repeat(32),
+            "nonce": "00".repeat(12),
+            "ciphertext": "AAAA",
+        });
+        let both_tx = signed_inference(&signing, &address, both_data, 1);
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(sampling_tx).unwrap(),
+                serde_json::to_value(both_tx).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(body["accepted"], 0);
+        assert_eq!(body["rejected"], 2);
+        assert!(body["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("sampling"));
+        assert!(body["results"][1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not both"));
+        assert!(shared.mempool.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_policy_rejection_is_per_item_and_redacts_terms() {
+        let policy =
+            verinoo_policy::Policy::from_json(r#"{ "blockedTerms": ["secretproject"] }"#).unwrap();
+        let shared = test_shared_with_policy(GenesisParams::default(), policy);
+        let net = test_network(&shared).await;
+        let auth = Auth::disabled();
+        let signing = test_key(10);
+        let address = key_address(&signing);
+        fund(&shared, &address);
+
+        let blocked = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "summarize secretPROJECT notes"),
+            1,
+        );
+        let clean = signed_inference(
+            &signing,
+            &address,
+            inference_data(&address, "tiny-gpt-v1", "summarize release notes"),
+            1,
+        );
+
+        let body = call_batch(
+            &shared,
+            &net,
+            &auth,
+            HeaderMap::new(),
+            vec![
+                serde_json::to_value(blocked).unwrap(),
+                serde_json::to_value(clean).unwrap(),
+            ],
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(body["accepted"], 1);
+        assert_eq!(body["rejected"], 1);
+        assert_eq!(body["results"][0]["reason"], "policy");
+        assert_eq!(body["results"][0]["policyReason"], "blocked_term");
+        assert!(!body["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("secretproject"));
+        assert_eq!(body["results"][1]["accepted"], true);
+        assert_eq!(shared.mempool.lock().await.len(), 1);
+    }
+
+    fn test_task(task_id: &str, status: &str) -> verinoo_state::models::InferenceTask {
+        let completed = status == "completed";
+        verinoo_state::models::InferenceTask {
+            task_id: task_id.into(),
+            requester: ADDR.into(),
+            target_model: "tiny-gpt-v1".into(),
+            input_commitment: verinoo_model::sha256_hex("secret prompt"),
+            input: "secret prompt".into(),
+            encrypted_input: None,
+            max_fee: 100,
+            deadline: 1000,
+            sampling: None,
+            verification_type: "optimistic".into(),
+            status: status.into(),
+            assigned_to: None,
+            collateral: 0,
+            result_hash: completed.then(|| "ab".repeat(32)),
+            result_output: completed.then(|| "final output".to_string()),
+            proof_data: None,
+            challenge_window_end: None,
+            game_id: None,
+            executed_at: 5,
+        }
+    }
+
+    async fn collect_events<S>(stream: Sse<S>) -> String
+    where
+        S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    {
+        use axum::response::IntoResponse as _;
+        let response = stream.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn task_events_returns_404_before_streaming_for_unknown_tasks() {
+        let shared = test_shared();
+        let error = v1_task_events(
+            State(shared.clone()),
+            axum::extract::Path("missing-task".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn task_events_emits_status_result_and_done_for_completed_and_failed_tasks() {
+        for status in ["completed", "failed"] {
+            let shared = test_shared();
+            let task_id = format!("task-events-{status}");
+            shared.store.set_task(&test_task(&task_id, status));
+            if status == "completed" {
+                shared.store.set_meta(
+                    &format!("receipt:{task_id}"),
+                    &serde_json::json!({ "taskId": task_id, "outputHash": "cd".repeat(32) }),
+                );
+            }
+
+            let body = collect_events(task_event_stream(
+                shared.clone(),
+                task_id.clone(),
+                Duration::from_millis(5),
+                Duration::from_millis(500),
+            ))
+            .await;
+
+            assert!(body.contains("event: status"), "{body}");
+            assert!(body.contains("event: result"), "{body}");
+            assert!(body.contains("event: done"), "{body}");
+            assert!(body.contains(&task_id));
+            assert!(body.contains(&format!("\"status\":\"{status}\"")));
+            assert!(!body.contains("secret prompt"));
+            assert!(!body.contains("event: token"));
+            assert!(!body.contains("event: preview"));
+            if status == "completed" {
+                assert!(body.contains("\"receipt\":{"));
+            } else {
+                assert!(body.contains("\"receipt\":null"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_events_times_out_without_token_output() {
+        let shared = test_shared();
+        let task_id = "task-events-timeout";
+        shared.store.set_task(&test_task(task_id, "pending"));
+
+        let body = collect_events(task_event_stream(
+            shared.clone(),
+            task_id.to_string(),
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+        ))
+        .await;
+
+        assert!(body.contains("event: status"));
+        assert!(body.contains("event: timeout"));
+        assert!(body.contains("event: done"));
+        assert!(!body.contains("event: result"));
+        assert!(!body.contains("event: token"));
     }
 }

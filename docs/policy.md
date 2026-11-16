@@ -116,3 +116,30 @@ consensus. It also does not enforce the input byte limit, because
    not reject or re-execute a result because a local output view differs.
 4. **No consensus dependency.** Keep policy config node-local. Changing config
    must not alter block validity, state transitions, or receipt commitments.
+
+## Node integration
+
+The node wiring is implemented at the submission boundary
+(`crates/node/src/policy_gate.rs`):
+
+- `VNN_POLICY_FILE` is loaded once at startup with `Policy::from_json`. An
+  invalid or unreadable file aborts startup; unset or empty uses
+  `Policy::default()`. The policy is immutable for the process lifetime, so
+  changes need a restart.
+- `/v1/infer`, `/tx` (for `submitInference`) and `/v1/infer/batch` call
+  `check_input_kind` after signature/nonce/balance/sampling validation and
+  before mempool admission:
+  - plaintext `input` is checked as `InputKind::Plaintext`;
+  - `encryptedInput` is checked as `InputKind::Encrypted` with an empty
+    payload, so only size, model allowlist and `requirePlaintext` apply;
+  - commitment-only submissions are checked as `InputKind::Opaque`.
+- A policy failure returns HTTP `422` with `reason: "policy"` and a stable
+  `policyReason`; blocked terms are not echoed. Batch responses carry the same
+  fields on the rejected item while accepted siblings stay accepted.
+- If the policy would redact a plaintext input, the node rejects with
+  `redaction_required` ("input requires client-side redaction"). Rewriting the
+  input would invalidate the signed `txId`, so redaction must happen in the
+  client before signing.
+- Policy runs only in the API process. It is not part of consensus execution,
+  block validation, result hashing, receipts, or `/v1/verify`, and it never
+  mutates committed state.

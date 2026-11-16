@@ -132,6 +132,52 @@ curl -fsS localhost:7100/v1/input-key
 
 Full threat model: [`docs/privacy.md`](privacy.md).
 
+## Request policy
+
+`VNN_POLICY_FILE` points at the deterministic plaintext policy described in
+[`docs/policy.md`](policy.md). The node loads it once at startup:
+
+```bash
+# /etc/verinoo/policy.json
+{
+  "maxInputBytes": 8192,
+  "allowedModels": ["intent-classifier-v1", "tiny-gpt-v1"],
+  "blockedTerms": ["confidential-project"],
+  "blockedPatterns": ["(?i)account\\s+number"],
+  "requirePlaintext": false
+}
+```
+
+- A missing or invalid file fails startup. There is no implicit fallback to a
+  permissive policy; fix the file or unset the variable deliberately.
+- Policy changes require a restart. The file is not reloaded on SIGHUP.
+- Only plaintext `input` is inspected. `encryptedInput` and commitment-only
+  submissions are opaque: with `requirePlaintext: false` they pass, with
+  `requirePlaintext: true` they are rejected.
+- Rejections are `422` with `reason: "policy"` and a stable `policyReason`
+  (`blocked_term`, `blocked_pattern`, `model_not_allowed`, `input_too_long`,
+  `encrypted_input`). Blocked terms are never echoed in responses or logs.
+- If redaction would change the input, the node rejects with `422` /
+  `redaction_required` and asks the client to redact before signing. It never
+  mutates a signed transaction.
+- Policy is a submission-boundary control. It does not run in consensus, does
+  not alter block validity, results, receipts, or verification.
+
+## Batch and task event streams
+
+- `POST /v1/infer/batch` accepts 1–32 signed transaction envelopes and applies
+  the same per-item checks as `/v1/infer`. Accepted items are pushed and
+  gossiped; rejected items are reported by index. Empty or oversized batches
+  are `400`; an unauthenticated request is `401`.
+- `GET /v1/tasks/:id/events` is a Server-Sent Events stream with `status`,
+  `result`, `done`, and `timeout` events. It polls about once per second and
+  ends after 60 seconds. A missing task is `404` JSON before streaming.
+- The stream exposes only committed task state and receipts. It does not emit
+  token-level previews; unverified execution previews are not implemented.
+- SSE needs proxy buffering disabled (for example nginx
+  `proxy_buffering off;` on that location) if you put it behind an external
+  proxy.
+
 ## Block time and latency
 
 `VNN_BLOCK_TIME_MS` overrides the chain's default interval and must be identical

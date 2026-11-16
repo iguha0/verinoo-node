@@ -16,6 +16,7 @@ verinoo-network = { path = "../network" }
 verinoo-model = { path = "../model" }
 verinoo-runtime = { path = "../runtime" }
 verinoo-crypto = { path = "../crypto" }
+verinoo-policy = { path = "../policy" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { workspace = true }

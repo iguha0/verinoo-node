@@ -6,6 +6,7 @@
 //! rejection, per-tx canonical + signature checks).
 
 mod auth;
+mod policy_gate;
 mod readiness;
 mod rpc;
 mod wallet;
@@ -51,6 +52,9 @@ pub struct Shared {
     pub block_time_ms: u64,
     /// Allowed lag behind the best observed peer before `/ready` fails.
     pub peer_lag_blocks: u64,
+    /// Node-local plaintext policy applied at the inference submission
+    /// boundary, before a transaction enters the mempool.
+    pub request_policy: verinoo_policy::Policy,
     policy: std::sync::Mutex<Policy>,
 }
 
@@ -499,6 +503,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2);
 
+    // A configured policy must load and validate; falling back to permissive
+    // here would silently disable an operator's blocklist.
+    let request_policy = policy_gate::load_from_env()?;
+    let policy_config = request_policy.config();
+    tracing::info!(
+        "request policy | maxInputBytes={} | allowedModels={} | blockedTerms={} | blockedPatterns={} | requirePlaintext={}",
+        policy_config.max_input_bytes,
+        policy_config.allowed_models.len(),
+        policy_config.blocked_terms.len(),
+        policy_config.blocked_patterns.len(),
+        policy_config.require_plaintext,
+    );
+
     let shared = Arc::new(Shared {
         store,
         params: cfg.genesis.clone(),
@@ -509,6 +526,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         best_peer_height: AtomicU64::new(0),
         block_time_ms,
         peer_lag_blocks,
+        request_policy,
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(

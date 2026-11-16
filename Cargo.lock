@@ -3832,6 +3832,7 @@ dependencies = [
  "verinoo-exec",
  "verinoo-model",
  "verinoo-network",
+ "verinoo-policy",
  "verinoo-runtime",
  "verinoo-state",
  "verinoo-types",

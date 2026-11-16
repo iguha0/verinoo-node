@@ -124,6 +124,7 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `VNN_SELF_SERVE_QUOTA` | `1000` | daily quota for self-serve keys (`0` = unlimited) |
 | `VNN_INPUT_KEY` | *(none)* | network X25519 secret (64 hex); enables encrypted inputs |
 | `VNN_REQUIRE_ENCRYPTED_INPUT` | `false` | reject plaintext inference submissions |
+| `VNN_POLICY_FILE` | *(none)* | node-local request policy JSON; invalid or missing file fails startup |
 | `VNN_BLOCK_TIME_MS` | chain default (10 000) | block interval; identical on every validator |
 | `VNN_PEER_LAG_BLOCKS` | `2` | allowed lag behind the best valid sync peer before `/ready` fails |
 
@@ -151,7 +152,9 @@ keep `/ready` failing. Proof: `./scripts/demo-sync.sh`.
 | `GET /v1/input-key` | network X25519 key for encrypted inputs |
 | `POST /v1/keys` | issue a self-serve key (`{"address":"ai_..."}`); 404 unless `VNN_SELF_SERVE_KEYS=1` |
 | `POST /v1/infer` | submit a signed inference transaction (`Authorization: Bearer <key>` when keys are enabled) |
+| `POST /v1/infer/batch` | submit 1–32 signed transactions with per-item results |
 | `GET /v1/tasks/:id` | task status, output and receipt |
+| `GET /v1/tasks/:id/events` | task status/result Server-Sent Events (SSE) stream |
 | `GET /v1/verify/:id` | recompute the output and compare with the chain |
 | `GET /v1/usage/:addr` | per-address metering (JSON) |
 | `GET /v1/usage/:addr/csv` | metering export for invoicing |
@@ -177,6 +180,59 @@ cargo build --workspace
 verinoo-node infer --key-file key.json --input "my parcel was never delivered"
 curl -s localhost:7100/v1/verify/<taskId> | jq '{verified, output}'
 ```
+
+### Batch submission
+
+`POST /v1/infer/batch` accepts `{"transactions":[<signed TxEnvelope>, ...]}` with
+1–32 items. Each item runs the same auth, signature, nonce/balance, sampling,
+encryption and policy checks as `POST /v1/infer`. Accepted transactions enter
+the mempool and are gossiped independently; the response reports every item in
+input order:
+
+```json
+{
+  "accepted": 1,
+  "rejected": 1,
+  "results": [
+    {"index": 0, "accepted": true, "txId": "...", "taskId": "..."},
+    {"index": 1, "accepted": false, "error": "...", "txId": "..."}
+  ]
+}
+```
+
+Partial success is intentional: a bad item does not roll back its siblings.
+Batching is not a consensus batch and gives no gas discount; each transaction
+keeps its own task id and receipt. An empty or oversized batch is `400`, an
+unauthenticated request is `401`, and per-item failures are reported in
+`results` with the batch still returning `200`.
+
+### Task event stream
+
+`GET /v1/tasks/:id/events` returns `text/event-stream`. The node polls the task
+store about once per second for up to 60 seconds:
+
+- `status` — `{taskId,status,height,resultHash,updatedAt}`, with input and
+  ciphertext redacted.
+- `result` — `{taskId,task,receipt}` after the task is `completed` or `failed`,
+  followed by `done`.
+- `timeout` — after 60 seconds without a terminal state, followed by `done`.
+
+Heartbeat comments keep idle proxies open. The stream carries only the
+consensus-committed result; token-level previews from unverified execution are
+not implemented. A missing task returns `404` JSON before the stream starts.
+
+### Request policy
+
+`VNN_POLICY_FILE` points at a JSON policy (see
+[`docs/policy.md`](docs/policy.md)). It is node-local, applies only to plaintext
+`input` at the submission boundary, and never changes consensus execution or
+committed results. A blocked term or over-limit plaintext returns `422` with
+`reason: "policy"`. Encrypted payloads are opaque: they are allowed unless the
+policy sets `requirePlaintext`, and they are never decrypted or inspected by
+the policy. Because a redacted input cannot be written back into a signed
+transaction, a policy redaction rejects the request with "input requires
+client-side redaction" instead of mutating the signature. An invalid policy
+file fails startup rather than silently falling back to permissive defaults.
 
 The reference model (`intent-classifier-v1`, 8,196 parameters) is trained from
 the committed corpus with `cargo run --release -p verinoo-model --bin train`.
