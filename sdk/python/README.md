@@ -119,6 +119,76 @@ If `required` is `true`, input stays encrypted even when `encrypt=False`.
 A `404` from `/v1/input-key` is treated as "no key advertised" so the SDK also
 works against nodes that predate the encryption endpoint.
 
+## Batch inference
+
+`infer_batch(requests, private_key, ...)` signs one independent inference
+transaction per request and submits them together to `POST /v1/infer/batch`.
+Batches must contain 1 to 32 requests; other sizes raise `ValueError` before
+any network call. The limit is exported as `MAX_BATCH_SIZE`.
+
+```python
+batch = client.infer_batch(
+    [
+        {"input": "first prompt"},
+        {"input": "second prompt", "model": "tiny-gpt-v1", "max_fee": 200},
+    ],
+    private_key=wallet,
+    max_fee=100,
+)
+# {"accepted": ..., "rejected": ..., "results": [...]}
+
+for result in batch["results"]:
+    if result["accepted"]:
+        print(result["index"], result["taskId"])
+    else:
+        print(result["index"], result["error"])
+```
+
+Each request is either an input string or a dict with `input` plus optional
+`model`, `max_fee`/`maxFee`, `encrypt`, `deadline`, `nonce`, and `sampling`
+overrides. Keyword arguments supply defaults. Signing, input encryption, auth,
+and input-key discovery are identical to `infer`. When an item omits `nonce`,
+the SDK signs consecutive nonces starting at `account.nonce + 1` (or the
+explicit `nonce` argument), because batch items execute as separate
+transactions from the same account.
+
+The endpoint returns HTTP 200 when at least one item is accepted. Partial
+failure is reported per item with `accepted: false` and an `error`. Inspect
+each `results` entry; the SDK does not raise for rejected items. Transport,
+auth, and non-2xx failures still raise `VerinooError`.
+
+## Task event streams
+
+`stream_task(task_id, callback=None)` is a generator over
+`GET /v1/tasks/:task_id/events` (`text/event-stream`), yielding
+`(event, data)` tuples as events arrive. The stream carries `status` and the
+final committed `result` followed by `done` (and optionally `timeout`). This
+is final-only streaming: there is no token-level preview, and consensus
+commits the whole result at once.
+
+```python
+def on_event(event, data):
+    print(event, data)
+
+for event, data in client.stream_task(task_id, callback=on_event):
+    if event == "status":
+        print("status", data["status"])
+    elif event == "result":
+        print("result", data["resultOutput"])
+    elif event == "timeout":
+        print("stream timeout", data)
+    elif event == "done":
+        break
+```
+
+`data` is the decoded JSON payload; non-JSON data is returned as a string.
+When `callback` is supplied it receives `(event, data)` before each tuple is
+yielded. The parser accepts CRLF and LF line endings, joins multi-line `data:`
+fields with newlines, ignores comments/heartbeats (`: ...`), and emits a final
+event at EOF even without a trailing blank line. `done` terminates the stream.
+Non-2xx responses raise `VerinooError` with `.status`, `.body`, and
+`.body_text`. Closing the generator early closes the HTTP response.
+
 ## API
 
 ```python
@@ -132,6 +202,8 @@ client = Client(base_url="https://verinoo.com", api_key=None, timeout=30.0)
 | `faucet(address)` | `POST /faucet` |
 | `account(address)` | `GET /account/:address` |
 | `infer(private_key, input, ...)` | `POST /v1/infer` |
+| `infer_batch(requests, private_key, ...)` | `POST /v1/infer/batch` |
+| `stream_task(id, callback=None)` | `GET /v1/tasks/:id/events` (SSE) |
 | `task(id)` / `wait_for_task(id)` | `GET /v1/tasks/:id`, polling until executed |
 | `verify(id)` | `GET /v1/verify/:id` |
 | `usage(address, api_key=None)` | `GET /v1/usage/:address` |
@@ -150,5 +222,6 @@ python3 -m pytest
 The suite covers canonical JSON against the repo conformance fixture, a fixed
 transaction vector shared with the TypeScript SDK, Ed25519 signing
 verification, wallet key-file loading, encryption shape/commitment, a full
-X25519 + HKDF + ChaCha20-Poly1305 round-trip, and plaintext/encrypted `infer`
-selection.
+X25519 + HKDF + ChaCha20-Poly1305 round-trip, plaintext/encrypted `infer`
+selection, and offline local-server tests for `infer_batch` and `stream_task`
+SSE parsing, heartbeats, CRLF/LF frames, and EOF handling.

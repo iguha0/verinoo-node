@@ -111,6 +111,78 @@ If `required` is `true`, input stays encrypted even when `encrypt: false`.
 A `404` from `/v1/input-key` is treated as "no key advertised" so the SDK also
 works against nodes that predate the encryption endpoint.
 
+## Batch inference
+
+`inferBatch(requests, options)` signs one independent inference transaction per
+request and submits them together to `POST /v1/infer/batch`. Batches must
+contain 1 to 32 requests; other sizes are rejected with a `TypeError` before
+any network call. The concurrency limit is exported as `MAX_BATCH_SIZE`.
+
+```js
+const batch = await client.inferBatch(
+  [
+    { input: 'first prompt' },
+    { input: 'second prompt', model: 'tiny-gpt-v1', maxFee: 200 },
+  ],
+  { privateKey: wallet, maxFee: 100 },
+);
+// { accepted, rejected, results: [...] }
+
+for (const result of batch.results) {
+  if (result.accepted) console.log(result.index, result.taskId);
+  else console.log(result.index, result.error);
+}
+```
+
+Each `requests` entry is either an input string or an object with `input` plus
+optional `model`, `maxFee`, `encrypt`, `deadline`, `nonce`, and `sampling`
+overrides. The options object supplies defaults. Signing, input encryption,
+auth, and input-key discovery are identical to `infer`. When an item omits
+`nonce`, the SDK signs consecutive nonces starting at `account.nonce + 1` (or
+the explicit `nonce` option), because batch items execute as separate
+transactions from the same account.
+
+The endpoint returns HTTP 200 when at least one item is accepted. Partial
+failure is reported per item: `{"index":1,"accepted":false,"error":"...",
+"txId":"..."}`. Inspect each `results` entry; the SDK does not throw for
+rejected items. Transport, auth, and non-2xx failures still throw
+`VerinooError`.
+
+## Task event streams
+
+`streamTask(taskId, handlers, options)` consumes
+`GET /v1/tasks/:task_id/events` (`text/event-stream`) and invokes handlers as
+events arrive. The stream carries `status` and the final committed `result`
+followed by `done` (and optionally `timeout`). This is final-only streaming:
+there is no token-level preview, and consensus commits the whole result at
+once.
+
+```js
+const controller = new AbortController();
+const outcome = await client.streamTask(
+  taskId,
+  {
+    signal: controller.signal,
+    onStatus: (data) => console.log('status', data.status),
+    onResult: (data) => console.log('result', data.resultOutput),
+    onDone: (data) => console.log('done', data),
+    onTimeout: (data) => console.log('stream timeout', data),
+    onEvent: (event, data, id) => console.log('event', event),
+  },
+  { apiKey: 'tenant-key' }, // optional; defaults to the client key
+);
+// { taskId, events: [{event, data, id?}], done, timedOut }
+```
+
+`onStatus`, `onResult`, `onDone`, and `onTimeout` receive the decoded JSON
+payload. `onEvent(event, data, id)` fires first for every event. The parser
+accepts CRLF and LF line endings, joins multi-line `data:` fields with
+newlines, and ignores comments/heartbeats (`: ...`). `done` terminates the
+stream and resolves the returned promise. Pass an `AbortSignal` as `signal` to
+cancel; the promise rejects with the abort error (`AbortError`). Non-2xx
+responses throw `VerinooError` with `.status`, `.body`, and `.bodyText`. SSE
+data is decoded as JSON; non-JSON data is returned as a string.
+
 ## API
 
 ```js
@@ -124,6 +196,8 @@ const client = new Client({ baseUrl, apiKey, timeoutMs, fetch });
 | `faucet(address)` | `POST /faucet` |
 | `account(address)` | `GET /account/:address` |
 | `infer(options)` | `POST /v1/infer` |
+| `inferBatch(requests, options)` | `POST /v1/infer/batch` |
+| `streamTask(id, handlers, options)` | `GET /v1/tasks/:id/events` (SSE) |
 | `task(id)` | `GET /v1/tasks/:id` |
 | `verify(id)` | `GET /v1/verify/:id` |
 | `usage(address, apiKey?)` | `GET /v1/usage/:address` |
@@ -142,4 +216,6 @@ node --test
 The suite covers canonical JSON against the repo conformance fixture, a fixed
 transaction vector shared with the Python SDK, Ed25519 signing verification,
 wallet key-file loading, encryption shape/commitment, a full X25519 +
-HKDF + ChaCha20-Poly1305 round-trip, and plaintext/encrypted `infer` selection.
+HKDF + ChaCha20-Poly1305 round-trip, plaintext/encrypted `infer` selection,
+and offline local-server tests for `inferBatch` and `streamTask` SSE parsing,
+heartbeats, CRLF/LF frames, and abort handling.

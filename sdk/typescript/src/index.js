@@ -16,6 +16,7 @@ export const DEFAULT_BASE_URL = 'https://verinoo.com';
 export const DEFAULT_MODEL = 'intent-classifier-v1';
 export const DEFAULT_MAX_FEE = 100;
 export const INPUT_KEY_INFO = 'verinoo-input-v1';
+export const MAX_BATCH_SIZE = 32;
 
 const ED25519_PKCS8_PREFIX = Buffer.from(
   '302e020100300506032b657004220420',
@@ -352,6 +353,86 @@ export function buildInferenceData({
   return { type: 'submitInference', data: inner };
 }
 
+function createSseLineReader(onLine) {
+  let buffer = '';
+  return {
+    push(chunk, final = false) {
+      buffer += chunk;
+      let start = 0;
+      let index = 0;
+      while (index < buffer.length) {
+        const char = buffer[index];
+        if (char === '\n') {
+          onLine(buffer.slice(start, index));
+          index += 1;
+          start = index;
+        } else if (char === '\r') {
+          if (index + 1 === buffer.length && !final) break;
+          onLine(buffer.slice(start, index));
+          index += buffer[index + 1] === '\n' ? 2 : 1;
+          start = index;
+        } else {
+          index += 1;
+        }
+      }
+      buffer = buffer.slice(start);
+      if (final && buffer.length > 0) {
+        onLine(buffer);
+        buffer = '';
+      }
+    },
+  };
+}
+
+function createSseEventParser(onEvent) {
+  let eventName = '';
+  let eventId;
+  let dataLines = [];
+
+  const dispatch = () => {
+    if (dataLines.length === 0) {
+      eventName = '';
+      eventId = undefined;
+      return;
+    }
+    const raw = dataLines.join('\n');
+    let data = raw;
+    if (raw.length > 0) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        data = raw;
+      }
+    }
+    const entry = { event: eventName || 'message', data };
+    if (eventId !== undefined) entry.id = eventId;
+    eventName = '';
+    eventId = undefined;
+    dataLines = [];
+    onEvent(entry);
+  };
+
+  return {
+    line(line) {
+      if (line === '') {
+        dispatch();
+        return;
+      }
+      if (line.startsWith(':')) return;
+      const colon = line.indexOf(':');
+      const field = colon === -1 ? line : line.slice(0, colon);
+      let value = colon === -1 ? '' : line.slice(colon + 1);
+      if (value.startsWith(' ')) value = value.slice(1);
+      if (field === 'event') eventName = value;
+      else if (field === 'data') dataLines.push(value);
+      else if (field === 'id') eventId = value;
+    },
+    end() {
+      dispatch();
+    },
+  };
+}
+
 export class Client {
   constructor(options = {}) {
     if (typeof options === 'string') options = { baseUrl: options };
@@ -487,7 +568,62 @@ export class Client {
     );
   }
 
-    async infer({
+  async _inputKeyOrNull() {
+    try {
+      return await this.inputKey();
+    } catch (error) {
+      if (!(error instanceof VerinooError) || error.status !== 404) {
+        throw error;
+      }
+      return null;
+    }
+  }
+
+  _buildInferenceEnvelope({
+    wallet,
+    keyInfo,
+    input,
+    model = DEFAULT_MODEL,
+    maxFee = DEFAULT_MAX_FEE,
+    deadline,
+    encrypt = true,
+    sampling = null,
+    nonce,
+  }) {
+    if (typeof input !== 'string') {
+      throw new TypeError('input must be a string');
+    }
+
+    const networkPublicKey = keyInfo?.publicKey;
+    let encrypted = null;
+    let commitment = inputCommitment(input);
+    if (networkPublicKey && (encrypt || keyInfo.required)) {
+      const result = encryptInput(input, networkPublicKey);
+      encrypted = result.encryptedInput;
+      commitment = result.inputCommitment;
+    }
+
+    const data = buildInferenceData({
+      from: wallet.address,
+      input,
+      model,
+      maxFee,
+      deadline,
+      encryptedInput: encrypted,
+      commitment,
+      sampling,
+    });
+    return buildSignedTx({
+      signingKey: wallet.signingKey,
+      from: wallet.address,
+      to: '',
+      value: 0,
+      nonce,
+      data,
+    });
+  }
+
+  async infer({
     privateKey,
     input,
     model = DEFAULT_MODEL,
@@ -506,46 +642,174 @@ export class Client {
     const txNonce = nonce ?? Number(account.nonce ?? 0) + 1;
     const txDeadline =
       deadline ?? Math.floor(Date.now() / 1000) + 3_600;
+    const keyInfo = await this._inputKeyOrNull();
 
-    let keyInfo = null;
-    try {
-      keyInfo = await this.inputKey();
-    } catch (error) {
-      if (!(error instanceof VerinooError) || error.status !== 404) {
-        throw error;
-      }
-    }
-
-    const networkPublicKey = keyInfo?.publicKey;
-    let encrypted = null;
-    let commitment = inputCommitment(input);
-    if (networkPublicKey) {
-      if (encrypt || keyInfo.required) {
-        const result = encryptInput(input, networkPublicKey);
-        encrypted = result.encryptedInput;
-        commitment = result.inputCommitment;
-      }
-    }
-
-    const data = buildInferenceData({
-      from: wallet.address,
+    const envelope = this._buildInferenceEnvelope({
+      wallet,
+      keyInfo,
       input,
       model,
       maxFee,
       deadline: txDeadline,
-      encryptedInput: encrypted,
-      commitment,
+      encrypt,
       sampling,
-    });
-    const envelope = buildSignedTx({
-      signingKey: wallet.signingKey,
-      from: wallet.address,
-      to: '',
-      value: 0,
       nonce: txNonce,
-      data,
     });
     return this._request('POST', '/v1/infer', { body: envelope, apiKey });
+  }
+
+  async inferBatch(
+    requests,
+    {
+      privateKey,
+      model = DEFAULT_MODEL,
+      maxFee = DEFAULT_MAX_FEE,
+      apiKey,
+      encrypt = true,
+      deadline,
+      nonce,
+      sampling = null,
+    } = {},
+  ) {
+    if (!Array.isArray(requests)) {
+      throw new TypeError('requests must be an array of inference requests');
+    }
+    if (requests.length < 1 || requests.length > MAX_BATCH_SIZE) {
+      throw new TypeError(
+        `batch must contain between 1 and ${MAX_BATCH_SIZE} requests`,
+      );
+    }
+
+    const wallet = loadWallet(privateKey);
+    const account = (await this.account(wallet.address)) ?? {};
+    const baseNonce = nonce ?? Number(account.nonce ?? 0) + 1;
+    const defaultDeadline =
+      deadline ?? Math.floor(Date.now() / 1000) + 3_600;
+    const keyInfo = await this._inputKeyOrNull();
+
+    const transactions = requests.map((request, index) => {
+      const item =
+        typeof request === 'string' ? { input: request } : request;
+      if (!item || typeof item !== 'object' || typeof item.input !== 'string') {
+        throw new TypeError(
+          `batch request ${index} must be a string or an object with a string input`,
+        );
+      }
+      return this._buildInferenceEnvelope({
+        wallet,
+        keyInfo,
+        input: item.input,
+        model: item.model ?? model,
+        maxFee: item.maxFee ?? maxFee,
+        deadline: item.deadline ?? defaultDeadline,
+        encrypt: item.encrypt ?? encrypt,
+        sampling: item.sampling === undefined ? sampling : item.sampling,
+        nonce: item.nonce ?? baseNonce + index,
+      });
+    });
+
+    return this._request('POST', '/v1/infer/batch', {
+      body: { transactions },
+      apiKey,
+    });
+  }
+
+  async streamTask(taskId, handlers = {}, { apiKey } = {}) {
+    const { onEvent, onStatus, onResult, onDone, onTimeout, signal } =
+      handlers;
+    const url = `${this.baseUrl}/v1/tasks/${encodeURIComponent(taskId)}/events`;
+    const headers = { accept: 'text/event-stream' };
+    const key = apiKey ?? this.apiKey;
+    if (key) headers.authorization = `Bearer ${key}`;
+    const init = { method: 'GET', headers };
+    if (signal) init.signal = signal;
+
+    let response;
+    try {
+      response = await this.fetchImpl(url, init);
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      throw new VerinooError(`request failed: ${error.message}`, {
+        cause: error,
+      });
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      let parsed = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = null;
+      }
+      throw new VerinooError(`HTTP ${response.status}: ${text}`, {
+        status: response.status,
+        body: parsed,
+        bodyText: text,
+      });
+    }
+    if (!response.body) {
+      throw new VerinooError('stream response has no body');
+    }
+
+    const events = [];
+    let done = false;
+    let timedOut = false;
+
+    const handleEvent = (entry) => {
+      if (done) return;
+      events.push(entry);
+      if (typeof onEvent === 'function') {
+        onEvent(entry.event, entry.data, entry.id);
+      }
+      if (entry.event === 'status' && typeof onStatus === 'function') {
+        onStatus(entry.data);
+      } else if (entry.event === 'result' && typeof onResult === 'function') {
+        onResult(entry.data);
+      } else if (entry.event === 'done' && typeof onDone === 'function') {
+        onDone(entry.data);
+      } else if (entry.event === 'timeout' && typeof onTimeout === 'function') {
+        onTimeout(entry.data);
+      }
+      if (entry.event === 'done') done = true;
+      if (entry.event === 'timeout') timedOut = true;
+    };
+
+    const parser = createSseEventParser(handleEvent);
+    const lines = createSseLineReader((line) => parser.line(line));
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (!done) {
+        const { value, done: ended } = await reader.read();
+        if (ended) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text) {
+          lines.push(text);
+          if (done) break;
+        }
+      }
+      if (!done) {
+        const tail = decoder.decode();
+        if (tail) lines.push(tail);
+        lines.push('', true);
+        parser.end();
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // The stream is already closed or was aborted.
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore release errors after an aborted stream.
+      }
+    }
+
+    return { taskId, events, done, timedOut };
   }
 }
 

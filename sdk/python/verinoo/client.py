@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -42,6 +42,7 @@ DEFAULT_BASE_URL = "https://verinoo.com"
 DEFAULT_MODEL = "intent-classifier-v1"
 DEFAULT_MAX_FEE = 100
 INPUT_KEY_INFO = b"verinoo-input-v1"
+MAX_BATCH_SIZE = 32
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]*$")
 _SEED_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -129,6 +130,16 @@ def address_from_public_key(public_key_hex: str) -> str:
 
 def input_commitment(plaintext: str) -> str:
     return sha256_hex(plaintext)
+
+
+def _parse_sse_data(lines: list[str]) -> Any:
+    raw = "\n".join(lines)
+    if not raw:
+        return raw
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
 
 
 class Wallet:
@@ -525,6 +536,57 @@ class Client:
 
     usageCsv = usage_csv
 
+    def _input_key_or_none(self) -> Optional[dict[str, Any]]:
+        try:
+            return self.input_key()
+        except VerinooError as exc:
+            if exc.status != 404:
+                raise
+            return None
+
+    def _build_inference_envelope(
+        self,
+        wallet: Wallet,
+        key_info: Optional[dict[str, Any]],
+        *,
+        input_text: str,
+        model: str,
+        max_fee: int,
+        deadline: int,
+        encrypt: bool,
+        sampling: Optional[dict[str, Any]],
+        nonce: int,
+    ) -> dict[str, Any]:
+        if not isinstance(input_text, str):
+            raise TypeError("input must be a string")
+
+        network_public_key = (key_info or {}).get("publicKey")
+        encrypted_input = None
+        commitment = input_commitment(input_text)
+        if network_public_key and (
+            encrypt or (key_info or {}).get("required")
+        ):
+            encrypted = encrypt_input(input_text, network_public_key)
+            encrypted_input = encrypted["encryptedInput"]
+            commitment = encrypted["inputCommitment"]
+
+        data = build_inference_data(
+            from_address=wallet.address,
+            input_text=input_text,
+            model=model,
+            max_fee=max_fee,
+            deadline=deadline,
+            encrypted_input=encrypted_input,
+            commitment=commitment,
+            sampling=sampling,
+        )
+        return build_signed_tx(
+            signing_key=wallet.signing_key,
+            from_address=wallet.address,
+            data=data,
+            nonce=nonce,
+        )
+
     def infer(
         self,
         private_key: Any,
@@ -557,40 +619,194 @@ class Client:
         tx_deadline = (
             deadline if deadline is not None else int(time.time()) + 3600
         )
+        key_info = self._input_key_or_none()
 
-        key_info: Optional[dict[str, Any]] = None
-        try:
-            key_info = self.input_key()
-        except VerinooError as exc:
-            if exc.status != 404:
-                raise
-
-        network_public_key = (key_info or {}).get("publicKey")
-        encrypted_input = None
-        commitment = input_commitment(input)
-        if network_public_key and (
-            encrypt or (key_info or {}).get("required")
-        ):
-            encrypted = encrypt_input(input, network_public_key)
-            encrypted_input = encrypted["encryptedInput"]
-            commitment = encrypted["inputCommitment"]
-
-        data = build_inference_data(
-            from_address=wallet.address,
+        envelope = self._build_inference_envelope(
+            wallet,
+            key_info,
             input_text=input,
             model=model,
             max_fee=max_fee,
             deadline=tx_deadline,
-            encrypted_input=encrypted_input,
-            commitment=commitment,
+            encrypt=encrypt,
             sampling=sampling,
-        )
-        envelope = build_signed_tx(
-            signing_key=wallet.signing_key,
-            from_address=wallet.address,
-            data=data,
             nonce=tx_nonce,
         )
         return self._request(
             "POST", "/v1/infer", body=envelope, api_key=api_key
         )
+
+    def infer_batch(
+        self,
+        requests: Any,
+        private_key: Any = None,
+        model: str = DEFAULT_MODEL,
+        max_fee: int = DEFAULT_MAX_FEE,
+        api_key: Optional[str] = None,
+        encrypt: bool = True,
+        deadline: Optional[int] = None,
+        nonce: Optional[int] = None,
+        sampling: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """Sign and submit 1..32 inference transactions in one request.
+
+        Each request is either an input string or a dict with ``input`` plus
+        optional ``model``, ``max_fee``/``maxFee``, ``encrypt``, ``deadline``,
+        ``nonce``, and ``sampling`` overrides. Transactions without an
+        explicit nonce use consecutive nonces starting at the account nonce.
+        """
+        if isinstance(requests, (str, bytes, dict)) or not isinstance(
+            requests, (list, tuple)
+        ):
+            raise TypeError(
+                "requests must be a list of 1 to 32 inference requests"
+            )
+        items = list(requests)
+        if not 1 <= len(items) <= MAX_BATCH_SIZE:
+            raise ValueError(
+                f"batch must contain between 1 and {MAX_BATCH_SIZE} requests"
+            )
+        if private_key is None:
+            raise TypeError("private_key is required for infer_batch")
+
+        wallet = load_wallet(private_key)
+        account = self.account(wallet.address) or {}
+        base_nonce = (
+            nonce
+            if nonce is not None
+            else int(account.get("nonce", 0) or 0) + 1
+        )
+        default_deadline = (
+            deadline if deadline is not None else int(time.time()) + 3600
+        )
+        key_info = self._input_key_or_none()
+
+        transactions = []
+        for index, request in enumerate(items):
+            item = request if isinstance(request, dict) else {"input": request}
+            input_text = item.get("input")
+            if not isinstance(input_text, str):
+                raise TypeError(
+                    f"batch request {index} must be a string or a dict "
+                    "with a string input"
+                )
+            item_model = item.get("model", model)
+            item_max_fee = item.get("max_fee", item.get("maxFee", max_fee))
+            item_encrypt = item.get("encrypt", encrypt)
+            item_sampling = (
+                item["sampling"] if "sampling" in item else sampling
+            )
+            item_nonce = item.get("nonce", base_nonce + index)
+            transactions.append(
+                self._build_inference_envelope(
+                    wallet,
+                    key_info,
+                    input_text=input_text,
+                    model=item_model,
+                    max_fee=item_max_fee,
+                    deadline=item.get("deadline", default_deadline),
+                    encrypt=item_encrypt,
+                    sampling=item_sampling,
+                    nonce=item_nonce,
+                )
+            )
+
+        return self._request(
+            "POST",
+            "/v1/infer/batch",
+            body={"transactions": transactions},
+            api_key=api_key,
+        )
+
+    inferBatch = infer_batch
+
+    def stream_task(
+        self,
+        task_id: str,
+        callback: Optional[Callable[[str, Any], None]] = None,
+    ) -> Iterator[tuple[str, Any]]:
+        """Yield ``(event, data)`` tuples from a task's SSE stream.
+
+        Events are ``status``, ``result``, ``done``, and optionally
+        ``timeout``; ``data`` is the decoded JSON payload. Comments and
+        heartbeat lines are ignored, multi-line ``data:`` fields are joined
+        with newlines, and a final event is emitted at EOF if the server does
+        not send a trailing blank line. When ``callback`` is supplied it is
+        called with ``(event, data)`` before each tuple is yielded.
+        """
+        url = (
+            f"{self.base_url}/v1/tasks/{urllib.parse.quote(task_id)}/events"
+        )
+        headers = {"Accept": "text/event-stream"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            response = urllib.request.urlopen(
+                request, timeout=self.timeout
+            )
+        except urllib.error.HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            parsed = None
+            try:
+                parsed = json.loads(text) if text else None
+            except json.JSONDecodeError:
+                parsed = None
+            raise VerinooError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                body=parsed,
+                body_text=text,
+                cause=exc,
+            ) from None
+        except OSError as exc:
+            raise VerinooError(
+                f"request failed: {exc}", cause=exc
+            ) from None
+
+        def emit(name: str, data: Any) -> tuple[str, Any]:
+            if callback is not None:
+                callback(name, data)
+            return name, data
+
+        with response:
+            event_name = ""
+            data_lines: list[str] = []
+            while True:
+                try:
+                    raw_line = response.readline()
+                except OSError as exc:
+                    raise VerinooError(
+                        f"request failed: {exc}", cause=exc
+                    ) from None
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace")
+                if line.endswith("\n"):
+                    line = line[:-1]
+                if line.endswith("\r"):
+                    line = line[:-1]
+                if line == "":
+                    if data_lines:
+                        yield emit(
+                            event_name or "message",
+                            _parse_sse_data(data_lines),
+                        )
+                    event_name = ""
+                    data_lines = []
+                    continue
+                if line.startswith(":"):
+                    continue
+                field, separator, value = line.partition(":")
+                if separator and value.startswith(" "):
+                    value = value[1:]
+                if field == "event":
+                    event_name = value
+                elif field == "data":
+                    data_lines.append(value)
+            if data_lines:
+                yield emit(
+                    event_name or "message", _parse_sse_data(data_lines)
+                )
+
+    streamTask = stream_task
