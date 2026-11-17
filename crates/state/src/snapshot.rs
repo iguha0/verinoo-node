@@ -249,6 +249,39 @@ fn invalid_path(path: &str, reason: &'static str) -> SnapshotError {
     }
 }
 
+/// Read and structurally validate `manifest.json` without checking files or
+/// signatures.
+///
+/// Node-level verifiers use this to obtain the signed bytes before opening the
+/// checkpoint, then pass the same manifest to [`verify_snapshot`] and compare
+/// the returned value for equality.
+pub fn read_snapshot_manifest(snapshot_dir: &Path) -> Result<SnapshotManifest, SnapshotError> {
+    Ok(read_manifest(snapshot_dir)?.0)
+}
+
+/// Atomically rewrite `manifest.json` with canonical JSON.
+///
+/// Intended for node-level signing after [`create_snapshot`]. The file is
+/// written to `manifest.json.tmp` (must not exist), fsynced, and renamed over
+/// the manifest. A manifest created by this call is still not trusted until a
+/// verifier checks its signatures and recomputes the state root.
+pub fn write_snapshot_manifest(
+    snapshot_dir: &Path,
+    manifest: &SnapshotManifest,
+) -> Result<(), SnapshotError> {
+    write_manifest(snapshot_dir, manifest)
+}
+
+/// Validate a manifest-relative snapshot path.
+///
+/// The path must be relative, slash-separated, start with `state/` followed by
+/// a file component, and must not contain `..` or absolute components. HTTP
+/// file handlers use the same rule as manifest verification so a served path
+/// can never escape the snapshot directory.
+pub fn validate_snapshot_path(path: &str) -> Result<(), SnapshotError> {
+    validate_manifest_path(path)
+}
+
 /// Create a RocksDB checkpoint plus `manifest.json` in `snapshot_dir`.
 ///
 /// The destination must be absent or an empty directory; a non-empty
@@ -1374,6 +1407,20 @@ mod tests {
         let mut other_signature = signed.clone();
         other_signature.signatures[0].signature = "ff".into();
         assert_eq!(manifest_signing_bytes(&other_signature).unwrap(), bytes);
+    }
+
+    #[test]
+    fn read_only_checkpoint_open_does_not_mutate_the_snapshot() {
+        let (_root, _meta, snapshot_dir) = fixture("read-only");
+        let state_dir = snapshot_dir.join(STATE_DIR);
+        let before = collect_state_files(&state_dir).unwrap();
+        {
+            let store = StateStore::open_read_only(&state_dir).unwrap();
+            assert_eq!(store.get_account("ai_alice").unwrap().balance, 500);
+            assert_eq!(store.meta_u64_or("baseFee", 0), 3);
+        }
+        let after = collect_state_files(&state_dir).unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]

@@ -37,6 +37,29 @@ impl StateStore {
         Ok(Self { db })
     }
 
+    /// Open an existing database without creating or modifying it.
+    ///
+    /// RocksDB's read-only API does not take the write lock and does not
+    /// replay writes. Use this to recompute a snapshot state root without
+    /// mutating the checkpoint. The caller must still treat the directory as
+    /// immutable for the duration of the check.
+    pub fn open_read_only(path: &Path) -> Result<Self, rocksdb::Error> {
+        let opts = rocksdb::Options::default();
+        let db = DBWithThreadMode::<SingleThreaded>::open_for_read_only(&opts, path, false)?;
+        Ok(Self { db })
+    }
+
+    /// Open an existing database read-write without creating it.
+    ///
+    /// This is a lock probe: it fails when another process already has the
+    /// database open. Drop the handle immediately; it is not for serving.
+    pub fn open_existing(path: &Path) -> Result<Self, rocksdb::Error> {
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(false);
+        let db = DBWithThreadMode::<SingleThreaded>::open(&opts, path)?;
+        Ok(Self { db })
+    }
+
     pub fn open_temp() -> Result<Self, rocksdb::Error> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);

@@ -64,6 +64,80 @@ curl -fsS localhost:7100/ready
 Also back up `/etc/verinoo` and `/opt/verinoo/models`; without the same model set
 the state root diverges and the node refuses peer blocks.
 
+## State snapshots (create, serve, verify, apply)
+
+Snapshots are RocksDB checkpoints with a signed file manifest. They speed up a
+fresh or very late node; they are not automatic failover. Signatures are
+operator-attested Ed25519 signatures, not BFT certificates, and applying a
+snapshot does not start the node or set up catch-up for you. Full format and
+trust details: `docs/snapshots.md`.
+
+Create on a stopped node (or a copy) with the same model directory as the
+network:
+
+```bash
+systemctl stop verinoo-node
+VNN_MODEL_DIR=/opt/verinoo/models \
+  verinoo-node snapshot create \
+    --db /var/lib/verinoo/data \
+    --out /var/lib/verinoo/snapshots/snapshot-$(date -u +%Y%m%dT%H%M%SZ) \
+    --key-seed "$SNAPSHOT_SIGNER_SEED"
+systemctl start verinoo-node
+```
+
+`create` opens the database read-write, so it fails if the node is still
+running. Keep the signer seed in the host secret manager; it is separate from
+`VNN_KEY_SEED` unless you deliberately reuse it. `create` prints the signer
+public key and the key is stored in `manifest.json.signatures`; publish it out
+of band to verifiers.
+
+Serve a snapshot directory from any node by setting:
+
+```ini
+VNN_SNAPSHOT_DIR=/var/lib/verinoo/snapshots/current
+VNN_SNAPSHOT_SIGNERS=<signer-pubkey-hex>[,<signer-pubkey-hex>...]
+```
+
+`GET /snapshot/manifest` and `GET /snapshot/files/state/...` are public reads.
+The file endpoint supports a single HTTP `Range` for resumable downloads.
+Paths are restricted to `state/` and symlinks/traversal are rejected by the
+node. If `/snapshot/` is exposed publicly, rate-limit or egress-cap it at the
+proxy; snapshots can be large.
+
+Verify and apply on the target host:
+
+```bash
+systemctl stop verinoo-node
+verinoo-node snapshot verify \
+  --snapshot /var/lib/verinoo/incoming/snapshot-<height> \
+  --signer "$SNAPSHOT_SIGNER_PUBKEY" \
+  --threshold 1 \
+  --chain-id verinoo-test-1
+
+verinoo-node snapshot apply \
+  --snapshot /var/lib/verinoo/incoming/snapshot-<height> \
+  --db /var/lib/verinoo/data \
+  --backup /var/lib/verinoo/data.pre-snapshot-$(date -u +%Y%m%dT%H%M%SZ) \
+  --signer "$SNAPSHOT_SIGNER_PUBKEY"
+systemctl start verinoo-node
+curl -fsS localhost:7100/health
+curl -fsS localhost:7100/ready
+```
+
+`verify` checks signatures/threshold, manifest and file hashes, recomputes the
+state root from the checkpoint read-only, recomputes the validator-set hash,
+checks the checkpoint head, and compares the local model set. `apply` repeats
+verification, probes the target RocksDB lock (so a running node fails apply),
+moves the old database to `--backup`, and never deletes it. Set `VNN_MODEL_DIR`
+when verifying a snapshot that contains installed models; with it unset only
+builtin models are compared and the check fails closed.
+
+Do not apply a snapshot at or below the local head, or one at the same height
+with a different hash. The CLI verifies the snapshot in isolation and does not
+compare it to the old target head. Applying a snapshot is not promotion and
+does not fence a validator; follow the manual stop/fence/start procedure in
+the HA recipe below.
+
 ## API key rotation (no downtime)
 
 Keys are address-bound, stored as SHA-256 hashes, and reloaded with SIGHUP.
@@ -366,6 +440,7 @@ address is removed from the set.
 - Run as the unprivileged `verinoo` user; the unit already sets
   `NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome` and `PrivateTmp`.
 - `/etc/verinoo/node.env` is `0600`; never commit it.
-- Nginx rate-limits `/v1/` and `/faucet`.
+- Nginx rate-limits `/v1/` and `/faucet`. Snapshot reads under `/snapshot/`
+  are public chain state; rate-limit or egress-cap them at the proxy.
 - The public demo intentionally has no API key; enable `VNN_API_KEYS_FILE` for
   a paid or private deployment.

@@ -4,19 +4,24 @@
 //! state directly. Block/tx payloads are canonical JSON.
 
 use axum::{
-    extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, Path as AxumPath, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
 use futures::stream::{self, Stream};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
+use std::io::{self, SeekFrom};
 use std::net::SocketAddr;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::auth::{Auth, AuthError, Caller, SelfServeError};
 use crate::policy_gate;
@@ -56,6 +61,8 @@ fn app(shared: Arc<Shared>, net: verinoo_network::NetworkNode, auth: Auth) -> Ro
         .route("/validators", get(validators))
         .route("/faucet", post(faucet))
         .route("/metrics", get(metrics))
+        .route("/snapshot/manifest", get(snapshot_manifest))
+        .route("/snapshot/files/*path", get(snapshot_file))
         .route("/tx", post(submit_tx))
         // ---- v1 product surface ----
         .route("/v1/models", get(v1_models))
@@ -1363,6 +1370,244 @@ async fn v1_usage_csv(
     Ok(([(axum::http::header::CONTENT_TYPE, "text/csv")], body))
 }
 
+const SNAPSHOT_READ_CHUNK: usize = 64 * 1024;
+
+/// Public snapshot reads: the manifest is the signed JSON document produced by
+/// `verinoo-node snapshot create`. No API key is required; snapshots are public
+/// chain state. Paths are validated by the state layer and every component is
+/// rejected if it is a symlink.
+async fn snapshot_manifest(State(shared): State<Arc<Shared>>) -> Response {
+    let Some(dir) = &shared.snapshot_dir else {
+        return snapshot_not_found("snapshot serving is not configured");
+    };
+    let path = dir.join("manifest.json");
+    let meta = match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) => meta,
+        Err(_) => return snapshot_not_found("snapshot manifest not found"),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return snapshot_not_found("snapshot manifest not found");
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return snapshot_not_found("snapshot manifest not found"),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => {
+            let mut response = Json(value).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(_) => snapshot_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot manifest is not valid JSON",
+        ),
+    }
+}
+
+async fn snapshot_file(
+    State(shared): State<Arc<Shared>>,
+    AxumPath(relative): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(dir) = &shared.snapshot_dir else {
+        return snapshot_not_found("snapshot serving is not configured");
+    };
+    let path = match resolve_snapshot_file(dir, &relative).await {
+        Ok(path) => path,
+        Err(SnapshotPathError::Invalid) => {
+            return snapshot_error(StatusCode::BAD_REQUEST, "invalid snapshot path")
+        }
+        Err(SnapshotPathError::Forbidden) => {
+            return snapshot_error(StatusCode::FORBIDDEN, "snapshot path is a symlink")
+        }
+        Err(SnapshotPathError::NotFound) => return snapshot_not_found("snapshot file not found"),
+    };
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(_) => return snapshot_not_found("snapshot file not found"),
+    };
+    let len = match file.metadata().await {
+        Ok(meta) if meta.is_file() => meta.len(),
+        _ => return snapshot_not_found("snapshot file not found"),
+    };
+
+    let requested = match headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => match parse_snapshot_range(value, len) {
+            Ok(range) => Some(range),
+            Err(()) => return snapshot_range_not_satisfiable(len),
+        },
+        None => None,
+    };
+
+    let (status, start, end) = match requested {
+        Some((start, end)) => (StatusCode::PARTIAL_CONTENT, start, end),
+        None => (StatusCode::OK, 0, len.saturating_sub(1)),
+    };
+    let response_len = if len == 0 { 0 } else { end - start + 1 };
+    if start > 0 && file.seek(SeekFrom::Start(start)).await.is_err() {
+        return snapshot_not_found("snapshot file not found");
+    }
+
+    let mut response = Response::new(snapshot_body(file, response_len));
+    *response.status_mut() = status;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&response_len.to_string()).expect("length is a valid header"),
+    );
+    if status == StatusCode::PARTIAL_CONTENT {
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{len}"))
+                .expect("range is a valid header"),
+        );
+    }
+    response
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotPathError {
+    Invalid,
+    Forbidden,
+    NotFound,
+}
+
+async fn resolve_snapshot_file(
+    root: &FsPath,
+    relative: &str,
+) -> Result<PathBuf, SnapshotPathError> {
+    if verinoo_state::snapshot::validate_snapshot_path(relative).is_err() {
+        return Err(SnapshotPathError::Invalid);
+    }
+    let root_meta = tokio::fs::symlink_metadata(root)
+        .await
+        .map_err(|_| SnapshotPathError::NotFound)?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(SnapshotPathError::NotFound);
+    }
+
+    let components: Vec<_> = FsPath::new(relative).components().collect();
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(SnapshotPathError::Invalid);
+        };
+        current.push(name);
+        let meta = tokio::fs::symlink_metadata(&current)
+            .await
+            .map_err(|_| SnapshotPathError::NotFound)?;
+        if meta.file_type().is_symlink() {
+            return Err(SnapshotPathError::Forbidden);
+        }
+        let last = index + 1 == components.len();
+        if last {
+            if !meta.is_file() {
+                return Err(SnapshotPathError::NotFound);
+            }
+        } else if !meta.is_dir() {
+            return Err(SnapshotPathError::NotFound);
+        }
+    }
+    Ok(current)
+}
+
+/// Parse a single `bytes=` range. Multiple ranges are rejected (416) so the
+/// response is always one contiguous stream.
+fn parse_snapshot_range(value: &str, len: u64) -> Result<(u64, u64), ()> {
+    let (unit, spec) = value.trim().split_once('=').ok_or(())?;
+    if !unit.eq_ignore_ascii_case("bytes") || spec.contains(',') {
+        return Err(());
+    }
+    let (start_raw, end_raw) = spec.trim().split_once('-').ok_or(())?;
+    if start_raw.trim().is_empty() {
+        let suffix: u64 = end_raw.trim().parse().map_err(|_| ())?;
+        if suffix == 0 || len == 0 {
+            return Err(());
+        }
+        return Ok((len.saturating_sub(suffix), len - 1));
+    }
+    let start: u64 = start_raw.trim().parse().map_err(|_| ())?;
+    if len == 0 || start >= len {
+        return Err(());
+    }
+    if end_raw.trim().is_empty() {
+        return Ok((start, len - 1));
+    }
+    let end: u64 = end_raw.trim().parse().map_err(|_| ())?;
+    if end < start {
+        return Err(());
+    }
+    Ok((start, end.min(len - 1)))
+}
+
+fn snapshot_body(file: tokio::fs::File, remaining: u64) -> Body {
+    struct ReadState {
+        file: tokio::fs::File,
+        remaining: u64,
+    }
+    let stream = stream::unfold(ReadState { file, remaining }, |mut state| async move {
+        if state.remaining == 0 {
+            return None;
+        }
+        let wanted = state.remaining.min(SNAPSHOT_READ_CHUNK as u64) as usize;
+        let mut buffer = vec![0u8; wanted];
+        match state.file.read(&mut buffer).await {
+            Ok(0) => {
+                state.remaining = 0;
+                Some((
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "snapshot file ended before its declared length",
+                    )),
+                    state,
+                ))
+            }
+            Ok(read) => {
+                state.remaining -= read as u64;
+                buffer.truncate(read);
+                Some((Ok(Bytes::from(buffer)), state))
+            }
+            Err(error) => {
+                state.remaining = 0;
+                Some((Err(error), state))
+            }
+        }
+    });
+    Body::from_stream(stream)
+}
+
+fn snapshot_range_not_satisfiable(len: u64) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    let headers = response.headers_mut();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes */{len}")).expect("range is a valid header"),
+    );
+    response
+}
+
+fn snapshot_not_found(message: &str) -> Response {
+    snapshot_error(StatusCode::NOT_FOUND, message)
+}
+
+fn snapshot_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,6 +1629,22 @@ mod tests {
         params: GenesisParams,
         request_policy: verinoo_policy::Policy,
     ) -> Arc<Shared> {
+        test_shared_full(params, request_policy, None)
+    }
+
+    fn test_shared_with_snapshot(snapshot_dir: Option<PathBuf>) -> Arc<Shared> {
+        test_shared_full(
+            GenesisParams::default(),
+            verinoo_policy::Policy::default(),
+            snapshot_dir,
+        )
+    }
+
+    fn test_shared_full(
+        params: GenesisParams,
+        request_policy: verinoo_policy::Policy,
+        snapshot_dir: Option<PathBuf>,
+    ) -> Arc<Shared> {
         let store = StateStore::open_temp().unwrap();
         let signing = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let address = verinoo_exec::engine::public_key_to_address(&hex::encode(
@@ -1404,6 +1665,7 @@ mod tests {
             peer_lag_blocks: 2,
             request_policy,
             task_streams: Arc::new(tokio::sync::Semaphore::new(crate::MAX_ACTIVE_TASK_STREAMS)),
+            snapshot_dir,
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
     }
@@ -2657,6 +2919,191 @@ mod tests {
             } else {
                 assert!(body.contains("\"receipt\":null"));
             }
+        }
+    }
+
+    struct SnapshotTempDir(std::path::PathBuf);
+
+    impl SnapshotTempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "verinoo-rpc-snapshot-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for SnapshotTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn response_parts(response: Response) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    fn range_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, value.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn snapshot_manifest_is_404_without_a_configured_or_present_snapshot() {
+        let shared = test_shared_with_snapshot(None);
+        let response = snapshot_manifest(State(shared)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let temp = SnapshotTempDir::new("manifest-missing");
+        let shared = test_shared_with_snapshot(Some(temp.path().join("missing")));
+        let response = snapshot_manifest(State(shared)).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let snapshot_dir = temp.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            br#"{"kind":"verinoo-state-snapshot","height":9}"#,
+        )
+        .unwrap();
+        let shared = test_shared_with_snapshot(Some(snapshot_dir));
+        let response = snapshot_manifest(State(shared)).await;
+        let (status, _headers, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["height"], 9);
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_serves_state_paths_and_ranges() {
+        let temp = SnapshotTempDir::new("ranges");
+        let snapshot_dir = temp.path().join("snapshot");
+        std::fs::create_dir_all(snapshot_dir.join("state")).unwrap();
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        std::fs::write(snapshot_dir.join("state/data.bin"), &bytes).unwrap();
+        let shared = test_shared_with_snapshot(Some(snapshot_dir));
+
+        let response = snapshot_file(
+            State(shared.clone()),
+            AxumPath("state/data.bin".into()),
+            HeaderMap::new(),
+        )
+        .await;
+        let (status, headers, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(headers[header::CONTENT_LENGTH], "256");
+        assert_eq!(body, bytes);
+
+        let response = snapshot_file(
+            State(shared.clone()),
+            AxumPath("state/data.bin".into()),
+            range_headers("bytes=10-19"),
+        )
+        .await;
+        let (status, headers, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 10-19/256");
+        assert_eq!(headers[header::CONTENT_LENGTH], "10");
+        assert_eq!(body, &bytes[10..=19]);
+
+        let response = snapshot_file(
+            State(shared.clone()),
+            AxumPath("state/data.bin".into()),
+            range_headers("bytes=246-"),
+        )
+        .await;
+        let (status, headers, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 246-255/256");
+        assert_eq!(body, &bytes[246..]);
+
+        let response = snapshot_file(
+            State(shared.clone()),
+            AxumPath("state/data.bin".into()),
+            range_headers("bytes=-10"),
+        )
+        .await;
+        let (status, headers, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[header::CONTENT_RANGE], "bytes 246-255/256");
+        assert_eq!(body, &bytes[246..]);
+
+        for value in ["bytes=999-", "bytes=9-3", "bytes=abc", "bytes=0-1,4-5"] {
+            let response = snapshot_file(
+                State(shared.clone()),
+                AxumPath("state/data.bin".into()),
+                range_headers(value),
+            )
+            .await;
+            let (status, headers, _body) = response_parts(response).await;
+            assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE, "{value}");
+            assert_eq!(headers[header::CONTENT_RANGE], "bytes */256");
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_rejects_traversal_absolute_and_symlink_paths() {
+        let temp = SnapshotTempDir::new("paths");
+        let snapshot_dir = temp.path().join("snapshot");
+        std::fs::create_dir_all(snapshot_dir.join("state")).unwrap();
+        std::fs::write(snapshot_dir.join("state/ok.bin"), b"ok").unwrap();
+        let shared = test_shared_with_snapshot(Some(snapshot_dir.clone()));
+
+        for path in [
+            "../outside",
+            "/etc/passwd",
+            "state/../../outside",
+            "state\\..\\outside",
+            "other/file",
+            "state",
+        ] {
+            let response = snapshot_file(
+                State(shared.clone()),
+                AxumPath(path.into()),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+
+        let response = snapshot_file(
+            State(shared.clone()),
+            AxumPath("state/missing.sst".into()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.bin");
+            std::fs::write(&outside, b"secret").unwrap();
+            symlink(&outside, snapshot_dir.join("state/escape.bin")).unwrap();
+            let response = snapshot_file(
+                State(shared.clone()),
+                AxumPath("state/escape.bin".into()),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
     }
 

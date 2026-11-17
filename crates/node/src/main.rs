@@ -9,6 +9,7 @@ mod auth;
 mod policy_gate;
 mod readiness;
 mod rpc;
+mod snapshot;
 mod wallet;
 
 use std::path::PathBuf;
@@ -59,6 +60,9 @@ pub struct Shared {
     pub request_policy: verinoo_policy::Policy,
     /// Global cap on concurrent task event streams, shared by every request.
     pub task_streams: Arc<tokio::sync::Semaphore>,
+    /// Optional directory served by `GET /snapshot/manifest` and
+    /// `GET /snapshot/files/*path`. Reads are public chain state.
+    pub snapshot_dir: Option<PathBuf>,
     policy: std::sync::Mutex<Policy>,
 }
 
@@ -355,6 +359,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return auth::cli(&args[2..]).map_err(|e| e.into());
     }
 
+    // Signed state snapshots: create, verify, apply.
+    if args.len() > 1 && args[1] == "snapshot" {
+        return snapshot::cli(&args[2..]);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -553,6 +562,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A configured policy must load and validate; falling back to permissive
     // here would silently disable an operator's blocklist.
     let request_policy = policy_gate::load_from_env()?;
+    let snapshot_dir = std::env::var("VNN_SNAPSHOT_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if let Some(dir) = &snapshot_dir {
+        tracing::info!("serving snapshots from {}", dir.display());
+    }
     let policy_config = request_policy.config();
     tracing::info!(
         "request policy | maxInputBytes={} | allowedModels={} | blockedTerms={} | blockedPatterns={} | requirePlaintext={}",
@@ -575,6 +592,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peer_lag_blocks,
         request_policy,
         task_streams: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_TASK_STREAMS)),
+        snapshot_dir,
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
