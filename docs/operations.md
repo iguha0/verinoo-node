@@ -415,6 +415,19 @@ best peer, or has a divergent validator set. Promotion is manual: stop the old v
 with the validator seed and `VNN_VALIDATOR=true`, and update `VNN_SYNC_URLS` on
 the other nodes. There is no automatic failover and no split-brain protection.
 
+### BFT finalized catch-up
+
+With `VNN_CONSENSUS=bft`, a node also exchanges finalized history. The peer
+serves `GET /finalized/since/:index`: up to 200 `{block, certificate}` pairs
+strictly above `index`, ascending, stopping at the first missing block or
+certificate. The syncing node verifies every certificate against the configured
+validator set and binds it to the served block hash before replaying the block
+through the same admission/state-root gate as gossip. Verified history persists
+`finalizedHeight`, `finalizedHash` and `meta:commit:<height>`, and the finality
+manager adopts the height so the node's first votes are for the current head,
+never historical heights. If a peer does not serve the endpoint, the node falls
+back to `/blocks/since` and leaves local finality unchanged.
+
 ## Monitoring
 
 | Signal | Where | Alarm |
@@ -425,7 +438,7 @@ the other nodes. There is no automatic failover and no split-brain protection.
 | mempool | `GET /metrics` | sustained growth |
 | service | `systemctl status verinoo-node` | restarts |
 | disk | `df -h /var/lib/verinoo` | < 20% free |
-| sync | journal `synced N block(s)` | repeated failures on a replica |
+| sync | journal `synced N block(s)`, `adopted N finalized block(s)` | repeated failures on a replica |
 
 ## Incident runbook
 

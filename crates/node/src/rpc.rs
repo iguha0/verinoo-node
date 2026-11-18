@@ -27,6 +27,7 @@ use crate::auth::{Auth, AuthError, Caller, SelfServeError};
 use crate::policy_gate;
 use crate::readiness::{self, ReadinessInput};
 use crate::Shared;
+use verinoo_consensus::{verify_certificate, CommitCertificate};
 
 pub async fn serve(
     shared: Arc<Shared>,
@@ -56,6 +57,7 @@ fn app(shared: Arc<Shared>, net: verinoo_network::NetworkNode, auth: Auth) -> Ro
         .route("/ready", get(ready))
         .route("/blocks", get(blocks))
         .route("/blocks/since/:index", get(blocks_since))
+        .route("/finalized/since/:index", get(finalized_since))
         .route("/mempool", get(mempool))
         .route("/account/:address", get(account))
         .route("/validators", get(validators))
@@ -309,6 +311,94 @@ async fn blocks_since(
         out.push(block);
     }
     Json(serde_json::json!(out))
+}
+
+/// Finalized `{block, certificate}` pairs strictly above `index`, ascending
+/// and capped at 200. Stops at the first height without a stored block or
+/// commit certificate, so a catch-up client never has to guess across a gap.
+/// Each certificate is verified against the configured validator set and bound
+/// to the served block before it leaves this node; an invalid entry ends the
+/// range instead of exposing an unfinalized or forged block.
+async fn finalized_since(
+    State(shared): State<Arc<Shared>>,
+    axum::extract::Path(from): axum::extract::Path<u64>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!(finalized_pairs(&shared, from)))
+}
+
+fn finalized_pairs(shared: &Shared, from: u64) -> Vec<serde_json::Value> {
+    let Some(head) = shared.head() else {
+        return Vec::new();
+    };
+    let start = from.saturating_add(1);
+    let end = start.saturating_add(199).min(head.header.index);
+    if start > end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for height in start..=end {
+        let Some(hash) = shared
+            .store
+            .get_meta(&format!("blockheight:{height}"))
+            .and_then(|v| v.as_str().map(String::from))
+        else {
+            break;
+        };
+        let Some(block_value) = shared.store.get_block_by_hash(&hash) else {
+            break;
+        };
+        let block = match serde_json::from_value::<verinoo_exec::engine::Block>(block_value) {
+            Ok(block) => block,
+            Err(e) => {
+                tracing::warn!(height = height, error = %e, "finalized block is malformed");
+                break;
+            }
+        };
+        if block.header.index != height || block.header.hash != hash {
+            tracing::warn!(
+                height = height,
+                "finalized block does not match its height index"
+            );
+            break;
+        }
+        let Some(cert_value) = shared.store.get_meta(&format!("commit:{height}")) else {
+            break;
+        };
+        let certificate = match serde_json::from_value::<CommitCertificate>(cert_value) {
+            Ok(certificate) => certificate,
+            Err(e) => {
+                tracing::warn!(height = height, error = %e, "finalized certificate is malformed");
+                break;
+            }
+        };
+        let invalid = if certificate.height != height {
+            Some(format!(
+                "certificate height {} does not match {height}",
+                certificate.height
+            ))
+        } else if certificate.block_hash != block.header.hash {
+            Some("certificate does not bind the served block".to_string())
+        } else if certificate.chain_id != shared.params.chain_id {
+            Some("certificate chain id mismatch".to_string())
+        } else if let Err(e) = verify_certificate(&certificate, &shared.params.validators) {
+            Some(e.to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            tracing::warn!(
+                height = height,
+                reason = %reason,
+                "dropping invalid finalized certificate"
+            );
+            break;
+        }
+        out.push(serde_json::json!({
+            "block": block,
+            "certificate": certificate,
+        }));
+    }
+    out
 }
 
 async fn blocks(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
@@ -3347,5 +3437,204 @@ mod tests {
         assert!(body.contains("event: done"));
         assert!(!body.contains("event: result"));
         assert!(!body.contains("event: token"));
+    }
+
+    fn test_bft_validators(count: u8) -> (Vec<ed25519_dalek::SigningKey>, Vec<String>) {
+        let keys: Vec<_> = (0..count)
+            .map(|index| ed25519_dalek::SigningKey::from_bytes(&[index.saturating_add(1); 32]))
+            .collect();
+        let addresses = keys
+            .iter()
+            .map(|key| {
+                verinoo_consensus::public_key_to_address(&hex::encode(
+                    key.verifying_key().to_bytes(),
+                ))
+                .unwrap()
+            })
+            .collect();
+        (keys, addresses)
+    }
+
+    fn store_test_block(shared: &Shared, height: u64) -> String {
+        let hash = format!("{height:064x}");
+        let block = verinoo_exec::engine::Block {
+            header: verinoo_exec::engine::BlockHeader {
+                hash: hash.clone(),
+                version: verinoo_exec::engine::HEADER_VERSION,
+                index: height,
+                timestamp: height,
+                previous_hash: format!("{:064x}", height.saturating_sub(1)),
+                validator: "genesis".into(),
+                validator_pub_key: String::new(),
+                validator_signature: String::new(),
+                state_root: "00".repeat(32),
+                tx_root: "00".repeat(32),
+                inference_tasks_root: "00".repeat(32),
+                compute_root: "00".repeat(32),
+            },
+            transactions: vec![],
+        };
+        shared.store.put_block_by_hash(
+            &hash,
+            &serde_json::to_value(&block).expect("block serialize"),
+        );
+        verinoo_exec::engine::set_head(&shared.store, &block);
+        hash
+    }
+
+    fn test_certificate(
+        chain_id: &str,
+        height: u64,
+        block_hash: &str,
+        keys: &[ed25519_dalek::SigningKey],
+        addresses: &[String],
+    ) -> CommitCertificate {
+        let votes = keys
+            .iter()
+            .zip(addresses)
+            .map(|(key, address)| {
+                verinoo_consensus::Vote::sign(
+                    chain_id,
+                    verinoo_consensus::VoteKind::Precommit,
+                    height,
+                    0,
+                    block_hash,
+                    address,
+                    key,
+                )
+            })
+            .collect();
+        CommitCertificate {
+            chain_id: chain_id.into(),
+            height,
+            round: 0,
+            block_hash: block_hash.into(),
+            votes,
+        }
+    }
+
+    fn store_commit(
+        shared: &Shared,
+        height: u64,
+        block_hash: &str,
+        certificate: &CommitCertificate,
+    ) {
+        shared.store.set_meta(
+            &format!("commit:{height}"),
+            &serde_json::to_value(certificate).expect("certificate serialize"),
+        );
+        if height > shared.store.meta_u64_or("finalizedHeight", 0) {
+            shared.store.set_meta_u64("finalizedHeight", height);
+            shared
+                .store
+                .set_meta("finalizedHash", &serde_json::json!(block_hash));
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_since_returns_ordered_block_certificate_pairs() {
+        let (keys, addresses) = test_bft_validators(4);
+        let params = GenesisParams {
+            validators: addresses.clone(),
+            ..GenesisParams::default()
+        };
+        let shared = test_shared_with(params);
+        let chain_id = shared.params.chain_id.clone();
+        for height in 1..=3 {
+            let hash = store_test_block(&shared, height);
+            let certificate = test_certificate(&chain_id, height, &hash, &keys, &addresses);
+            store_commit(&shared, height, &hash, &certificate);
+        }
+
+        let Json(body) = finalized_since(State(shared.clone()), AxumPath(0)).await;
+        let pairs = body.as_array().unwrap();
+        assert_eq!(pairs.len(), 3);
+        for (offset, pair) in pairs.iter().enumerate() {
+            let height = offset as u64 + 1;
+            assert_eq!(pair["block"]["header"]["index"], height);
+            assert_eq!(pair["certificate"]["height"], height);
+            assert_eq!(
+                pair["certificate"]["blockHash"],
+                pair["block"]["header"]["hash"]
+            );
+        }
+
+        let Json(body) = finalized_since(State(shared), AxumPath(1)).await;
+        let pairs = body.as_array().unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0]["block"]["header"]["index"], 2);
+        assert_eq!(pairs[1]["block"]["header"]["index"], 3);
+    }
+
+    #[tokio::test]
+    async fn finalized_since_stops_at_a_missing_certificate_or_block() {
+        let (keys, addresses) = test_bft_validators(4);
+        let params = GenesisParams {
+            validators: addresses.clone(),
+            ..GenesisParams::default()
+        };
+        let chain_id = params.chain_id.clone();
+
+        let shared = test_shared_with(params.clone());
+        for height in 1..=3 {
+            let hash = store_test_block(&shared, height);
+            if height == 2 {
+                continue;
+            }
+            let certificate = test_certificate(&chain_id, height, &hash, &keys, &addresses);
+            store_commit(&shared, height, &hash, &certificate);
+        }
+        let Json(body) = finalized_since(State(shared), AxumPath(0)).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["block"]["header"]["index"], 1);
+
+        let shared = test_shared_with(params.clone());
+        for height in 1..=3 {
+            if height == 2 {
+                continue;
+            }
+            let hash = store_test_block(&shared, height);
+            let certificate = test_certificate(&chain_id, height, &hash, &keys, &addresses);
+            store_commit(&shared, height, &hash, &certificate);
+        }
+        let Json(body) = finalized_since(State(shared), AxumPath(0)).await;
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["block"]["header"]["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn finalized_since_drops_tampered_certificates() {
+        let (keys, addresses) = test_bft_validators(4);
+        let params = GenesisParams {
+            validators: addresses.clone(),
+            ..GenesisParams::default()
+        };
+        let chain_id = params.chain_id.clone();
+
+        let shared = test_shared_with(params.clone());
+        for height in 1..=2 {
+            let hash = store_test_block(&shared, height);
+            let mut certificate = test_certificate(&chain_id, height, &hash, &keys, &addresses);
+            if height == 1 {
+                certificate.votes[0].signature = "00".repeat(64);
+            }
+            store_commit(&shared, height, &hash, &certificate);
+        }
+        let Json(body) = finalized_since(State(shared), AxumPath(0)).await;
+        assert!(body.as_array().unwrap().is_empty());
+
+        let shared = test_shared_with(params);
+        for height in 1..=2 {
+            let hash = store_test_block(&shared, height);
+            let mut certificate = test_certificate(&chain_id, height, &hash, &keys, &addresses);
+            if height == 2 {
+                certificate.block_hash = "ff".repeat(32);
+            }
+            store_commit(&shared, height, &hash, &certificate);
+        }
+        let Json(body) = finalized_since(State(shared), AxumPath(0)).await;
+        let pairs = body.as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0]["block"]["header"]["index"], 1);
     }
 }

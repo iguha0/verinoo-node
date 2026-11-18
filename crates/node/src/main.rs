@@ -219,13 +219,7 @@ impl Shared {
             );
         }
         if let Some((height, block_hash, certificate)) = output.finalized {
-            self.store.set_meta_u64("finalizedHeight", height);
-            self.store
-                .set_meta("finalizedHash", &serde_json::json!(block_hash));
-            self.store.set_meta(
-                &format!("commit:{height}"),
-                &serde_json::to_value(&certificate).expect("certificate serialize"),
-            );
+            persist_finalized(self, height, &block_hash, &certificate);
             tracing::info!(
                 "finalized block #{height} {}",
                 &block_hash[..16.min(block_hash.len())]
@@ -245,6 +239,47 @@ impl Shared {
         self.best_peer_height
             .store(height.unwrap_or(0), Ordering::Relaxed);
     }
+}
+
+/// Persist finalized height/hash and the certificate that proves them.
+/// Monotonic: a late or duplicate certificate can never move finality back.
+fn persist_finalized(
+    shared: &Shared,
+    height: u64,
+    block_hash: &str,
+    certificate: &verinoo_consensus::CommitCertificate,
+) {
+    if height <= shared.store.meta_u64_or("finalizedHeight", 0) {
+        return;
+    }
+    shared.store.set_meta_u64("finalizedHeight", height);
+    shared
+        .store
+        .set_meta("finalizedHash", &serde_json::json!(block_hash));
+    shared.store.set_meta(
+        &format!("commit:{height}"),
+        &serde_json::to_value(certificate).expect("certificate serialize"),
+    );
+}
+
+/// Local finalized tip. The BFT manager is authoritative when present; legacy
+/// mode falls back to the persisted metadata written by finality outputs.
+async fn current_finalized(shared: &Shared) -> (u64, String) {
+    if let Some(manager) = &shared.finality {
+        let manager = manager.lock().await;
+        return (
+            manager.finalized_height(),
+            manager.finalized_hash().to_string(),
+        );
+    }
+    (
+        shared.store.meta_u64_or("finalizedHeight", 0),
+        shared
+            .store
+            .get_meta("finalizedHash")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    )
 }
 
 /// The hostile-network gate. Nothing from the wire touches state without
@@ -1008,6 +1043,132 @@ impl Drop for SyncingGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FinalizedPair {
+    block: Block,
+    certificate: verinoo_consensus::CommitCertificate,
+}
+
+/// Fetch finalized pairs from a peer. `Ok(None)` means the peer does not serve
+/// `/finalized/since` (older build), so the caller can fall back to plain block
+/// catch-up without changing local finality.
+async fn fetch_finalized_pairs(
+    client: &reqwest::Client,
+    base: &str,
+    from: u64,
+) -> Result<Option<Vec<FinalizedPair>>, String> {
+    let response = client
+        .get(format!("{base}/finalized/since/{from}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    ) {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("peer /finalized/since returned HTTP {status}"));
+    }
+    response
+        .json::<Vec<FinalizedPair>>()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Verify a peer-served finalized run, apply the blocks through the same
+/// admission/state-root gate as gossip, then persist finality. Certificates
+/// are checked against the configured set and bound to their block hash before
+/// any block or finality marker is touched, so an uncertified block can never
+/// advance finalized height.
+async fn apply_finalized_pairs(
+    shared: &Shared,
+    pairs: Vec<FinalizedPair>,
+) -> Result<usize, String> {
+    let mut adopted = 0usize;
+    for pair in pairs {
+        let FinalizedPair { block, certificate } = pair;
+        let height = block.header.index;
+        if certificate.height != height {
+            return Err(format!(
+                "finalized certificate height {} does not match block #{height}",
+                certificate.height
+            ));
+        }
+        if certificate.block_hash != block.header.hash {
+            return Err(format!(
+                "finalized certificate at #{height} does not bind the block hash"
+            ));
+        }
+        if certificate.chain_id != shared.params.chain_id {
+            return Err(format!(
+                "finalized certificate at #{height} chain id mismatch"
+            ));
+        }
+        verinoo_consensus::verify_certificate(&certificate, &shared.params.validators)
+            .map_err(|e| format!("finalized certificate at #{height} rejected: {e}"))?;
+
+        let (local_finalized, _) = current_finalized(shared).await;
+        if height <= local_finalized {
+            continue;
+        }
+        if height != local_finalized + 1 {
+            tracing::warn!(
+                height = height,
+                finalized = local_finalized,
+                "finalized catch-up has a gap; stopping"
+            );
+            break;
+        }
+
+        {
+            let _guard = shared.chain_lock.lock().await;
+            let head_height = shared.head().map(|head| head.header.index).unwrap_or(0);
+            if height <= head_height {
+                // Already replayed: the certificate must still bind the block
+                // this node has at that height, otherwise refuse to finalize.
+                let local_hash = shared
+                    .store
+                    .get_meta(&format!("blockheight:{height}"))
+                    .and_then(|value| value.as_str().map(String::from))
+                    .unwrap_or_default();
+                if local_hash != block.header.hash {
+                    return Err(format!(
+                        "finalized certificate at #{height} does not match the local block"
+                    ));
+                }
+            } else if height == head_height + 1 {
+                admit_block(shared, &block)?;
+                let producer = block.header.validator.clone();
+                if !commit_block(shared, &block, &producer) {
+                    return Err(format!(
+                        "finalized block #{height} did not advance head (state root or model set mismatch?)"
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "finalized block #{height} skips local head #{head_height}"
+                ));
+            }
+        }
+
+        persist_finalized(shared, height, &block.header.hash, &certificate);
+        if let Some(manager) = &shared.finality {
+            manager
+                .lock()
+                .await
+                .adopt_finalized(height, &block.header.hash);
+        }
+        adopted += 1;
+    }
+    Ok(adopted)
+}
+
 async fn sync_once(
     shared: &Shared,
     client: &reqwest::Client,
@@ -1042,10 +1203,34 @@ async fn sync_once(
             })
         }
     };
+    // BFT nodes exchange certificates, not just blocks: a late node adopts
+    // finalized history first so it never votes for heights that are already
+    // final. A peer without the endpoint still gets the legacy block path and
+    // leaves local finality untouched.
+    let mut finalized_applied = 0usize;
+    if shared.consensus_mode == "bft" {
+        let peer_finalized = status["finalizedHeight"].as_u64().unwrap_or(0);
+        let (local_finalized, _) = current_finalized(shared).await;
+        if peer_finalized > local_finalized {
+            match fetch_finalized_pairs(client, base, local_finalized).await? {
+                Some(pairs) => {
+                    let _syncing = SyncingGuard::enter(&shared.syncing);
+                    let adopted = apply_finalized_pairs(shared, pairs).await?;
+                    finalized_applied = adopted;
+                    if adopted > 0 {
+                        tracing::info!("adopted {adopted} finalized block(s) from {base}");
+                    }
+                }
+                None => tracing::debug!(
+                    "peer {base} does not serve /finalized/since; falling back to block catch-up"
+                ),
+            }
+        }
+    }
     let our_height = shared.head().map(|b| b.header.index).unwrap_or(0);
     if peer_height <= our_height {
         return Ok(SyncReport {
-            applied: 0,
+            applied: finalized_applied,
             peer_height: Some(peer_height),
         });
     }
@@ -1057,7 +1242,7 @@ async fn sync_once(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let mut applied = 0usize;
+    let mut applied = finalized_applied;
     {
         // Only block application is catch-up work; the polls above are routine.
         let _syncing = SyncingGuard::enter(&shared.syncing);
@@ -1401,5 +1586,280 @@ mod tests {
 
         let ids: Vec<_> = mempool.iter().map(|t| t.tx_id.as_str()).collect();
         assert_eq!(ids, vec!["b", "c", "z"]);
+    }
+
+    fn test_validators(count: u32) -> Vec<verinoo_exec::engine::ProducerKey> {
+        let mut keys: Vec<_> = (0..count)
+            .map(|index| verinoo_exec::engine::ProducerKey::deterministic("bft-catchup", index))
+            .collect();
+        keys.sort_by(|a, b| a.address.cmp(&b.address));
+        keys
+    }
+
+    fn test_genesis() -> Block {
+        let mut header = verinoo_exec::engine::BlockHeader {
+            hash: String::new(),
+            version: 1,
+            index: 0,
+            timestamp: 0,
+            previous_hash: "0".repeat(64),
+            validator: "genesis".into(),
+            validator_pub_key: String::new(),
+            validator_signature: String::new(),
+            state_root: sha256_hex_str("genesis"),
+            tx_root: sha256_hex_str("empty"),
+            inference_tasks_root: sha256_hex_str("empty-tasks"),
+            compute_root: sha256_hex_str("empty-compute"),
+        };
+        header.hash = verinoo_exec::engine::hash_header(&header);
+        Block {
+            header,
+            transactions: vec![],
+        }
+    }
+
+    fn test_store_with_genesis() -> verinoo_state::StateStore {
+        let store = verinoo_state::StateStore::open_temp().unwrap();
+        let genesis = test_genesis();
+        store.put_block_by_hash(
+            &genesis.header.hash,
+            &serde_json::to_value(&genesis).unwrap(),
+        );
+        verinoo_exec::engine::set_head(&store, &genesis);
+        store
+    }
+
+    fn test_bft_shared(
+        store: verinoo_state::StateStore,
+        keys: &[verinoo_exec::engine::ProducerKey],
+        finalized_height: u64,
+        finalized_hash: &str,
+    ) -> Arc<Shared> {
+        let params = GenesisParams {
+            validators: keys.iter().map(|key| key.address.clone()).collect(),
+            ..GenesisParams::default()
+        };
+        let manager = finality::FinalityManager::new(
+            &params.chain_id,
+            params.validators.clone(),
+            &keys[0].address,
+            keys[0].signing.clone(),
+            finalized_height,
+            finalized_hash,
+            1_000,
+        )
+        .unwrap();
+        let faucet = verinoo_exec::engine::ProducerKey::deterministic("faucet-test", 0);
+        Arc::new(Shared {
+            store,
+            params,
+            mempool: tokio::sync::Mutex::new(Vec::new()),
+            faucet,
+            chain_lock: tokio::sync::Mutex::new(()),
+            syncing: AtomicBool::new(false),
+            best_peer_height: AtomicU64::new(0),
+            block_time_ms: 1_000,
+            peer_lag_blocks: 2,
+            request_policy: verinoo_policy::Policy::default(),
+            task_streams: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_TASK_STREAMS)),
+            snapshot_dir: None,
+            finality: Some(tokio::sync::Mutex::new(manager)),
+            consensus_mode: "bft".into(),
+            policy: std::sync::Mutex::new(Policy::default()),
+        })
+    }
+
+    fn test_certificate(
+        chain_id: &str,
+        block: &Block,
+        keys: &[verinoo_exec::engine::ProducerKey],
+    ) -> verinoo_consensus::CommitCertificate {
+        let votes = keys
+            .iter()
+            .map(|key| {
+                verinoo_consensus::Vote::sign(
+                    chain_id,
+                    verinoo_consensus::VoteKind::Precommit,
+                    block.header.index,
+                    0,
+                    &block.header.hash,
+                    &key.address,
+                    &key.signing,
+                )
+            })
+            .collect();
+        verinoo_consensus::CommitCertificate {
+            chain_id: chain_id.into(),
+            height: block.header.index,
+            round: 0,
+            block_hash: block.header.hash.clone(),
+            votes,
+        }
+    }
+
+    fn produce_finalized_pairs(
+        store: &verinoo_state::StateStore,
+        chain_id: &str,
+        keys: &[verinoo_exec::engine::ProducerKey],
+        count: u64,
+    ) -> Vec<FinalizedPair> {
+        let mut pairs = Vec::new();
+        for height in 1..=count {
+            let producer = &keys[((height - 1) as usize) % keys.len()];
+            let block =
+                verinoo_exec::engine::produce_block(store, &[], producer, 1_000 + height).unwrap();
+            verinoo_exec::engine::set_head(store, &block);
+            let certificate = test_certificate(chain_id, &block, keys);
+            pairs.push(FinalizedPair { block, certificate });
+        }
+        pairs
+    }
+
+    async fn spawn_peer(
+        chain_id: String,
+        pairs: Vec<FinalizedPair>,
+        with_finalized_endpoint: bool,
+    ) -> String {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let height = pairs
+            .last()
+            .map(|pair| pair.block.header.index)
+            .unwrap_or(0);
+        let status = serde_json::json!({
+            "chainId": chain_id,
+            "height": height,
+            "finalizedHeight": height,
+        });
+        let blocks: Vec<Block> = pairs.iter().map(|pair| pair.block.clone()).collect();
+        let pairs = Arc::new(pairs);
+        let blocks = Arc::new(blocks);
+
+        let mut app =
+            Router::new().route("/status", get(move || async move { Json(status.clone()) }));
+        if with_finalized_endpoint {
+            let pairs = pairs.clone();
+            app = app.route(
+                "/finalized/since/:index",
+                get(
+                    move |axum::extract::Path(index): axum::extract::Path<u64>| async move {
+                        let out: Vec<serde_json::Value> = pairs
+                            .iter()
+                            .filter(|pair| pair.block.header.index > index)
+                            .take(200)
+                            .map(|pair| {
+                                serde_json::json!({
+                                    "block": pair.block,
+                                    "certificate": pair.certificate,
+                                })
+                            })
+                            .collect();
+                        Json(serde_json::json!(out))
+                    },
+                ),
+            );
+        }
+        let blocks_for_route = blocks.clone();
+        app = app.route(
+            "/blocks/since/:index",
+            get(
+                move |axum::extract::Path(index): axum::extract::Path<u64>| async move {
+                    let out: Vec<Block> = blocks_for_route
+                        .iter()
+                        .filter(|block| block.header.index > index)
+                        .take(200)
+                        .cloned()
+                        .collect();
+                    Json(serde_json::json!(out))
+                },
+            ),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn sync_once_adopts_certified_history_from_an_empty_store() {
+        let keys = test_validators(4);
+        let chain_id = GenesisParams::default().chain_id;
+        let peer_store = test_store_with_genesis();
+        let pairs = produce_finalized_pairs(&peer_store, &chain_id, &keys, 3);
+        let peer_head = verinoo_exec::engine::current_head(&peer_store).unwrap();
+        let shared = test_bft_shared(test_store_with_genesis(), &keys, 0, "");
+
+        let url = spawn_peer(chain_id, pairs, true).await;
+        let client = reqwest::Client::new();
+        let report = sync_once(&shared, &client, &url).await.unwrap();
+
+        assert_eq!(report.applied, 3);
+        assert_eq!(report.peer_height, Some(3));
+        let head = shared.head().unwrap();
+        assert_eq!(head.header.index, peer_head.header.index);
+        assert_eq!(head.header.hash, peer_head.header.hash);
+        let (finalized_height, finalized_hash) = current_finalized(&shared).await;
+        assert_eq!(finalized_height, 3);
+        assert_eq!(finalized_hash, peer_head.header.hash);
+        for height in 1..=3 {
+            assert!(shared.store.get_meta(&format!("commit:{height}")).is_some());
+        }
+        assert!(shared
+            .store
+            .get_meta("consensusOwnVote:1:0:prevote")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn finalized_catch_up_rejects_tampered_certificates() {
+        let keys = test_validators(4);
+        let chain_id = GenesisParams::default().chain_id;
+        let peer_store = test_store_with_genesis();
+        let pairs = produce_finalized_pairs(&peer_store, &chain_id, &keys, 2);
+
+        let mut bad_signature = pairs.clone();
+        bad_signature[0].certificate.votes[0].signature = "00".repeat(64);
+        let shared = test_bft_shared(test_store_with_genesis(), &keys, 0, "");
+        assert!(apply_finalized_pairs(&shared, bad_signature).await.is_err());
+        assert_eq!(shared.head().unwrap().header.index, 0);
+        assert_eq!(current_finalized(&shared).await.0, 0);
+
+        let mut bad_binding = pairs.clone();
+        bad_binding[0].certificate.block_hash = "ff".repeat(32);
+        let shared = test_bft_shared(test_store_with_genesis(), &keys, 0, "");
+        assert!(apply_finalized_pairs(&shared, bad_binding).await.is_err());
+        assert_eq!(current_finalized(&shared).await.0, 0);
+
+        let mut no_quorum = pairs;
+        no_quorum[0].certificate.votes.truncate(2);
+        let shared = test_bft_shared(test_store_with_genesis(), &keys, 0, "");
+        assert!(apply_finalized_pairs(&shared, no_quorum).await.is_err());
+        assert_eq!(current_finalized(&shared).await.0, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_once_falls_back_when_finalized_endpoint_is_missing() {
+        let keys = test_validators(4);
+        let chain_id = GenesisParams::default().chain_id;
+        let peer_store = test_store_with_genesis();
+        let pairs = produce_finalized_pairs(&peer_store, &chain_id, &keys, 3);
+        let peer_head = verinoo_exec::engine::current_head(&peer_store).unwrap();
+        let shared = test_bft_shared(test_store_with_genesis(), &keys, 0, "");
+
+        let url = spawn_peer(chain_id, pairs, false).await;
+        let client = reqwest::Client::new();
+        let report = sync_once(&shared, &client, &url).await.unwrap();
+
+        assert_eq!(report.applied, 3);
+        let head = shared.head().unwrap();
+        assert_eq!(head.header.index, peer_head.header.index);
+        assert_eq!(head.header.hash, peer_head.header.hash);
+        let (finalized_height, finalized_hash) = current_finalized(&shared).await;
+        assert_eq!(finalized_height, 0);
+        assert!(finalized_hash.is_empty());
     }
 }
