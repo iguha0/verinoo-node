@@ -1,7 +1,9 @@
 # Operations runbook
 
 Scope: a single-validator testnet or a small dedicated pilot network. This is
-the operational layer around `verinoo-node`; it documents the optional BFT certificate layer, but not view-change liveness or HA.
+the operational layer around `verinoo-node`; it documents the BFT modes
+(`legacy`, `bft`, and the planned `bft-v2`) and links to the activation
+runbook. View-change liveness is not shipped, and there is no automatic HA.
 
 ## Layout on a VPS
 
@@ -303,6 +305,37 @@ on every validator. A single-validator demo at `1000` gives roughly 1–2 s task
 latency; the two- and multi-validator safety story is unchanged (still
 round-robin; optional BFT finality certificates, but no view changes). Changing it does not change state. The same effective
 interval drives the `/ready` staleness threshold.
+
+## BFT modes (`legacy`, `bft`, `bft-v2`)
+
+| Mode | Status | What it does | What it does not do |
+|---|---|---|---|
+| `legacy` | default | single-producer round-robin; head advances on block admission | no votes, certificates or finality |
+| `bft` (v1) | shipped, live-capable | 2/3+1 prevote/precommit certificates over validated blocks; persisted `finalizedHeight`/`finalizedHash`; equivocation evidence in `evid:` keys; certificate-verified `/finalized/since` catch-up | head still advances on admission; no view changes (an offline leader stalls the chain); no slashing or removal |
+| `bft-v2` | **in progress, not shipped** | proposal-on-clone, certificate-gated commit (head advances only with a verified quorum certificate), pacemaker/view changes | not deployed, not audited; still no slashing or removal |
+
+Environment:
+
+| Variable | Notes |
+|---|---|
+| `VNN_CONSENSUS` | `legacy` (default), `bft`, or `bft-v2` once that release ships; current binaries reject `bft-v2`. `bft`/`bft-v2` require `VNN_VALIDATOR=true`. |
+| `VNN_BFT_ACTIVATION_HEIGHT` | coordinated activation height for the v2 switch (per the release that ships it). |
+| `VNN_VALIDATORS` | the consensus set in every mode; must be identical on every node. |
+| `VNN_BLOCK_TIME_MS` | drives the round-timeout base in v2; identical on every node. |
+
+Status and evidence fields: `/status` reports `consensus` (the active mode),
+`finalizedHeight` and `finalizedHash` (persisted finality; in `bft-v2` the
+head itself is finalized). Certificates are stored under `meta:commit:<H>`;
+equivocation evidence under `evid:` keys (an `/evidence` endpoint is planned,
+not shipped). `/finalized/since/:index` serves verified finalized history in
+BFT modes.
+
+Mode changes are never rolling: `legacy`, `bft` and `bft-v2` nodes disagree
+on when the head advances, so a mixed set is unsupported. The full activation
+plan (binary soak, coordinated switch, timer enablement), per-phase acceptance
+criteria, rollback rules, and the runbooks for a stuck chain, a Byzantine
+validator and an evidence incident are in
+[`docs/upgrade-bft-v2.md`](upgrade-bft-v2.md).
 
 ## Readiness (`/ready`)
 
