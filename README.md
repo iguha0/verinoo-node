@@ -52,7 +52,7 @@ test-suite exports the golden fixtures this workspace reproduces exactly. See
 ## Live testnet
 
 Prebuilt `x86_64` Linux binary:
-<https://github.com/iguha0/verinoo-node/releases/tag/v0.10.0-testnet>
+<https://github.com/iguha0/verinoo-node/releases/tag/v0.11.0-testnet>
 
 The `/v1` API is deployed behind **https://verinoo.com** (single validator,
 testnet, no SLA):
@@ -352,7 +352,7 @@ Self-serve keys live in the database and are **not** listed by
 
 ```bash
 cargo build --workspace --locked
-cargo test --workspace --locked        # 243 tests (model-parity tests skip without local weights)
+cargo test --workspace --locked        # 274 tests (model-parity tests skip without local weights)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ./scripts/demo.sh                      # single node, ~45 s
