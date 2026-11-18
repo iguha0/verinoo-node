@@ -3738,6 +3738,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "verinoo-consensus"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "verinoo-types",
+]
+
+[[package]]
 name = "verinoo-crypto"
 version = "0.1.0"
 dependencies = [
