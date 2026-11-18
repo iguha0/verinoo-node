@@ -1,6 +1,6 @@
 # Go-to-market readiness
 
-Assessment date: 2026-11-15. Scope: the Rust node in this repository.
+Assessment date: 2026-11-18. Scope: the Rust node in this repository.
 
 ## Verdict
 
@@ -278,7 +278,7 @@ This is the reproducible design-partner proof: two validators share a set,
 execute the same task during block application, derive the same result hash, and
 the receipt verifies on the node that did not produce the block.
 
-## Live deployment (2026-11-15)
+## Live deployment (2026-11-18)
 
 `https://verinoo.com/v1/*` is served by this node (`v0.10.0-testnet`, single
 validator, systemd unit `verinoo-node`, data in `/var/lib/verinoo`). Nginx
