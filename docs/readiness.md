@@ -37,7 +37,7 @@ claims a technical buyer will test in the first diligence call.
 | SDKs | works | `sdk/typescript` (8 tests), `sdk/python` (8 tests), live-tested against an encrypted node |
 | Block-time override | works | `VNN_BLOCK_TIME_MS=1000` gives ~1–2 s task latency; network-wide setting |
 | Attention kernel | prototype | Q16.16 single/multi-head, 6 tests; not wired into model loading (`docs/transformer.md`) |
-| BFT finality | works (certificate layer) | 2/3+1 prevote/precommit certificates, evidence, 4-validator live cluster; no view-change/offline-leader liveness |
+| BFT finality | works (certificate layer) | 2/3+1 prevote/precommit certificates, evidence, certificate-aware catch-up, 4-validator live cluster; no view-change/offline-leader liveness |
 | Result commitment | works | state root covers every executed output |
 | Receipts + verification | works | `/v1/verify` recompute, live 2-node run |
 | Metering | works | `/v1/usage`, CSV export |
@@ -77,8 +77,10 @@ claims a technical buyer will test in the first diligence call.
 2. **Partial finality.** `VNN_CONSENSUS=bft` adds signed prevotes/precommits,
    a 2/3+1 commit certificate, persisted finality and equivocation evidence.
    Block production is still single-producer round-robin: there is no
-   view-change for an offline leader, no certificate-aware catch-up, and no
-   slashing/removal. The default is legacy; the live testnet is single-validator.
+   view-change for an offline leader and no slashing/removal. A late BFT node
+   can now adopt certified finalized history (`/finalized/since`), but
+   production liveness still depends on the scheduled leader. The default is
+   legacy; the live testnet is single-validator.
 3. **The dispute game is not live over RPC for a real model.** With consensus
    re-execution, verification is recomputation and there is nothing to dispute
    in the deterministic path. The game that exists targets the manual-claim
@@ -95,8 +97,10 @@ claims a technical buyer will test in the first diligence call.
    balancer; it does not fence a host or promote a replica.
 6. **No automatic snapshot sync.** Signed snapshot create/verify/apply and
    read-only manifest/file serving exist, but a node still does not
-   automatically download, resume or apply a snapshot, and there are no BFT
-   commit certificates. Catch-up still replays blocks from the caller's height.
+   automatically download, resume or apply a snapshot, and snapshots do not
+   carry BFT commit certificates. BFT finalized catch-up is separate
+   (`GET /finalized/since/:index`); legacy catch-up still replays blocks from
+   the caller's height.
 
 ## Prepared in this pass
 
@@ -140,7 +144,10 @@ claims a technical buyer will test in the first diligence call.
   `gguf` Python package.
 - Catch-up sync: `GET /blocks/since/:index` plus `VNN_SYNC_URLS`. A late
   replica replays blocks through the same validation and state-root check;
-  `scripts/demo-sync.sh` proves a three-block catch-up.
+  `scripts/demo-sync.sh` proves a three-block catch-up. In BFT mode a late node
+  also fetches `GET /finalized/since/:index`, verifies each certificate and
+  block binding, persists finalized history and resumes voting at the current
+  head; peers without the endpoint fall back to plain block catch-up.
 - `/ready` hardening: catch-up HTTP has 2 s connect / 5 s read / 5 s total
   timeouts, `syncing` is set only while replayed blocks are applied, peer
   heights are accepted only from peers with a matching `chainId` and are
@@ -207,8 +214,10 @@ claims a technical buyer will test in the first diligence call.
 - Quorum finality (`VNN_CONSENSUS=bft`): signed prevotes/precommits over
   validated blocks, 2/3+1 commit certificates, `finalizedHeight`/`finalizedHash`
   in `/status`, persisted certificates and equivocation evidence. A four-node
-  local cluster finalized the same head. View-change liveness, finalized sync
-  and slashing remain unimplemented; the live node is single-validator.
+  local cluster finalized the same head. A late node adopts certified finalized
+  history through `/finalized/since` and never votes for historical heights.
+  View-change liveness and slashing remain unimplemented; the live node is
+  single-validator.
 
 ## Verified end-to-end (2-node product run)
 
@@ -308,7 +317,7 @@ domain still belong to the older reference node.
 | ~~Block catch-up sync~~ | **done**: `/blocks/since`, `VNN_SYNC_URLS`, validated replay (`scripts/demo-sync.sh`) | — |
 | ~~Backups, restore, key rotation, incident runbook~~ | **done**: `scripts/backup.sh`, [`docs/operations.md`](operations.md) | — |
 | Dispute game live for a real model | commit layer specs/weights at model registration; replace `get_layer_spec` | 2–3 wk |
-| ~~Finality certificate layer~~ | **done (partial)**: quorum votes/certificates/evidence; view-change, certified sync, slashing remain | — |
+| ~~Finality certificate layer~~ | **done (partial)**: quorum votes/certificates/evidence and certified catch-up; view-change and slashing remain | — |
 | Public multi-party ceremony | external contributors to powers-of-tau | 2 wk + coordination |
 | Automatic HA / validator removal | failover, split-brain protection, on-chain set changes | 2–3 wk |
 | ~~State snapshot transfer~~ | **done (operator-attested)**: signed create/verify/apply + read-only serving; automatic sync remains | — |

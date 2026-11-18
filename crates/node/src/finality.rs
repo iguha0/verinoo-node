@@ -85,6 +85,21 @@ impl FinalityManager {
         &self.local
     }
 
+    /// Adopt finalized history learned from a verified peer certificate.
+    ///
+    /// A late node must not sign votes for heights that are already final.
+    /// Dropping state and buffered votes at or below the adopted height makes
+    /// the next vote start at the current head instead of replaying history.
+    pub fn adopt_finalized(&mut self, height: u64, block_hash: &str) {
+        if height <= self.finalized_height {
+            return;
+        }
+        self.finalized_height = height;
+        self.finalized_hash = block_hash.to_string();
+        self.states.retain(|h, _| *h > height);
+        self.pending_votes.retain(|h, _| *h > height);
+    }
+
     pub fn observe_block(&mut self, height: u64, block_hash: &str) -> FinalityOutput {
         if height <= self.finalized_height || block_hash.is_empty() {
             return FinalityOutput::default();
@@ -202,5 +217,58 @@ impl FinalityManager {
             }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn validators(n: u8) -> (Vec<SigningKey>, Vec<String>) {
+        let keys: Vec<SigningKey> = (0..n)
+            .map(|i| SigningKey::from_bytes(&[i.saturating_add(1); 32]))
+            .collect();
+        let addresses = keys
+            .iter()
+            .map(|key| {
+                verinoo_consensus::public_key_to_address(&hex::encode(
+                    key.verifying_key().to_bytes(),
+                ))
+                .unwrap()
+            })
+            .collect();
+        (keys, addresses)
+    }
+
+    #[test]
+    fn adopt_finalized_stops_historical_votes_and_restarts_at_the_head() {
+        let (keys, addresses) = validators(4);
+        let mut manager = FinalityManager::new(
+            "test-chain",
+            addresses.clone(),
+            &addresses[0],
+            keys[0].clone(),
+            2,
+            "hash-2",
+            1_000,
+        )
+        .unwrap();
+
+        let before = manager.observe_block(3, "hash-3");
+        assert!(before.finalized.is_none());
+        assert!(!before.votes.is_empty());
+        assert!(before.votes.iter().all(|vote| vote.height == 3));
+
+        manager.adopt_finalized(5, "hash-5");
+        assert_eq!(manager.finalized_height(), 5);
+        assert_eq!(manager.finalized_hash(), "hash-5");
+
+        let stale = manager.observe_block(3, "hash-3");
+        assert!(stale.votes.is_empty());
+        assert!(stale.finalized.is_none());
+
+        let fresh = manager.observe_block(6, "hash-6");
+        assert!(!fresh.votes.is_empty());
+        assert!(fresh.votes.iter().all(|vote| vote.height == 6));
     }
 }
