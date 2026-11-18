@@ -18,6 +18,9 @@ pub const VERSION: u8 = 1;
 pub const VOTE_DOMAIN: &[u8] = b"verinoo/vote/v1\n";
 pub const PROPOSAL_DOMAIN: &[u8] = b"verinoo/proposal/v1\n";
 
+mod state;
+pub use state::*;
+
 pub fn quorum(n: usize) -> usize {
     n * 2 / 3 + 1
 }
