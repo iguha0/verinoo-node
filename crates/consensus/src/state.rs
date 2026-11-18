@@ -203,6 +203,31 @@ impl ConsensusState {
         Ok(())
     }
 
+    /// A block already validated/applied by the node acts as the round-0
+    /// proposal. The block header signature is the producer authentication;
+    /// no separate proposal envelope is needed for this single-producer
+    /// finality layer. Returns the prevote intent (or nil when locked).
+    pub fn on_validated_block(&mut self, block_hash: &str) -> Vec<Action> {
+        if block_hash.is_empty() || block_hash.len() > 128 {
+            return Vec::new();
+        }
+        let hash = match &self.locked {
+            Some(lock) if lock.height == self.height && lock.block_hash != block_hash => {
+                String::new()
+            }
+            _ => block_hash.to_string(),
+        };
+        self.emit_vote(VoteKind::Prevote, self.height, self.round, hash)
+    }
+
+    /// Restore finality metadata from the canonical store on restart.
+    pub fn restore_finalized(&mut self, height: u64, hash: &str) {
+        if height >= self.finalized_height {
+            self.finalized_height = height;
+            self.finalized_hash = hash.to_string();
+        }
+    }
+
     pub fn on_proposal(&mut self, proposal: &Proposal, block_valid: bool) -> Vec<Action> {
         if proposal.height != self.height || proposal.round != self.round {
             return Vec::new();
