@@ -4,11 +4,13 @@
 //! vote, broadcasts it, and feeds it back through `on_vote`. This keeps the
 //! transition logic pure and testable without sockets or wall clocks.
 
-use super::{public_key_to_address, quorum, CommitCertificate, Evidence, Proposal, Vote, VoteKind};
+use super::{
+    public_key_to_address, quorum, CommitCertificate, Evidence, Pacemaker, Proposal, Schedule,
+    Vote, VoteKind,
+};
 use std::collections::{HashMap, HashSet};
 
-pub const DEFAULT_MAX_ROUND: u64 = 8;
-pub const DEFAULT_MAX_TIMEOUT_MS: u64 = 60_000;
+const MAX_BLOCK_HASH_LEN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteIntent {
@@ -24,6 +26,7 @@ pub enum Action {
     Vote(VoteIntent),
     /// Re-broadcast a previously persisted own vote verbatim.
     Rebroadcast(Vote),
+    /// Arm the round timer for `(height, round)` with `timeout_ms`.
     StartRound {
         height: u64,
         round: u64,
@@ -50,8 +53,7 @@ pub struct ConsensusState {
     validators: Vec<String>,
     local: String,
     quorum: usize,
-    height: u64,
-    round: u64,
+    pacemaker: Pacemaker,
     finalized_height: u64,
     finalized_hash: String,
     locked: Option<Lock>,
@@ -61,8 +63,6 @@ pub struct ConsensusState {
     evidence: Vec<Evidence>,
     evidence_ids: HashSet<String>,
     certificate: Option<CommitCertificate>,
-    base_timeout_ms: u64,
-    max_round: u64,
 }
 
 impl ConsensusState {
@@ -86,13 +86,14 @@ impl ConsensusState {
             return Err("local validator is not in the consensus set".into());
         }
         let q = quorum(validators.len());
+        let mut pacemaker = Pacemaker::new(base_timeout_ms);
+        pacemaker.start_height(start_height.max(1));
         Ok(Self {
             chain_id: chain_id.to_string(),
             validators,
             local: local.to_string(),
             quorum: q,
-            height: start_height.max(1),
-            round: 0,
+            pacemaker,
             finalized_height: 0,
             finalized_hash: String::new(),
             locked: None,
@@ -102,8 +103,6 @@ impl ConsensusState {
             evidence: Vec::new(),
             evidence_ids: HashSet::new(),
             certificate: None,
-            base_timeout_ms: base_timeout_ms.max(1),
-            max_round: DEFAULT_MAX_ROUND,
         })
     }
 
@@ -120,10 +119,16 @@ impl ConsensusState {
         self.quorum
     }
     pub fn height(&self) -> u64 {
-        self.height
+        self.pacemaker.height()
     }
     pub fn round(&self) -> u64 {
-        self.round
+        self.pacemaker.current_round()
+    }
+    pub fn current_round(&self) -> u64 {
+        self.pacemaker.current_round()
+    }
+    pub fn max_round(&self) -> u64 {
+        self.pacemaker.max_round()
     }
     pub fn finalized_height(&self) -> u64 {
         self.finalized_height
@@ -148,32 +153,63 @@ impl ConsensusState {
     }
 
     pub fn is_leader(&self) -> bool {
-        self.local == self.leader_for(self.height, self.round)
+        self.local == self.leader_for(self.height(), self.round())
     }
 
+    /// Timeout for the current round.
     pub fn timeout_ms(&self) -> u64 {
-        let mut out = self.base_timeout_ms;
-        for _ in 0..self.round {
-            out = out.saturating_mul(3) / 2;
-            if out >= DEFAULT_MAX_TIMEOUT_MS {
-                return DEFAULT_MAX_TIMEOUT_MS;
-            }
+        self.pacemaker.timeout_ms()
+    }
+
+    /// Timeout for an explicit round under the same deterministic backoff.
+    pub fn timeout_ms_for(&self, round: u64) -> u64 {
+        self.pacemaker.timeout_ms_at(round)
+    }
+
+    /// Timer instruction for the node's timer actor.
+    pub fn schedule(&self) -> Schedule {
+        self.pacemaker.schedule()
+    }
+
+    /// Explicitly enter `(height, round)` after a restart, catch-up, or sync.
+    /// This does not emit a vote; the node waits for the round leader's
+    /// proposal or calls `on_timeout`.
+    pub fn start_round(&mut self, height: u64, round: u64) -> Result<Vec<Action>, String> {
+        if height <= self.finalized_height {
+            return Err("cannot start a round at or below the finalized height".into());
         }
-        out
+        self.reset_for_height(height, round);
+        Ok(vec![Action::StartRound {
+            height,
+            round,
+            timeout_ms: self.timeout_ms(),
+        }])
     }
 
     /// Restore a signed own vote after restart. The node persists these before
     /// broadcasting; the state machine will not sign a conflicting vote for the
-    /// same `(height, round, kind)`.
+    /// same `(height, round, kind)` and refuses conflicting restores.
     pub fn restore_own_vote(&mut self, vote: Vote) -> Result<(), String> {
         vote.verify_with_chain(&self.chain_id, &self.validators)
             .map_err(|e| e.to_string())?;
         if vote.validator != self.local {
             return Err("restored vote is not from the local validator".into());
         }
-        self.pending.remove(&(vote.height, vote.round, vote.kind));
-        self.own_votes
-            .insert((vote.height, vote.round, vote.kind), vote.clone());
+        if vote.height <= self.finalized_height {
+            return Err("restored vote is at or below the finalized height".into());
+        }
+        let key = (vote.height, vote.round, vote.kind);
+        if let Some(existing) = self.own_votes.get(&key) {
+            if existing.block_hash != vote.block_hash
+                || existing.signature != vote.signature
+                || existing.public_key != vote.public_key
+                || existing.chain_id != vote.chain_id
+            {
+                return Err("conflicting own vote for the same height, round, and kind".into());
+            }
+        }
+        self.pending.remove(&key);
+        self.own_votes.insert(key, vote.clone());
         self.votes.insert(
             (vote.height, vote.round, vote.kind, vote.validator.clone()),
             vote,
@@ -190,16 +226,10 @@ impl ConsensusState {
         if height <= self.finalized_height {
             return Err("next height must be above the finalized height".into());
         }
-        if height <= self.height {
+        if height <= self.height() {
             return Err("next height must increase".into());
         }
-        self.height = height;
-        self.round = 0;
-        self.locked = None;
-        self.votes.clear();
-        self.own_votes.clear();
-        self.pending.clear();
-        self.certificate = None;
+        self.reset_for_height(height, 0);
         Ok(())
     }
 
@@ -208,58 +238,69 @@ impl ConsensusState {
     /// no separate proposal envelope is needed for this single-producer
     /// finality layer. Returns the prevote intent (or nil when locked).
     pub fn on_validated_block(&mut self, block_hash: &str) -> Vec<Action> {
-        if block_hash.is_empty() || block_hash.len() > 128 {
+        if !valid_block_hash(block_hash) {
             return Vec::new();
         }
-        let hash = match &self.locked {
-            Some(lock) if lock.height == self.height && lock.block_hash != block_hash => {
-                String::new()
-            }
-            _ => block_hash.to_string(),
+        let round = self.round();
+        let hash = if self.lock_allows(block_hash, round) {
+            block_hash.to_string()
+        } else {
+            String::new()
         };
-        self.emit_vote(VoteKind::Prevote, self.height, self.round, hash)
+        self.emit_vote(VoteKind::Prevote, self.height(), round, hash)
     }
 
     /// Restore finality metadata from the canonical store on restart.
     pub fn restore_finalized(&mut self, height: u64, hash: &str) {
-        if height >= self.finalized_height {
-            self.finalized_height = height;
-            self.finalized_hash = hash.to_string();
+        if height < self.finalized_height {
+            return;
+        }
+        self.finalized_height = height;
+        self.finalized_hash = hash.to_string();
+        self.votes.retain(|(h, _, _, _), _| *h > height);
+        self.own_votes.retain(|(h, _, _), _| *h > height);
+        self.pending.retain(|(h, _, _)| *h > height);
+        if self
+            .locked
+            .as_ref()
+            .is_some_and(|lock| lock.height <= height)
+        {
+            self.locked = None;
         }
     }
 
+    /// Handle a round-change proposal. Only the elected leader for the current
+    /// `(height, round)` can propose, and the envelope signature, chain id,
+    /// height, round, and block hash must all be valid. An invalid or locked-out
+    /// proposal produces a nil prevote; a stale or future proposal is ignored.
     pub fn on_proposal(&mut self, proposal: &Proposal, block_valid: bool) -> Vec<Action> {
-        if proposal.height != self.height || proposal.round != self.round {
+        let height = self.height();
+        let round = self.round();
+        if proposal.height <= self.finalized_height || proposal.height != height {
             return Vec::new();
         }
-        if proposal.proposer != self.leader_for(proposal.height, proposal.round) {
-            return self.emit_vote(VoteKind::Prevote, self.height, self.round, String::new());
+        if proposal.round != round {
+            return Vec::new();
         }
-        if proposal
-            .verify_with_chain(&self.chain_id, &self.validators)
-            .is_err()
-        {
-            return self.emit_vote(VoteKind::Prevote, self.height, self.round, String::new());
-        }
-        let hash = if block_valid && !proposal.block_hash.is_empty() {
-            let locked_blocks = self.locked.as_ref().is_some_and(|lock| {
-                lock.height == self.height
-                    && lock.block_hash != proposal.block_hash
-                    && proposal.round <= lock.round
-            });
-            if locked_blocks {
-                String::new()
-            } else {
-                proposal.block_hash.clone()
-            }
+        let valid = block_valid
+            && valid_block_hash(&proposal.block_hash)
+            && proposal.proposer == self.leader_for(height, round)
+            && proposal
+                .verify_with_chain(&self.chain_id, &self.validators)
+                .is_ok();
+        let hash = if valid && self.lock_allows(&proposal.block_hash, round) {
+            proposal.block_hash.clone()
         } else {
             String::new()
         };
-        self.emit_vote(VoteKind::Prevote, self.height, self.round, hash)
+        self.emit_vote(VoteKind::Prevote, height, round, hash)
     }
 
     pub fn on_vote(&mut self, vote: &Vote) -> Vec<Action> {
-        if vote.height != self.height || vote.round != self.round {
+        if vote.height <= self.finalized_height {
+            return Vec::new();
+        }
+        if vote.height != self.height() || vote.round != self.round() {
             return Vec::new();
         }
         if vote
@@ -291,79 +332,139 @@ impl ConsensusState {
                 .insert((vote.height, vote.round, vote.kind), vote.clone());
         }
 
-        let mut actions = Vec::new();
-        if vote.kind == VoteKind::Prevote {
-            self.apply_unlock_rule();
-            if let Some(hash) = self.quorum_hash(VoteKind::Prevote, vote.round) {
-                if !hash.is_empty() {
-                    let should_lock = self
-                        .locked
-                        .as_ref()
-                        .is_none_or(|lock| lock.block_hash != hash || lock.round < vote.round);
-                    if should_lock {
-                        self.locked = Some(Lock {
-                            height: self.height,
-                            block_hash: hash.clone(),
-                            round: vote.round,
-                        });
-                    }
-                }
-                actions.extend(self.emit_vote(VoteKind::Precommit, self.height, vote.round, hash));
-            }
-        } else if vote.kind == VoteKind::Precommit {
-            if let Some(hash) = self.quorum_hash(VoteKind::Precommit, vote.round) {
-                if !hash.is_empty()
-                    && self
-                        .locked
-                        .as_ref()
-                        .is_none_or(|lock| lock.block_hash == hash)
-                {
-                    let certificate = self.build_certificate(&hash, vote.round);
-                    self.finalized_height = self.height;
-                    self.finalized_hash = hash.clone();
-                    self.certificate = Some(certificate.clone());
-                    actions.push(Action::Finalized {
-                        height: self.height,
-                        block_hash: hash,
-                        certificate,
-                    });
-                }
-            }
+        match vote.kind {
+            VoteKind::Prevote => self.on_prevote_quorum(vote.round),
+            VoteKind::Precommit => self.on_precommit_quorum(vote.round),
         }
-        actions
     }
 
+    /// Phase/round timeout: nil-prevote the round that timed out, then advance
+    /// exactly one round and schedule its timer. Rounds keep advancing past
+    /// `R_MAX` with the capped timeout.
     pub fn on_timeout(&mut self) -> Vec<Action> {
-        if self.round >= self.max_round {
+        if self.height() <= self.finalized_height {
             return Vec::new();
         }
-        self.round += 1;
+        let timed_out_round = self.round();
+        let height = self.height();
+        let mut actions = self.emit_vote(VoteKind::Prevote, height, timed_out_round, String::new());
         self.pending.clear();
-        let mut actions = vec![Action::StartRound {
-            height: self.height,
-            round: self.round,
+        self.pacemaker.on_timeout();
+        actions.push(Action::StartRound {
+            height,
+            round: self.round(),
             timeout_ms: self.timeout_ms(),
-        }];
-        actions.extend(self.emit_vote(VoteKind::Prevote, self.height, self.round, String::new()));
+        });
         actions
     }
 
-    fn apply_unlock_rule(&mut self) {
-        let lock = match &self.locked {
-            Some(lock) => lock.clone(),
-            None => return,
+    fn reset_for_height(&mut self, height: u64, round: u64) {
+        self.pacemaker.start_round(height, round);
+        self.votes.clear();
+        self.pending.clear();
+        self.locked = None;
+        self.certificate = None;
+        self.own_votes
+            .retain(|(h, _, _), _| *h > self.finalized_height);
+    }
+
+    /// Tendermint lock rule: a proposal at `round` may be prevoted when there
+    /// is no lock, the lock is for a different (older) height, the hash
+    /// matches, or the new round is strictly above the locked round.
+    fn lock_allows(&self, block_hash: &str, round: u64) -> bool {
+        match &self.locked {
+            None => true,
+            Some(lock) if lock.height < self.height() => true,
+            Some(lock) if lock.height == self.height() => {
+                lock.block_hash == block_hash || round > lock.round
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// A precommit certificate is authoritative. A lock from an earlier round
+    /// is unlocked by a certificate from a later round; only a same-round
+    /// conflicting lock blocks finality (which would imply more than f faulty
+    /// validators).
+    fn finality_allowed(&self, block_hash: &str, round: u64) -> bool {
+        match &self.locked {
+            None => true,
+            Some(lock) if lock.height < self.height() => true,
+            Some(lock) if lock.height == self.height() => {
+                lock.block_hash == block_hash || round > lock.round
+            }
+            Some(_) => false,
+        }
+    }
+
+    fn on_prevote_quorum(&mut self, round: u64) -> Vec<Action> {
+        let Some(hash) = self.quorum_hash(VoteKind::Prevote, round) else {
+            return Vec::new();
         };
-        if let Some(hash) = self.quorum_hash(VoteKind::Prevote, self.round) {
-            if self.round > lock.round && !hash.is_empty() && hash != lock.block_hash {
-                self.locked = None;
+        let height = self.height();
+        let own = self
+            .own_votes
+            .get(&(height, round, VoteKind::Prevote))
+            .cloned();
+        match own {
+            Some(vote) if vote.block_hash == hash => {
+                if !hash.is_empty() && self.lock_allows(&hash, round) {
+                    self.locked = Some(Lock {
+                        height,
+                        block_hash: hash.clone(),
+                        round,
+                    });
+                    return self.emit_vote(VoteKind::Precommit, height, round, hash);
+                }
+                if hash.is_empty() {
+                    return self.emit_vote(VoteKind::Precommit, height, round, hash);
+                }
+                Vec::new()
+            }
+            // Never precommit a hash that differs from our own prevote.
+            Some(_) => Vec::new(),
+            None => {
+                let hash = if hash.is_empty() || self.lock_allows(&hash, round) {
+                    hash
+                } else {
+                    return Vec::new();
+                };
+                self.emit_vote(VoteKind::Prevote, height, round, hash)
             }
         }
+    }
+
+    fn on_precommit_quorum(&mut self, round: u64) -> Vec<Action> {
+        let Some(hash) = self.quorum_hash(VoteKind::Precommit, round) else {
+            return Vec::new();
+        };
+        if hash.is_empty() || !self.finality_allowed(&hash, round) {
+            return Vec::new();
+        }
+        let height = self.height();
+        if self.lock_allows(&hash, round) {
+            self.locked = Some(Lock {
+                height,
+                block_hash: hash.clone(),
+                round,
+            });
+        }
+        let certificate = self.build_certificate(&hash, round);
+        self.finalized_height = height;
+        self.finalized_hash = hash.clone();
+        self.certificate = Some(certificate.clone());
+        vec![Action::Finalized {
+            height,
+            block_hash: hash,
+            certificate,
+        }]
     }
 
     fn quorum_hash(&self, kind: VoteKind, round: u64) -> Option<String> {
+        let height = self.height();
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for ((height, vote_round, vote_kind, _), vote) in &self.votes {
-            if *height == self.height && *vote_round == round && *vote_kind == kind {
+        for ((vote_height, vote_round, vote_kind, _), vote) in &self.votes {
+            if *vote_height == height && *vote_round == round && *vote_kind == kind {
                 *counts.entry(vote.block_hash.as_str()).or_default() += 1;
             }
         }
@@ -374,11 +475,12 @@ impl ConsensusState {
     }
 
     fn build_certificate(&self, hash: &str, round: u64) -> CommitCertificate {
+        let height = self.height();
         let mut votes: Vec<Vote> = self
             .votes
             .iter()
-            .filter(|((height, vote_round, kind, _), vote)| {
-                *height == self.height
+            .filter(|((vote_height, vote_round, kind, _), vote)| {
+                *vote_height == height
                     && *vote_round == round
                     && *kind == VoteKind::Precommit
                     && vote.block_hash == hash
@@ -388,7 +490,7 @@ impl ConsensusState {
         votes.sort_by(|a, b| a.validator.cmp(&b.validator));
         CommitCertificate {
             chain_id: self.chain_id.clone(),
-            height: self.height,
+            height,
             round,
             block_hash: hash.to_string(),
             votes,
@@ -422,6 +524,10 @@ impl ConsensusState {
     pub fn local_address_for_key(public_key: &str) -> Result<String, String> {
         public_key_to_address(public_key).map_err(|e| e.to_string())
     }
+}
+
+fn valid_block_hash(block_hash: &str) -> bool {
+    !block_hash.is_empty() && block_hash.len() <= MAX_BLOCK_HASH_LEN
 }
 
 #[cfg(test)]
@@ -530,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_starts_next_round_with_nil_prevote() {
+    fn timeout_nil_prevotes_the_timed_out_round_and_starts_the_next() {
         let (mut state, keys) = setup();
         let local = state.local().to_string();
         let actions = state.on_timeout();
@@ -540,7 +646,7 @@ mod tests {
             .any(|a| matches!(a, Action::StartRound { round: 1, .. })));
         let prevote = intent(&actions).expect("nil prevote");
         assert_eq!(prevote.kind, VoteKind::Prevote);
-        assert_eq!(prevote.round, 1);
+        assert_eq!(prevote.round, 0);
         assert_eq!(prevote.block_hash, "");
         state.on_vote(&sign_intent(&keys, &local, &prevote));
     }
@@ -600,9 +706,12 @@ mod tests {
                 state.on_vote(&sign_intent(&keys, &local, &p));
             }
         }
+        assert_eq!(state.lock().unwrap().block_hash, "a");
+        assert_eq!(state.lock().unwrap().round, 0);
         let proposal_b = Proposal::sign("chain", 1, 0, "b", &leader, find_key(&keys, &leader));
         let actions = state.on_proposal(&proposal_b, true);
         assert!(actions.iter().any(|a| matches!(a, Action::Rebroadcast(_))));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Vote(_))));
     }
 
     #[test]

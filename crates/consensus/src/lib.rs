@@ -1,11 +1,37 @@
-//! Signed BFT message types and verification.
+//! Signed BFT message types, verification, and the pure round/view-change
+//! state machine.
 //!
-//! This crate is intentionally stateless: it defines proposals, prevotes,
-//! precommits, commit certificates, and equivocation evidence, plus the
-//! signature and quorum checks over them. Round driving lives elsewhere.
+//! The crate defines proposals, prevotes, precommits, commit certificates,
+//! equivocation evidence, signature/quorum checks, and two pure machines:
 //!
-//! See `docs/adr/004-bft-finality.md`, sections "Messages and phases" and
-//! "Wire format and gossipsub topics".
+//! - [`Pacemaker`] owns `(height, round)` and the deterministic
+//!   `base * 1.5^round` timeout backoff capped at [`R_MAX`]. It has no wall
+//!   clock and emits [`Schedule`] values for the node's timer actor.
+//! - [`ConsensusState`] owns round/lock/vote state. It accepts round-leader
+//!   proposals, applies the Tendermint lock rule, emits vote intentions and
+//!   `StartRound` actions, and finalizes on a precommit quorum.
+//!
+//! See `docs/adr/004-bft-finality.md`, sections "Messages and phases",
+//! "Lock and unlock rules", and "Wire format and gossipsub topics".
+//!
+//! # Remaining node work (not in this crate)
+//!
+//! This is the pure core only; it does not by itself provide live liveness.
+//! The node must still:
+//!
+//! - gossip proposal envelopes and route them to [`ConsensusState::on_proposal`];
+//! - run a timer actor that arms/cancels from [`Schedule`] or
+//!   [`Action::StartRound`] and calls [`ConsensusState::on_timeout`] when a
+//!   round expires;
+//! - persist and restore own votes per `(height, round, kind)` via
+//!   [`ConsensusState::restore_own_vote`] before broadcasting;
+//! - gate head advancement on [`Action::Finalized`] / a verified commit
+//!   certificate (commit gating) instead of applying a produced block
+//!   directly;
+//! - wire round-aware proposal validation and peer/rate limits.
+//!
+//! Until the node does those, an offline round-0 leader still stalls the live
+//! network even though this crate can move rounds in-process.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -18,7 +44,9 @@ pub const VERSION: u8 = 1;
 pub const VOTE_DOMAIN: &[u8] = b"verinoo/vote/v1\n";
 pub const PROPOSAL_DOMAIN: &[u8] = b"verinoo/proposal/v1\n";
 
+mod pacemaker;
 mod state;
+pub use pacemaker::*;
 pub use state::*;
 
 pub fn quorum(n: usize) -> usize {
