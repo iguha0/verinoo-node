@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (243 tests) |
+| Test suite | green | `cargo test --workspace --locked` (274 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -37,7 +37,7 @@ claims a technical buyer will test in the first diligence call.
 | SDKs | works | `sdk/typescript` (8 tests), `sdk/python` (8 tests), live-tested against an encrypted node |
 | Block-time override | works | `VNN_BLOCK_TIME_MS=1000` gives ~1–2 s task latency; network-wide setting |
 | Attention kernel | prototype | Q16.16 single/multi-head, 6 tests; not wired into model loading (`docs/transformer.md`) |
-| BFT finality | design only | `docs/adr/004-bft-finality.md`; no code |
+| BFT finality | works (certificate layer) | 2/3+1 prevote/precommit certificates, evidence, 4-validator live cluster; no view-change/offline-leader liveness |
 | Result commitment | works | state root covers every executed output |
 | Receipts + verification | works | `/v1/verify` recompute, live 2-node run |
 | Metering | works | `/v1/usage`, CSV export |
@@ -74,9 +74,11 @@ claims a technical buyer will test in the first diligence call.
    unsupported. On the 1-CPU VPS DistilGPT-2 is slower than a 1 s consensus block, so
    the public node still serves the small demo. Dense classifiers from ONNX/GGUF
    continue to work. This is the main product gap.
-2. **No finality.** `RoundRobin` selects producers; there are no prevote /
-   precommit rounds, so a block is only as final as the single producer's
-   signature. No equivocation slashing in the live path.
+2. **Partial finality.** `VNN_CONSENSUS=bft` adds signed prevotes/precommits,
+   a 2/3+1 commit certificate, persisted finality and equivocation evidence.
+   Block production is still single-producer round-robin: there is no
+   view-change for an offline leader, no certificate-aware catch-up, and no
+   slashing/removal. The default is legacy; the live testnet is single-validator.
 3. **The dispute game is not live over RPC for a real model.** With consensus
    re-execution, verification is recomputation and there is nothing to dispute
    in the deterministic path. The game that exists targets the manual-claim
@@ -202,7 +204,11 @@ claims a technical buyer will test in the first diligence call.
 - `GET /ready` with `syncing`, peer lag, a canonical validator-set hash and
   fail-closed `validatorSetConsistent`; `/status` exposes the same fields.
   Automatic failover/fencing and snapshot sync remain unimplemented.
-- A BFT finality design (`docs/adr/004-bft-finality.md`). Not implemented.
+- Quorum finality (`VNN_CONSENSUS=bft`): signed prevotes/precommits over
+  validated blocks, 2/3+1 commit certificates, `finalizedHeight`/`finalizedHash`
+  in `/status`, persisted certificates and equivocation evidence. A four-node
+  local cluster finalized the same head. View-change liveness, finalized sync
+  and slashing remain unimplemented; the live node is single-validator.
 
 ## Verified end-to-end (2-node product run)
 
@@ -302,7 +308,7 @@ domain still belong to the older reference node.
 | ~~Block catch-up sync~~ | **done**: `/blocks/since`, `VNN_SYNC_URLS`, validated replay (`scripts/demo-sync.sh`) | — |
 | ~~Backups, restore, key rotation, incident runbook~~ | **done**: `scripts/backup.sh`, [`docs/operations.md`](operations.md) | — |
 | Dispute game live for a real model | commit layer specs/weights at model registration; replace `get_layer_spec` | 2–3 wk |
-| Finality or honest framing | Malachite adapter **or** document "operator-attested with economic recourse" | 4–6 wk / 1 wk |
+| ~~Finality certificate layer~~ | **done (partial)**: quorum votes/certificates/evidence; view-change, certified sync, slashing remain | — |
 | Public multi-party ceremony | external contributors to powers-of-tau | 2 wk + coordination |
 | Automatic HA / validator removal | failover, split-brain protection, on-chain set changes | 2–3 wk |
 | ~~State snapshot transfer~~ | **done (operator-attested)**: signed create/verify/apply + read-only serving; automatic sync remains | — |
@@ -323,7 +329,7 @@ domain still belong to the older reference node.
 
 ## Do not claim
 
-- "Trustless" — there is one operator and no BFT.
+- "Trustless" — there is one operator. BFT finality certificates require independent validators to be meaningful.
 - "Verified inference for any model" — only the supported runtimes execute
   deterministically: dense/relu/softmax graphs, a transformer encoder
   classifier, and GPT-2/GPT-Neo decoders including an imported 81.9M

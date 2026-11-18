@@ -1,7 +1,7 @@
 # Operations runbook
 
 Scope: a single-validator testnet or a small dedicated pilot network. This is
-the operational layer around `verinoo-node`; it does not claim BFT or HA.
+the operational layer around `verinoo-node`; it documents the optional BFT certificate layer, but not view-change liveness or HA.
 
 ## Layout on a VPS
 
@@ -301,7 +301,7 @@ Full threat model: [`docs/privacy.md`](privacy.md).
 `VNN_BLOCK_TIME_MS` overrides the chain's default interval and must be identical
 on every validator. A single-validator demo at `1000` gives roughly 1–2 s task
 latency; the two- and multi-validator safety story is unchanged (still
-round-robin, no BFT). Changing it does not change state. The same effective
+round-robin; optional BFT finality certificates, but no view changes). Changing it does not change state. The same effective
 interval drives the `/ready` staleness threshold.
 
 ## Readiness (`/ready`)

@@ -6,7 +6,7 @@ optimistic inference verification.**
 Status: **testnet node with a working verifiable-inference vertical slice.**
 Single- and multi-validator testnets run, and inference tasks are executed by
 consensus against a real (small) model with on-chain receipts and a
-verification endpoint. Consensus is still round-robin with no BFT finality.
+verification endpoint. Consensus block production is round-robin; `VNN_CONSENSUS=bft` adds quorum finality certificates over validated blocks (no view-change liveness).
 Models come from the compiled-in reference classifier, operator graph models
 loaded from `VNN_MODEL_DIR`, and a transformer encoder classifier
 (`intent-transformer-v1`). Dense/relu/softmax classifiers convert from ONNX
@@ -28,7 +28,7 @@ decoder demo, not DistilGPT-2. See
 [`docs/transformer.md`](docs/transformer.md),
 [`docs/decoder.md`](docs/decoder.md) and
 [`docs/adr/004-bft-finality.md`](docs/adr/004-bft-finality.md) for the
-transformer runtimes and the BFT design.
+transformer runtimes and the BFT finality layer.
 
 | Crate | Purpose |
 |---|---|
@@ -127,6 +127,7 @@ Reproduce a two-validator consensus + independent-verification run locally:
 | `VNN_POLICY_FILE` | *(none)* | node-local request policy JSON; invalid or missing file fails startup |
 | `VNN_BLOCK_TIME_MS` | chain default (10 000) | block interval; identical on every validator |
 | `VNN_PEER_LAG_BLOCKS` | `2` | allowed lag behind the best valid sync peer before `/ready` fails |
+| `VNN_CONSENSUS` | `legacy` | `legacy` or `bft`; bft adds prevote/precommit certificates and requires a validator set |
 
 Catch-up: a node that starts late or falls behind replays validated blocks from
 `VNN_SYNC_URLS`. Peer heights are only used when the peer reports the same
@@ -139,7 +140,7 @@ keep `/ready` failing. Proof: `./scripts/demo-sync.sh`.
 |---|---|
 | `GET /health` | liveness + head age + validator count |
 | `GET /ready` | readiness probe: 200 only when fresh, caught up, and the validator set is consistent |
-| `GET /status` | chain id, height, head hash, mempool depth, validator-set consistency |
+| `GET /status` | chain id, height, head hash, finalized height/hash, consensus mode, mempool depth, validator-set consistency |
 | `GET /metrics` | height, head age, mempool, validator count |
 | `GET /blocks` | latest 20 blocks |
 | `GET /blocks/since/:index` | up to 200 blocks after `index` (catch-up sync) |
