@@ -34,7 +34,7 @@ pub enum Action {
         block_hash: String,
         certificate: CommitCertificate,
     },
-    Evidence(Evidence),
+    Evidence(Box<Evidence>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +253,7 @@ impl ConsensusState {
                     let id = evidence.id();
                     if self.evidence_ids.insert(id) {
                         self.evidence.push(evidence.clone());
-                        return vec![Action::Evidence(evidence)];
+                        return vec![Action::Evidence(Box::new(evidence))];
                     }
                 }
             }
