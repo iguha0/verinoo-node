@@ -15,6 +15,7 @@ verinoo-exec = { path = "../exec" }
 verinoo-network = { path = "../network" }
 verinoo-model = { path = "../model" }
 verinoo-runtime = { path = "../runtime" }
+verinoo-consensus = { path = "../consensus" }
 verinoo-crypto = { path = "../crypto" }
 verinoo-policy = { path = "../policy" }
 axum = "0.7"

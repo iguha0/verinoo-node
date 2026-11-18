@@ -6,6 +6,7 @@
 //! rejection, per-tx canonical + signature checks).
 
 mod auth;
+mod finality;
 mod policy_gate;
 mod readiness;
 mod rpc;
@@ -63,6 +64,10 @@ pub struct Shared {
     /// Optional directory served by `GET /snapshot/manifest` and
     /// `GET /snapshot/files/*path`. Reads are public chain state.
     pub snapshot_dir: Option<PathBuf>,
+    /// BFT finality certificate manager. `None` in legacy mode.
+    pub finality: Option<tokio::sync::Mutex<finality::FinalityManager>>,
+    /// `legacy` or `bft` (VNN_CONSENSUS).
+    pub consensus_mode: String,
     policy: std::sync::Mutex<Policy>,
 }
 
@@ -166,6 +171,68 @@ impl Shared {
     pub fn validator_set_hash(&self) -> String {
         readiness::validator_set_hash(&self.effective_validator_set())
     }
+    pub async fn finality_observe(&self, net: &NetworkNodeAlias, block: &Block) {
+        let Some(manager) = &self.finality else {
+            return;
+        };
+        let output = {
+            let mut manager = manager.lock().await;
+            manager.observe_block(block.header.index, &block.header.hash)
+        };
+        self.apply_finality_output(net, output).await;
+    }
+
+    pub async fn finality_vote(&self, net: &NetworkNodeAlias, vote: verinoo_consensus::Vote) {
+        let Some(manager) = &self.finality else {
+            return;
+        };
+        let output = {
+            let mut manager = manager.lock().await;
+            manager.on_vote(&vote)
+        };
+        self.apply_finality_output(net, output).await;
+    }
+
+    async fn apply_finality_output(
+        &self,
+        net: &NetworkNodeAlias,
+        output: finality::FinalityOutput,
+    ) {
+        for vote in output.votes {
+            let kind = vote.kind.as_str();
+            self.store.set_meta(
+                &format!("consensusOwnVote:{}:{}:{}", vote.height, vote.round, kind),
+                &serde_json::to_value(&vote).expect("vote serialize"),
+            );
+            net.publish_vote(&serde_json::to_string(&vote).expect("vote serialize"));
+        }
+        for evidence in output.evidence {
+            let id = evidence.id();
+            self.store.set_meta(
+                &format!("evid:{id}"),
+                &serde_json::to_value(&evidence).expect("evidence serialize"),
+            );
+            tracing::warn!(
+                height = evidence.height,
+                validator = %evidence.validator,
+                "equivocation evidence recorded"
+            );
+        }
+        if let Some((height, block_hash, certificate)) = output.finalized {
+            self.store.set_meta_u64("finalizedHeight", height);
+            self.store
+                .set_meta("finalizedHash", &serde_json::json!(block_hash));
+            self.store.set_meta(
+                &format!("commit:{height}"),
+                &serde_json::to_value(&certificate).expect("certificate serialize"),
+            );
+            tracing::info!(
+                "finalized block #{height} {}",
+                &block_hash[..16.min(block_hash.len())]
+            );
+        }
+    }
+
     pub fn best_peer_height(&self) -> Option<u64> {
         match self.best_peer_height.load(Ordering::Relaxed) {
             0 => None,
@@ -194,7 +261,7 @@ fn admit_block(shared: &Shared, block: &Block) -> Result<(), String> {
 }
 
 /// Persist + execute an admitted block.
-fn commit_block(shared: &Shared, block: &Block, producer_address: &str) {
+fn commit_block(shared: &Shared, block: &Block, producer_address: &str) -> bool {
     shared.store.put_block_by_hash(
         &block.header.hash,
         &serde_json::to_value(block).expect("block serialize"),
@@ -206,7 +273,7 @@ fn commit_block(shared: &Shared, block: &Block, producer_address: &str) {
         verinoo_exec::engine::apply_block(&shared.store, block, base_fee, producer_address)
     {
         tracing::error!("apply failed after admission: {e}");
-        return;
+        return false;
     }
     // Execute-by-consensus check: the block's state root must commit to the
     // outputs this node derived. A missing model file or a divergent runtime
@@ -219,9 +286,10 @@ fn commit_block(shared: &Shared, block: &Block, producer_address: &str) {
             "state root mismatch at #{} (ours {ours}, block {theirs}) — model set differs? refusing to advance",
             block.header.index
         );
-        return;
+        return false;
     }
     set_head(&shared.store, block);
+    true
 }
 
 /// Put transactions the producer skipped only for gas back at the front of the
@@ -323,6 +391,7 @@ async fn validator_loop(
                     &block.header.hash[..16.min(block.header.hash.len())]
                 );
                 net.publish_block(&serde_json::to_string(&block).expect("block serialize"));
+                shared.finality_observe(&net, &block).await;
             }
             Err(e) => {
                 shared.mempool.lock().await.extend(batch);
@@ -597,6 +666,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_config.require_plaintext,
     );
 
+    let consensus_mode = std::env::var("VNN_CONSENSUS").unwrap_or_else(|_| "legacy".into());
+    if consensus_mode != "legacy" && consensus_mode != "bft" {
+        return Err(
+            format!("VNN_CONSENSUS must be `legacy` or `bft`, got `{consensus_mode}`").into(),
+        );
+    }
+    if consensus_mode == "bft" && !validator {
+        return Err("VNN_CONSENSUS=bft requires VNN_VALIDATOR=true".into());
+    }
+    let finalized_height = store.meta_u64_or("finalizedHeight", 0);
+    let finalized_hash = store
+        .get_meta("finalizedHash")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let finality = if consensus_mode == "bft" {
+        Some(tokio::sync::Mutex::new(finality::FinalityManager::new(
+            &cfg.genesis.chain_id,
+            cfg.genesis.validators.clone(),
+            &own_address,
+            ed25519_dalek::SigningKey::from_bytes(&key_seed),
+            finalized_height,
+            &finalized_hash,
+            block_time_ms.saturating_mul(2),
+        )?))
+    } else {
+        None
+    };
+
     let shared = Arc::new(Shared {
         store,
         params: cfg.genesis.clone(),
@@ -610,6 +707,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_policy,
         task_streams: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_TASK_STREAMS)),
         snapshot_dir,
+        finality,
+        consensus_mode,
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
@@ -707,8 +806,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Event pump consumes the wire stream.
     let pump_shared = shared.clone();
+    let pump_net = net.clone();
     tokio::spawn(async move {
         let shared = pump_shared;
+        let net = pump_net;
         while let Some(ev) = event_rx.recv().await {
             match ev {
                 NetworkEvent::Tx(payload) => {
@@ -742,7 +843,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         block.header.index,
                                         &producer[..12.min(producer.len())]
                                     );
-                                    commit_block(&shared, &block, &producer);
+                                    if commit_block(&shared, &block, &producer) {
+                                        shared.finality_observe(&net, &block).await;
+                                    }
                                 }
                                 Err(reason) => {
                                     tracing::warn!("rejected block: {reason}");
@@ -750,6 +853,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Err(e) => tracing::debug!("bad block payload: {e}"),
+                    }
+                }
+                NetworkEvent::Proposal(_payload) => {
+                    // Round > 0 proposals are not used by the single-producer
+                    // finality integration; the block topic is the round-0
+                    // proposal.
+                }
+                NetworkEvent::Vote(payload) => {
+                    match serde_json::from_str::<verinoo_consensus::Vote>(&payload) {
+                        Ok(vote) => shared.finality_vote(&net, vote).await,
+                        Err(e) => tracing::debug!("bad vote payload: {e}"),
+                    }
+                }
+                NetworkEvent::Evidence(payload) => {
+                    match serde_json::from_str::<verinoo_consensus::Evidence>(&payload) {
+                        Ok(evidence) => {
+                            if evidence.verify(&shared.params.validators).is_ok() {
+                                let id = evidence.id();
+                                shared.store.set_meta(
+                                    &format!("evid:{id}"),
+                                    &serde_json::to_value(&evidence).expect("evidence serialize"),
+                                );
+                            }
+                        }
+                        Err(e) => tracing::debug!("bad evidence payload: {e}"),
                     }
                 }
                 NetworkEvent::PeerBanned(peer, reason) => {
@@ -941,8 +1069,7 @@ async fn sync_once(
             }
             admit_block(shared, &block)?;
             let producer = block.header.validator.clone();
-            commit_block(shared, &block, &producer);
-            if shared.head().map(|b| b.header.index) != Some(block.header.index) {
+            if !commit_block(shared, &block, &producer) {
                 return Err(format!(
                     "block #{} did not advance head (state root or model set mismatch?)",
                     block.header.index

@@ -3841,6 +3841,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "verinoo-consensus",
  "verinoo-crypto",
  "verinoo-exec",
  "verinoo-model",
