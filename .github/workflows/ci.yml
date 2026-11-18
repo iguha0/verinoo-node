@@ -3,26 +3,75 @@ on: push
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: System deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y cmake g++ libclang-dev clang llvm-dev
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
+      - name: Release script syntax
+        run: bash -n scripts/upgrade-v2.sh scripts/package-release.sh scripts/backup.sh scripts/verify.sh
       - name: SDK tests
         run: |
           cd sdk/typescript && node --test
           python3 -m pip install --quiet cryptography pytest
           cd ../python && python3 -m pytest -q
+      - name: Stripe tests (offline)
+        run: python3 scripts/test_stripe_invoice.py
       - name: Python importer tests (offline)
         run: |
           python3 -m pip install --quiet numpy huggingface_hub "torch==2.8.0+cpu" \
             --extra-index-url https://download.pytorch.org/whl/cpu
           python3 scripts/test_hf_gpt_import.py
+      - name: Package release smoke test (stub binary)
+        run: |
+          set -euo pipefail
+          stub="$RUNNER_TEMP/verinoo-node-stub"
+          printf 'int main(void) { return 0; }\n' | cc -x c - -o "$stub"
+          out="$RUNNER_TEMP/verinoo-package"
+          scripts/package-release.sh \
+            --version v0.10.0-testnet \
+            --binary "$stub" \
+            --out "$out" \
+            --skip-strip \
+            --platform x86_64-linux
+          archive="$out/verinoo-node-v0.10.0-testnet-x86_64-linux.tar.gz"
+          test -f "$archive"
+          test -f "$out/SHA256SUMS.v0.10.0-testnet"
+          (cd "$out" && sha256sum -c SHA256SUMS.v0.10.0-testnet)
+          mkdir -p "$RUNNER_TEMP/verinoo-extract"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/verinoo-extract"
+          pkg="$RUNNER_TEMP/verinoo-extract/verinoo-node-v0.10.0-testnet-x86_64-linux"
+          (cd "$pkg" && sha256sum -c SHA256SUMS)
+          for path in \
+            bin/verinoo-node \
+            models/acme-support-v1.graph.json \
+            models/claims-triage-v1.graph.json \
+            models/claims-triage-v1.test.json \
+            models/intent-transformer-v1.json \
+            models/intent-transformer-v1.test.json \
+            models/tiny-gpt-v1.json \
+            models/tiny-gpt-v1.test.json \
+            scripts/backup.sh \
+            scripts/verify.sh \
+            scripts/upgrade-v2.sh \
+            scripts/test_stripe_invoice.py \
+            docs/upgrade-v2.md \
+            docs/releases/v0.10.0.md \
+            README.txt \
+            SHA256SUMS; do
+            test -f "$pkg/$path"
+          done

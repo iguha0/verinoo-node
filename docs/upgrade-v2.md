@@ -37,7 +37,7 @@ v0.10.0 validator emits v2 creates two incompatible heads.
 | Batch API | no | `/v1/infer/batch`, 1–32 items, per-item results |
 | Task events | polling | final-only SSE with a 60 s cap and 64-stream limit |
 | Policy | no | `VNN_POLICY_FILE` submission gate |
-| Snapshots | no | state-layer create/verify/apply; operator CLI/RPC/signing via the snapshot integration |
+| Snapshots | no | signed operator `snapshot create/verify/apply` CLI, state-layer library, read-only serving |
 | Runtime | owned `.vnnw` loading | mmap `.vnnw`, generic GPT-2/GPT-Neo importer |
 
 Older tasks, receipts and v1 blocks without sampling remain valid and keep
@@ -48,12 +48,15 @@ their historical encoding.
 Run these on every node before changing anything.
 
 ```bash
-# 1. Identify the running version and service.
+# 1. Identify the installed binary and service. This tree has no
+#    `verinoo-node --version`; use the unit's ExecStart path and its checksum.
 systemctl status verinoo-node --no-pager
-verinoo-node --version 2>/dev/null || true
+systemctl show -p ExecStart --no-pager verinoo-node
 journalctl -u verinoo-node -n 50 --no-pager
 
-# 2. The node must be live and ready, not syncing or stale.
+# 2. The node must be live and ready, not syncing or stale. /health is liveness
+#    only and returns 200 with "ok": false before a head exists; /ready is the
+#    gate.
 curl -fsS http://127.0.0.1:7100/health
 curl -fsS http://127.0.0.1:7100/ready
 curl -fsS http://127.0.0.1:7100/status
@@ -78,9 +81,12 @@ node that is already unhealthy makes the failure harder to attribute.
 Confirm the new binary is the expected x86_64 Linux build and executable:
 
 ```bash
+file /root/verinoo-node-v0.10.0-testnet
 ls -l /root/verinoo-node-v0.10.0-testnet
 sha256sum /root/verinoo-node-v0.10.0-testnet
-# Compare with SHA256SUMS.v0.10.0-testnet from the release.
+# Compare the hash with the value you pass to --sha256/--sums-file.
+# The release sums file covers the archive; verify it first, then hash the
+# extracted bin/verinoo-node.
 ```
 
 ## 4. Backup and optional snapshot
@@ -99,28 +105,46 @@ sudo VNN_DB=/var/lib/verinoo/data \
 Keep the archive and its checksum. Do not delete backups during or after the
 upgrade; they are the recovery path for the pre-v2 state.
 
-If the snapshot integration is present in your build, you may additionally take
-a state snapshot **after** confirming the CLI exists:
+If the shipped snapshot CLI is present (`verinoo-node snapshot --help`), you may
+additionally take a signed state snapshot. Stop the service first: `create`
+opens RocksDB and fails while the live node holds the lock. `--out` must be
+absent or an empty directory, and `create` always signs with a seed:
 
 ```bash
-verinoo-node snapshot --help
-# Example surface; flags are defined by the snapshot integration:
-# verinoo-node snapshot create --db /var/lib/verinoo/data --out /root/snapshots
-# verinoo-node snapshot verify --snapshot /root/snapshots/snapshot-<height>
+sudo systemctl stop verinoo-node
+
+sudo verinoo-node snapshot create \
+  --db /var/lib/verinoo/data \
+  --out /root/snapshots/snapshot-<height> \
+  --key-seed "<operator-seed>" \
+  --signer <signer-pubkey-hex>
+
+sudo verinoo-node snapshot verify \
+  --snapshot /root/snapshots/snapshot-<height> \
+  --signer <signer-pubkey-hex>
+
+sudo systemctl start verinoo-node
 ```
+
+`create` requires `--key-seed` (or `VNN_KEY_SEED`) and always signs the
+manifest; `--signer` pins the derived signing key. `verify` and `apply` require
+at least one `--signer` (or `VNN_SNAPSHOT_SIGNERS`). A failed `create` can leave
+a partial directory; delete it before retrying.
 
 Snapshot caveats:
 
 - A snapshot is not a backup substitute. Keep the stopped-service tarball too.
-- Verification is file integrity plus caller-supplied expectations. The state
-  layer does not recompute `stateRoot`, derive model/validator hashes, or verify
-  BFT certificates.
-- Manifests, if signed, are **operator-attested**. There is no automatic
-  snapshot download, trust-on-first-use or sync.
+- The state layer verifies file integrity against caller-supplied expectations.
+  The `verinoo-node snapshot verify` command additionally recomputes
+  `stateRoot`, the validator-set hash, the checkpoint head fields, and the local
+  model hashes.
+- Manifest signatures are **operator-attested**, not BFT certificates. There is
+  no automatic snapshot download, trust-on-first-use, sync or failover.
 - `apply` requires the node to be stopped and never deletes the existing
   database; it moves it to a backup directory.
 
-If the CLI is absent, skip snapshots and use `scripts/backup.sh`.
+If the CLI is absent from the binary, skip snapshots and use
+`scripts/backup.sh`.
 
 ## 5. Upgrade order
 
@@ -130,24 +154,38 @@ There is no coordination problem, but there is still a rollback boundary.
 
 ```bash
 # Preflight, backup and record the head first (sections 3 and 4).
+NEW_BIN=/root/verinoo-node-v0.10.0-testnet
 sudo scripts/upgrade-v2.sh \
-  --binary /root/verinoo-node-v0.10.0-testnet \
+  --binary "$NEW_BIN" \
+  --sha256 "$(sha256sum "$NEW_BIN" | awk '{print $1}')" \
   --service verinoo-node \
   --db /var/lib/verinoo/data \
   --backup-dir /root/verinoo-backups/$(date -u +%Y%m%d-%H%M%S)
+# --sums-file <path> works instead of --sha256 when the file contains an entry
+# for the binary (the extracted package SHA256SUMS does; the release archive
+# sums file does not).
 ```
 
 The script:
 
-1. Requires root, an executable new binary, an existing service, a reachable
-   `/health`, and enough free space for a database copy.
+1. Requires root, an executable new binary with a published SHA-256
+   (`--sha256` or `--sums-file`), an existing service, `/ready` returning 200,
+   exactly one `ExecStart` path whose basename is `verinoo-node`, and enough
+   free space for a database copy. It never falls back to a guessed install
+   path.
 2. Backs up the database with `scripts/backup.sh` when available, otherwise
    stops the service and copies the database.
 3. Backs up the old binary and its hash.
-4. Stops the service, installs the new binary at the service's `ExecStart`
-   path, starts the service, and waits for `/health` and `/ready`.
-5. Prints `/v1/models` and the first post-upgrade block's header version.
-6. On failure, leaves backups in place and prints exact rollback commands.
+4. Stops the service, stages the new binary, verifies its checksum again,
+   installs it at the service's `ExecStart` path, starts the service, and
+   checks the running process where `/proc` is available.
+5. Waits for `/health` and `/ready`, prints `/v1/models`, and parses
+   `/blocks/since/<pre-height>` as JSON. The first block above the recorded
+   height must have header version 2.
+6. Exits non-zero with `installed but v2 unconfirmed` when it cannot prove
+   that. It leaves backups in place, does not delete them, and only prints
+   old-binary rollback commands when `--force-rollback` is passed and no v2
+   block is observed.
 
 It does **not** upgrade peers, rotate keys, change `VNN_VALIDATORS`, fence a
 host or roll back automatically.
@@ -166,8 +204,8 @@ stopping all validators is safer than letting old and new producers race.
    ```
 
 4. Upgrade all replicas and validators. You may use the helper per node, but
-   it expects `/health` to be reachable; for an already-stopped node use the
-   manual path in section 5.3.
+   it expects `/ready` to be 200; for an already-stopped node use the manual
+   path in section 5.3.
 5. Start all validators together. Confirm the same `chainId`, validator set and
    model set.
 6. Verify the first new block is `version: 2` (section 6). Only then resume
@@ -220,8 +258,9 @@ curl -fsS http://127.0.0.1:7100/health
 curl -fsS http://127.0.0.1:7100/ready
 ```
 
-`/health` only proves a head exists. `/ready` must return 200 with
-`"ready": true`. A 503 body gives the reason:
+`/health` is liveness only: it returns HTTP 200 even when no head exists, with
+`"ok": false`. `/ready` must return 200 with `"ready": true`. A 503 body gives
+the reason:
 
 | `reason` | Action |
 |---|---|
@@ -241,8 +280,9 @@ curl -fsS http://127.0.0.1:7100/blocks |
   python3 -c 'import json,sys; b=json.load(sys.stdin); h=b[0]["header"]; print("height", h["index"], "version", h["version"])'
 ```
 
-The first block produced after the upgrade must be `version 2`. If the RPC is
-unavailable, inspect the journal:
+The genesis block remains `version 1`; the first block produced after the
+upgrade (the first height above the value you recorded) must be `version 2`.
+If the RPC is unavailable, inspect the journal:
 
 ```bash
 journalctl -u verinoo-node -n 100 --no-pager

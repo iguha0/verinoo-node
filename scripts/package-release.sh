@@ -5,25 +5,29 @@
 #     --binary target/release/verinoo-node --out dist
 #
 # Optional:
-#   --repo <path>   repository root (default: parent of this script)
-#   --skip-strip    do not run strip on the packaged binary
+#   --repo <path>      repository root (default: parent of this script)
+#   --platform <name>  assert the target platform when `file` is unavailable
+#                      (only x86_64-linux is supported)
+#   --skip-strip       do not run strip on the packaged binary
 #
-# The script validates every input, stages a clean tree, writes README.txt,
-# archives it, and leaves the archive plus SHA256SUMS.<version> in --out.
-# It never writes into the repository or follows TinyStories/DistilGPT-2
-# weights into the package.
+# The script validates every input, checks the binary is an x86_64 Linux ELF,
+# stages a clean tree with the explicit seven-model allowlist, writes README.txt
+# and an internal SHA256SUMS, archives it, and leaves the archive plus
+# SHA256SUMS.<version> in --out. It never writes into the repository or follows
+# TinyStories/DistilGPT-2 weights into the package.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/package-release.sh --version <version> --binary <path> --out <dir>
-       [--repo <path>] [--skip-strip]
+       [--repo <path>] [--platform x86_64-linux] [--skip-strip]
 
-  --version    release version, for example v0.10.0-testnet
-  --binary     path to the built verinoo-node binary
-  --out        output directory for the archive and checksum file
-  --repo       repository root (default: parent of this script)
-  --skip-strip skip stripping the packaged binary
+  --version        release version, for example v0.10.0-testnet
+  --binary         path to the built verinoo-node binary
+  --out            output directory for the archive and checksum file
+  --repo           repository root (default: parent of this script)
+  --platform       assert x86_64-linux when `file` is not available
+  --skip-strip     skip stripping the packaged binary
 EOF
 }
 
@@ -32,10 +36,19 @@ die() {
   exit 1
 }
 
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 VERSION=""
 BINARY=""
 OUT=""
 REPO=""
+PLATFORM=""
 SKIP_STRIP=0
 
 while [ "$#" -gt 0 ]; do
@@ -76,6 +89,15 @@ while [ "$#" -gt 0 ]; do
       REPO="${1#*=}"
       shift
       ;;
+    --platform)
+      [ "$#" -ge 2 ] || die "--platform needs a value"
+      PLATFORM="$2"
+      shift 2
+      ;;
+    --platform=*)
+      PLATFORM="${1#*=}"
+      shift
+      ;;
     --skip-strip)
       SKIP_STRIP=1
       shift
@@ -109,6 +131,42 @@ REPO="$(cd "$REPO" && pwd)"
 [ -x "$BINARY" ] || die "binary is not executable: $BINARY"
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 
+case "$PLATFORM" in
+  ""|x86_64-linux) ;;
+  *) die "unsupported --platform '$PLATFORM' (only x86_64-linux is supported)" ;;
+esac
+
+if command -v file >/dev/null 2>&1; then
+  BINARY_DESC="$(file -b "$BINARY" 2>/dev/null || true)"
+  [ -n "$BINARY_DESC" ] || die "file could not inspect the binary: $BINARY"
+  BINARY_DESC_LC="$(printf '%s' "$BINARY_DESC" | tr '[:upper:]' '[:lower:]')"
+  case "$BINARY_DESC_LC" in
+    *elf*64-bit*) ;;
+    *) die "binary is not a 64-bit ELF: $BINARY_DESC" ;;
+  esac
+  case "$BINARY_DESC_LC" in
+    *x86-64*|*x86_64*|*amd64*) ;;
+    *) die "binary is not x86_64: $BINARY_DESC" ;;
+  esac
+  case "$BINARY_DESC_LC" in
+    *mach-o*|*pe32*|*ms-dos*|*arm*|*aarch64*|*riscv*|*powerpc*|*s390*)
+      die "binary target is not x86_64 Linux: $BINARY_DESC"
+      ;;
+  esac
+  case "$BINARY_DESC_LC" in
+    *linux*) ;;
+    *)
+      [ "$PLATFORM" = "x86_64-linux" ] ||
+        die "could not confirm the ELF targets Linux ($BINARY_DESC); pass --platform x86_64-linux to assert it"
+      ;;
+  esac
+  echo "  platform: x86_64 Linux ($BINARY_DESC)"
+else
+  [ "$PLATFORM" = "x86_64-linux" ] ||
+    die "file command not found; pass --platform x86_64-linux to assert the binary target"
+  echo "  platform: x86_64 Linux (asserted by --platform; file not available)"
+fi
+
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -134,6 +192,7 @@ required_scripts=(
   hf_gpt_common.py
   test_hf_gpt_import.py
   stripe_invoice.py
+  test_stripe_invoice.py
   backup.sh
   upgrade-v2.sh
   verify.sh
@@ -178,30 +237,23 @@ else
   echo "  --skip-strip: leaving the binary as supplied"
 fi
 
-# Small committed models and fixtures only. Never follow model-card links or
-# package locally imported TinyStories/DistilGPT-2 weights.
-model_count=0
-for model in "$REPO"/models/*; do
-  [ -f "$model" ] || continue
-  base="$(basename "$model")"
-  lower="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
-  case "$lower" in
-    *tiny-stories*|*tinystories*|*distilgpt*|*.vnnw) continue ;;
-  esac
-  case "$lower" in
-    *.json) ;;
-    *) continue ;;
-  esac
-  size="$(wc -c <"$model" | tr -d ' ')"
-  if [ "$size" -gt 20971520 ]; then
-    echo "  skipping large model file: $base ($size bytes)" >&2
-    continue
-  fi
-  cp -p "$model" "$PKG/models/$base"
-  model_count=$((model_count + 1))
+# Explicit allowlist of the small committed models and fixtures. Never follow
+# model-card links or package locally imported TinyStories/DistilGPT-2 weights.
+required_models=(
+  acme-support-v1.graph.json
+  claims-triage-v1.graph.json
+  claims-triage-v1.test.json
+  intent-transformer-v1.json
+  intent-transformer-v1.test.json
+  tiny-gpt-v1.json
+  tiny-gpt-v1.test.json
+)
+for name in "${required_models[@]}"; do
+  [ -f "$REPO/models/$name" ] || die "required model missing: models/$name"
+  [ -s "$REPO/models/$name" ] || die "required model is empty: models/$name"
+  cp -p "$REPO/models/$name" "$PKG/models/$name"
 done
-[ "$model_count" -gt 0 ] || die "no small model files found under models/"
-echo "  packaged $model_count model files"
+echo "  packaged ${#required_models[@]} model files"
 
 for name in "${required_scripts[@]}"; do
   cp -p "$REPO/scripts/$name" "$PKG/scripts/$name"
@@ -276,11 +328,26 @@ the validator set, so validators (including the operator) can decrypt them.
 
 Verification and release notes
 ------------------------------
+  # From the download directory, next to the published archive checksum:
   sha256sum -c SHA256SUMS.@VERSION@
+
+  # After extracting and cd'ing into this directory:
+  sha256sum -c SHA256SUMS
+
   See docs/releases/@NOTES@ for the full notes, evidence and artifact list.
 
 License: AGPL-3.0. See LICENSE.
 README_TEMPLATE
+
+echo "→ writing package contents SHA256SUMS"
+(
+  cd "$PKG"
+  find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort |
+    while IFS= read -r file; do
+      rel="${file#./}"
+      printf '%s  %s\n' "$(hash_file "$file")" "$rel"
+    done >SHA256SUMS
+)
 
 file_count="$(find "$PKG" -type f | wc -l | tr -d ' ')"
 size_kb="$(du -sk "$PKG" | awk '{print $1}')"
@@ -293,14 +360,8 @@ mv "$TMP_ARCHIVE" "$OUT/$ARCHIVE"
 TMP_ARCHIVE=""
 
 echo "→ writing SHA256SUMS.$VERSION"
-(
-  cd "$OUT"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$ARCHIVE" >"SHA256SUMS.$VERSION"
-  else
-    shasum -a 256 "$ARCHIVE" >"SHA256SUMS.$VERSION"
-  fi
-)
+printf '%s  %s\n' "$(hash_file "$OUT/$ARCHIVE")" "$ARCHIVE" \
+  >"$OUT/SHA256SUMS.$VERSION"
 
 echo "✓ package ready"
 echo "  $OUT/$ARCHIVE"
