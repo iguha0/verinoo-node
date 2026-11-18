@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (274 tests) |
+| Test suite | green | `cargo test --workspace --locked` (294 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -34,10 +34,10 @@ claims a technical buyer will test in the first diligence call.
 | ONNX classifier import | works | `verinoo-onnx`, parity vs f32, 10 tests |
 | GGUF classifier import | works (experimental) | `verinoo-gguf`, Q4/Q5/Q8 + Q2_K–Q6_K dequant, 15 tests |
 | Input encryption | works (validator-confidential) | X25519 + HKDF + ChaCha20-Poly1305; task/block redaction; `docs/privacy.md` |
-| SDKs | works | `sdk/typescript` (8 tests), `sdk/python` (8 tests), live-tested against an encrypted node |
+| SDKs | works | `sdk/typescript` (17 tests), `sdk/python` (15 tests), live-tested against an encrypted node |
 | Block-time override | works | `VNN_BLOCK_TIME_MS=1000` gives ~1–2 s task latency; network-wide setting |
 | Attention kernel | prototype | Q16.16 single/multi-head, 6 tests; not wired into model loading (`docs/transformer.md`) |
-| BFT finality | works (certificate layer) | 2/3+1 prevote/precommit certificates, evidence, certificate-aware catch-up, 4-validator live cluster; no view-change/offline-leader liveness |
+| BFT finality | works (certificate layer) | 2/3+1 prevote/precommit certificates, evidence, certificate-aware catch-up, pacemaker/round core, 4-validator live cluster; node-side view-change/timers not wired |
 | Result commitment | works | state root covers every executed output |
 | Receipts + verification | works | `/v1/verify` recompute, live 2-node run |
 | Metering | works | `/v1/usage`, CSV export |
