@@ -51,8 +51,9 @@ usage: scripts/upgrade-v2.sh --binary <new-binary>
   --force-rollback  allow the failure report to print old-binary rollback
                     commands; only use when no v2 block exists
 
-Run as root on the server. The node must be live, /ready must be 200, and the
-new binary checksum must be known before the upgrade starts. VNN_API_PORT
+Run as root on the server. The node must be live, /health must be reachable, and the new binary checksum
+must be known before the upgrade starts. A legacy v0.9.0 node may return 404
+for /ready; the post-upgrade check still requires /ready 200. VNN_API_PORT
 overrides the local API port (7100).
 EOF
 }
@@ -244,11 +245,15 @@ if ! curl -fsS -m 5 "$API_BASE/health" >/dev/null 2>&1; then
 fi
 echo "  /health: reachable at $API_BASE/health"
 
-if ! curl -fsS -m 5 "$API_BASE/ready" >/dev/null 2>&1; then
+READY_CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$API_BASE/ready" 2>/dev/null || true)"
+if [ "$READY_CODE" = "200" ]; then
+  echo "  /ready: HTTP 200 at $API_BASE/ready"
+elif [ "$READY_CODE" = "404" ]; then
+  echo "  /ready: 404 (legacy v0.9.0 binary has no readiness endpoint); /health is reachable"
+else
   READY_DETAIL="$(curl -sS -m 5 "$API_BASE/ready" 2>/dev/null || true)"
-  die "/ready is not HTTP 200 at $API_BASE/ready before the upgrade${READY_DETAIL:+: $READY_DETAIL}"
+  die "/ready is not ready at $API_BASE/ready before the upgrade (HTTP ${READY_CODE:-unknown})${READY_DETAIL:+: $READY_DETAIL}"
 fi
-echo "  /ready: HTTP 200 at $API_BASE/ready"
 
 PRE_HEALTH="$(curl -fsS -m 5 "$API_BASE/health" 2>/dev/null || true)"
 PRE_HEIGHT="$(printf '%s' "$PRE_HEALTH" |

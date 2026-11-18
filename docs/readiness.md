@@ -19,7 +19,7 @@ claims a technical buyer will test in the first diligence call.
 | Area | State | Evidence |
 |---|---|---|
 | Workspace build | green | `cargo build --workspace --locked` |
-| Test suite | green | `cargo test --workspace --locked` (221 tests) |
+| Test suite | green | `cargo test --workspace --locked` (243 tests) |
 | Node boot + block production | works | block height advances every 10 s |
 | Ed25519 tx/block signing | works | enforced in `validate_block` |
 | Canonical tx-id binding | works | conformance vectors |
@@ -57,7 +57,7 @@ claims a technical buyer will test in the first diligence call.
 | Policy API boundary | works (plaintext) | `VNN_POLICY_FILE`, byte limits, model allowlist, blocked terms/patterns, redaction rejection; encrypted inputs size-only |
 | Batch inference API | works | `/v1/infer/batch`, 1–32 txs, per-item results, nonce/balance overlay, block-gas cap, gas-skip requeue, mempool cap |
 | Task SSE | works (final-only) | `/v1/tasks/:id/events`, status/result/done, 60s cap, 64-stream limit; no token stream |
-| Snapshot state layer | works (library) | RocksDB checkpoint, manifest, hash verification, TOCTOU-hardened apply/rollback, 18 tests; no node endpoints/signing |
+| Snapshot transfer | works (operator-attested) | signed `verinoo-node snapshot` create/verify/apply, state-root/validator/model checks, read-only Range serving; automatic download/sync and BFT certificates missing |
 | ZK op vectors | works | Q16.16 conformance vs WASM runtime |
 
 ## What blocks a paid launch
@@ -91,9 +91,10 @@ claims a technical buyer will test in the first diligence call.
    remove a validator from the active set without a coordinated re-genesis.
    `/ready` exposes lag, sync activity and validator-set consistency for a load
    balancer; it does not fence a host or promote a replica.
-6. **No state snapshot transfer.** Catch-up replays blocks from the caller's
-   height; a node far behind replays from genesis, which is O(chain length).
-   There is no snapshot download yet.
+6. **No automatic snapshot sync.** Signed snapshot create/verify/apply and
+   read-only manifest/file serving exist, but a node still does not
+   automatically download, resume or apply a snapshot, and there are no BFT
+   commit certificates. Catch-up still replays blocks from the caller's height.
 
 ## Prepared in this pass
 
@@ -193,10 +194,11 @@ claims a technical buyer will test in the first diligence call.
 - The policy crate is wired into `/v1/infer`, `/tx` inference submissions and
   every batch item. It checks plaintext content and ciphertext size; it never
   mutates a signed transaction, runs in consensus, or changes receipts.
-- A state-layer snapshot create/verify/apply path with manifest hashing,
-  path-traversal checks, expectation re-verification at apply time and
-  backup/rollback. It is not exposed over RPC and does not verify signatures or
-  recompute the state root; those remain node/exec work.
+- Signed `verinoo-node snapshot create/verify/apply` with manifest signing and
+  threshold verification, state-root/validator-set/model-hash checks, stale and
+  chain-id rejection, target-lock probing, digest-bound apply/rollback, and
+  read-only `/snapshot/manifest` + `/snapshot/files/*` serving with Range
+  support. Automatic snapshot sync and BFT certificates remain unimplemented.
 - `GET /ready` with `syncing`, peer lag, a canonical validator-set hash and
   fail-closed `validatorSetConsistent`; `/status` exposes the same fields.
   Automatic failover/fencing and snapshot sync remain unimplemented.
@@ -278,7 +280,7 @@ the receipt verifies on the node that did not produce the block.
 
 ## Live deployment (2026-11-15)
 
-`https://verinoo.com/v1/*` is served by this node (`v0.9.0-testnet`, single
+`https://verinoo.com/v1/*` is served by this node (`v0.10.0-testnet`, single
 validator, systemd unit `verinoo-node`, data in `/var/lib/verinoo`). Nginx
 proxies `/v1/`, `/faucet` and `/account/` to `127.0.0.1:7100` with rate limits;
 the API and P2P ports are firewalled. Verified against the public endpoint:
@@ -303,7 +305,7 @@ domain still belong to the older reference node.
 | Finality or honest framing | Malachite adapter **or** document "operator-attested with economic recourse" | 4–6 wk / 1 wk |
 | Public multi-party ceremony | external contributors to powers-of-tau | 2 wk + coordination |
 | Automatic HA / validator removal | failover, split-brain protection, on-chain set changes | 2–3 wk |
-| State snapshot transfer | serve and verify a signed state snapshot | 1–2 wk |
+| ~~State snapshot transfer~~ | **done (operator-attested)**: signed create/verify/apply + read-only serving; automatic sync remains | — |
 
 ## Recommended sequence
 
@@ -338,7 +340,8 @@ domain still belong to the older reference node.
   safety layer, 7B+ serving or LLaMA/SentencePiece/arbitrary checkpoint import.
   Batch is API fan-out, not runtime batching; SSE is final-only, not token
   streaming. Policy checks only the API boundary and cannot inspect encrypted
-  content. Snapshot create/verify/apply is a state library only: no RPC
-  endpoints, manifest signing, state-root recomputation or automatic sync.
-  Per-task sampling is v2-only and requires a coordinated validator upgrade.
+  content. Snapshot create/verify/apply and read-only serving are
+  operator-attested and do not provide trustless sync, automatic download or
+  BFT certificates. Per-task sampling is v2-only and requires a coordinated
+  validator upgrade.
   "BFT" — the finality design is not implemented.

@@ -23,7 +23,7 @@ node and leaves the older reference node on `/status` and `/health`.
 
 ```bash
 cd /opt/verinoo
-git fetch --tags && git checkout v0.9.0-testnet
+git fetch --tags && git checkout v0.10.0-testnet
 cargo build --release --locked -p verinoo-node
 install -m 0755 target/release/verinoo-node /usr/local/bin/verinoo-node
 systemctl restart verinoo-node
@@ -33,6 +33,10 @@ curl -fsS localhost:7100/v1/models
 ```
 
 State is forward-compatible within a release; take a backup before upgrading.
+
+Protocol v2 (v0.10.0) requires a coordinated upgrade: old binaries reject v2
+blocks. Follow [`docs/upgrade-v2.md`](upgrade-v2.md); do not roll back to
+v0.9.0 after a v2 block has been produced.
 
 ## Backups
 
