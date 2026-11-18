@@ -3,10 +3,12 @@
 Status: the state layer can create, verify, and apply a snapshot; the node has
 operator CLI commands for all three, signs manifests with Ed25519 operator
 keys, recomputes the checkpoint state root read-only, and serves snapshots over
-HTTP. Snapshot signatures are **operator-attested**, not BFT certificates. The
-node does not automatically download or apply a snapshot, does not set its head
-from one, and does not provide automatic failover. See ADR 006 and "What
-remains" below.
+HTTP. Apply is bound to the exact manifest digest verified under those
+signatures, rejects stale/same-height/chain-mismatched targets automatically,
+and holds the target database lock across the rename. Snapshot signatures are
+**operator-attested**, not BFT certificates. The node does not automatically
+download or apply a snapshot, does not set its head from one, and does not
+provide automatic failover. See ADR 006 and "What remains" below.
 
 ## Scope
 
@@ -19,7 +21,11 @@ remains" below.
 - Manifest parsing and structural validation.
 - File-set completeness, path, symlink, size, and hash checks.
 - Comparison against caller-supplied trusted metadata.
+- A digest-bound `VerifiedSnapshot` handle that apply re-checks immediately
+  before the rename.
 - Atomic rename-based apply with rollback and a backup when the target exists.
+- Unconditional rejection of an existing backup path, even when the target is
+  absent.
 
 `verinoo-node` (`crates/node/src/snapshot.rs`) owns:
 
@@ -27,8 +33,12 @@ remains" below.
 - Ed25519 manifest signatures and signer threshold checks.
 - `stateRoot` recomputation with `verinoo_exec::engine::compute_state_root`.
 - Validator-set and model-set hash derivation and comparison.
-- Checkpoint head consistency checks.
-- The read-only `/snapshot/manifest` and `/snapshot/files/*path` endpoints.
+- Checkpoint head consistency checks: header hash, version, and the head's
+  committed state root are recomputed.
+- Target chain-id and head-height checks before apply, with the target's
+  RocksDB lock held across the rename.
+- The read-only `/snapshot/manifest` and `/snapshot/files/*path` endpoints,
+  limited to manifest-listed files and a bounded manifest size.
 
 The state layer does **not** know chain truth, model registries, or signer
 identity. The node does not own BFT finality, automatic catch-up, or head setup
@@ -131,8 +141,11 @@ verinoo-node snapshot verify --snapshot <dir> --signer <pubkey-hex> \
   [--signer ...] [--threshold N] [--chain-id <id>]
 
 verinoo-node snapshot apply --snapshot <dir> --db <target> --backup <dir> \
-  --signer <pubkey-hex> [--signer ...] [--threshold N]
+  --chain-id <id> --signer <pubkey-hex> [--signer ...] [--threshold N]
 ```
+
+`apply` requires `--chain-id`; it is compared with both the signed manifest and
+the target database's recorded chain id.
 
 Environment:
 
@@ -140,26 +153,36 @@ Environment:
 |---|---|---|
 | `VNN_KEY_SEED` | create | Default seed when `--key-seed` is omitted. |
 | `VNN_SNAPSHOT_SIGNERS` | verify, apply | Comma-separated signer public keys when no `--signer` is given. |
-| `VNN_MODEL_DIR` | create, verify, apply | Model directory. Create defaults to `./models`; verify/apply compare only this directory when set, otherwise builtin-only and fail closed on a mismatch. |
+| `VNN_MODEL_DIR` | create, verify, apply | Model directory. Create defaults to `./models` and **fails** if it is missing or loads no installed model. Verify/apply compare only this directory when set (a missing directory is an error), otherwise builtin-only and fail closed on a mismatch. |
 | `VNN_SNAPSHOT_DIR` | node serving | Directory containing `manifest.json` and `state/`. |
 
 ### create
 
 `create` requires the database to be stopped. It opens the store read-write to
 take the checkpoint, so a running node's RocksDB lock makes the command fail
-with a clear "is the node still running?" error. It also requires a chain head.
-Steps:
+with a clear "is the node still running?" error. It requires a chain head and a
+validated model directory. Steps:
 
-1. Read the head block and compute `compute_state_root` over the store.
-2. Copy `baseFee` from `meta:baseFee` when present.
-3. Load the model directory and derive `modelHashes`/`modelSetHash`.
-4. Hash the state's canonical sorted validator addresses.
-5. Create the checkpoint and unsigned manifest with `create_snapshot`.
-6. Sign `manifest_signing_bytes` with the seed-derived Ed25519 key, append the
+1. Read the database's recorded `meta:chainId`. The node writes it at startup;
+   a database that predates the field gets the compiled chain id recorded by
+   `create` (which already opens the database read-write).
+2. Read the head block and compute `compute_state_root` over the store.
+3. Validate the checkpoint head: recompute `hash_header(head.header)` and
+   require it to equal `head.header.hash`; require `version` in
+   `MIN_HEADER_VERSION..=HEADER_VERSION`; require
+   `head.header.state_root == compute_state_root(store)`.
+4. Copy `baseFee` from `meta:baseFee` when present.
+5. Require `VNN_MODEL_DIR` (default `./models`) to exist and load at least one
+   installed model. A missing or model-less directory is an error; create never
+   silently signs a builtin-only snapshot.
+6. Load the model directory and derive `modelHashes`/`modelSetHash`.
+7. Hash the state's canonical sorted validator addresses.
+8. Create the checkpoint and unsigned manifest with `create_snapshot`.
+9. Sign `manifest_signing_bytes` with the seed-derived Ed25519 key, append the
    signature (`address`, `publicKey`, `signature`), and atomically rewrite
    `manifest.json`.
-7. Print the height, manifest hash (SHA-256 over the exact manifest file
-   bytes), state root, and signer.
+10. Print the height, manifest hash (SHA-256 over the exact manifest file
+    bytes), state root, and signer.
 
 The seed is hashed once with SHA-256 to obtain the 32-byte Ed25519 key, exactly
 like `verinoo-node address`. The address is `public_key_to_address(publicKey)`.
@@ -177,7 +200,8 @@ directory; delete it before retrying.
 1. Parse signer public keys; reject malformed, non-32-byte, or duplicate keys.
 2. Read `manifest.json` and reject an unsupported version or kind.
 3. When `--chain-id` is given, require an exact chain id match.
-4. Reject a threshold below 1 or above the configured signer count.
+4. Reject a threshold below 1 or above the configured signer count, and reject
+   a manifest with more than 64 signature entries.
 5. For every manifest signature: the public key must be one of the configured
    signers (unknown keys are rejected), its address must equal
    `public_key_to_address(publicKey)`, it must be the only signature from that
@@ -190,13 +214,18 @@ directory; delete it before retrying.
    verification is rejected.
 7. Open `state/` with `StateStore::open_read_only` and recompute
    `compute_state_root`. It must equal `stateRoot`.
-8. Recompute `validatorSetHash` from the checkpoint's active validator
+8. Validate the checkpoint head. Recompute `hash_header(head.header)` and
+   require it to equal `head.header.hash`; require the header version to be in
+   `MIN_HEADER_VERSION..=HEADER_VERSION`; require
+   `head.header.state_root == compute_state_root(checkpoint)`; require the head
+   height, hash, previous hash, and state root to equal `height`, `blockHash`,
+   `parentHash`, and `stateRoot`.
+9. Recompute `validatorSetHash` from the checkpoint's active validator
    addresses. It must equal the manifest.
-9. Require the checkpoint head index, hash, and previous hash to equal
-   `height`, `blockHash`, and `parentHash`.
 10. Derive the local model hashes and set hash. Both must match exactly. With
     `VNN_MODEL_DIR` unset only builtin models are loaded, so a manifest that
-    lists installed models fails closed rather than skipping the check.
+    lists installed models fails closed rather than skipping the check. When
+    it is set, the directory must exist and be readable.
 
 Signatures are checked before the checkpoint is opened. The checkpoint is never
 mutated by verification. The manifest hash printed by `verify` is SHA-256 over
@@ -204,24 +233,44 @@ the exact manifest bytes.
 
 ### apply
 
-`apply` performs the full `verify` sequence, then:
+`apply` performs the full `verify` sequence with `--chain-id`, then:
 
-1. If the target database exists, opens it read-write without create to probe
-   the RocksDB lock. A running node (or any other writer) makes apply fail.
-2. Calls `apply_verified_snapshot` with expectations derived from the verified
-   manifest (`stateRoot`, `modelSetHash`, `modelHashes`, `validatorSetHash`,
-   chain id, height, block hashes, and `baseFee`).
-3. Moves an existing target to `--backup` before moving `state/` into place.
-   The old database is **never deleted**. If the target did not exist, no
-   backup is created.
+1. Rejects a snapshot whose signed chain id differs from `--chain-id`.
+2. If the target database exists, opens it read-write without create, reads
+   `meta:chainId`, and **keeps the RocksDB lock** for the whole rename. A
+   running node (or any other writer) makes apply fail. A target without a
+   recorded chain id is rejected: start the node once with this release so it
+   records one.
+3. Rejects a target chain id different from the snapshot.
+4. Reads the target's current head and rejects unless
+   `snapshot.height > target.head.height`. A same-height snapshot is always
+   rejected; there is no same-hash no-op. A target with no head (fresh
+   database) is accepted.
+5. Calls `apply_verified_snapshot_bound` with the digest-bound handle from
+   `verify` and expectations derived from the verified manifest (`stateRoot`,
+   `modelSetHash`, `modelHashes`, `validatorSetHash`, chain id, height, block
+   hashes, and `baseFee`). The state layer re-reads the manifest, requires its
+   digest to equal the verified digest, and re-verifies every file hash and
+   expectation immediately before the state rename.
+6. Rejects an existing `--backup` path unconditionally, even when the target is
+   absent. Moves an existing target to `--backup` before moving `state/` into
+   place. The old database is **never deleted**. If the target did not exist,
+   no backup is created and the CLI prints no backup path.
 
-The snapshot directory must be immutable and trusted for the whole verify and
-apply operation. Apply re-verifies integrity and expectations immediately
-before the state rename and binds to the manifest bytes seen at entry, but it
-cannot stop an attacker who controls the snapshot directory from racing the
-final check against the rename. Stop the node before apply and keep the backup
-until the new database has served blocks and reproduced the expected state
-root.
+Signature binding: `verify` returns the verified manifest digest. Signatures
+are checked over that exact manifest, and `apply` passes the digest into the
+state layer. A different internally consistent manifest or file set swapped in
+between signature verification and the rename is rejected with a manifest
+digest mismatch. The target database lock is held across the rename, so a node
+started after the probe cannot open the old database and have it moved aside.
+Residual races: (1) the target path is briefly absent between the
+target-to-backup and state-to-target renames, so a process that recreates
+`VNN_DB` in that window can make apply fail (inspect and restore manually);
+(2) the snapshot directory must still be immutable and trusted: an attacker who
+can rewrite its state files between the final hash check inside apply and the
+rename can still race it. Keep the node stopped and the snapshot on a trusted
+path, and keep the backup until the new database has served blocks and
+reproduced the expected state root.
 
 ## Trust boundaries
 
@@ -253,23 +302,29 @@ that the state is the canonical chain. Pin the signer public key and publish it
 out of band. Do not call this trustless. A snapshot does not replace block
 validation for blocks after its height.
 
-The operator is responsible for rejecting a snapshot at or below the local
-head, a same-height snapshot with a different hash, or a snapshot older than
-the local finalized state. The CLI does not read the target database's old head
-for that comparison; it verifies the snapshot in isolation.
+`apply` now enforces the stale/same-height rule itself: it reads the target's
+recorded chain id and current head under the target lock and rejects a
+mismatched chain, a snapshot at or below the target height, and a target
+without a chain id. `verify` alone remains a pure snapshot check; run it with
+`--chain-id` and inspect the printed height before downloading or applying.
 
 ## Serving
 
 Set `VNN_SNAPSHOT_DIR` to the snapshot directory. Reads are public chain state
 and do not require an API key:
 
+- A symlinked `VNN_SNAPSHOT_DIR` is allowed: the root is canonicalized once
+  and both endpoints use the resolved root. Symlinks below the root are still
+  rejected.
 - `GET /snapshot/manifest` returns the manifest JSON, or 404 when serving is
   disabled, the directory is missing, or the manifest is absent/not a regular
-  file.
-- `GET /snapshot/files/*path` serves one checkpoint file. Only relative paths
-  beginning with `state/` are accepted; `..`, absolute paths, backslashes,
-  other top-level directories, and symlinks are rejected. Traversal attempts
-  return 400, symlinks 403, and missing files or directories 404.
+  file. A manifest larger than 16 MiB returns 413.
+- `GET /snapshot/files/*path` serves only a file listed in the manifest. Only
+  relative paths beginning with `state/` are accepted; `..`, absolute paths,
+  backslashes, other top-level directories, and symlinks are rejected.
+  Traversal attempts return 400, symlinks 403, and missing, unlisted, or
+  size-mismatched files return 404. The manifest is re-read per request and
+  must be a valid snapshot manifest under the same 16 MiB cap.
 - The file endpoint supports a single `Range: bytes=...` range. It returns 206
   with `Content-Range` and `Accept-Ranges: bytes`, or 416 with
   `Content-Range: bytes */<size>` for an invalid/unsatisfiable/multi-range
@@ -319,11 +374,16 @@ verinoo-node snapshot apply \
   --snapshot /var/lib/verinoo/incoming/snapshot-<height> \
   --db /var/lib/verinoo/data \
   --backup /var/lib/verinoo/data.pre-snapshot-$(date -u +%Y%m%dT%H%M%SZ) \
+  --chain-id verinoo-test-1 \
   --signer "$SNAPSHOT_SIGNER_PUBKEY"
 systemctl start verinoo-node
 curl -fsS localhost:7100/health
 curl -fsS localhost:7100/ready
 ```
+
+Apply fails closed if the backup path already exists, the target chain id is
+missing or different, or the target head is at or above the snapshot height.
+Do not start the node until apply exits successfully.
 
 If verification or apply fails, leave the live database alone and fall back to
 normal catch-up. If apply succeeded but the node later diverges, stop it and
@@ -346,9 +406,13 @@ starting another host. See `docs/operations.md`.
   node or wire the snapshot height into catch-up sync. The checkpoint already
   contains the head and `blockheight:<height>` index, so a restart resumes from
   it; a fresh node still needs its normal genesis/startup path.
-- **Stale/same-height policy.** The CLI does not compare against the target's
-  old head. Enforce "height must be greater" and "same height must have the
-  same hash" in the promotion runbook or a future node integration.
+- **Snapshot-directory immutability.** Apply re-checks hashes and the manifest
+  digest under the target lock, but an attacker who can rewrite the snapshot
+  state directory between that final check and the rename can still race it.
+  Keep snapshots on an immutable or operator-controlled path.
+- **No same-height no-op.** `apply` rejects a snapshot at the target head even
+  when the block hash matches. Restart the node from its existing database
+  instead of re-applying an identical snapshot.
 - **Download resume tooling.** Range serving exists, but there is no built-in
   downloader, temporary-directory manager, or partial-download verifier.
 - **Retention/pruning.** No snapshot retention policy is defined. Old `hash:`,

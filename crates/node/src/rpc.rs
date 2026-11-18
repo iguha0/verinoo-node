@@ -13,7 +13,7 @@ use axum::{
     Extension, Json, Router,
 };
 use futures::stream::{self, Stream};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::{self, SeekFrom};
 use std::net::SocketAddr;
@@ -1371,22 +1371,82 @@ async fn v1_usage_csv(
 }
 
 const SNAPSHOT_READ_CHUNK: usize = 64 * 1024;
+const MAX_SNAPSHOT_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Canonicalize the configured snapshot root once. A symlinked
+/// `VNN_SNAPSHOT_DIR` is resolved here so the manifest and file endpoints
+/// behave the same; every component below the resolved root is still checked
+/// for symlinks.
+async fn resolve_snapshot_root(root: &FsPath) -> Result<PathBuf, SnapshotPathError> {
+    let resolved = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|_| SnapshotPathError::NotFound)?;
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|_| SnapshotPathError::NotFound)?;
+    if !meta.is_dir() {
+        return Err(SnapshotPathError::NotFound);
+    }
+    Ok(resolved)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotManifestError {
+    NotFound,
+    TooLarge,
+    Invalid,
+}
+
+async fn load_snapshot_manifest(
+    root: &FsPath,
+) -> Result<verinoo_state::snapshot::SnapshotManifest, SnapshotManifestError> {
+    let path = root.join("manifest.json");
+    let meta = tokio::fs::symlink_metadata(&path)
+        .await
+        .map_err(|_| SnapshotManifestError::NotFound)?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(SnapshotManifestError::NotFound);
+    }
+    if meta.len() > MAX_SNAPSHOT_MANIFEST_BYTES {
+        return Err(SnapshotManifestError::TooLarge);
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| SnapshotManifestError::NotFound)?;
+    let manifest: verinoo_state::snapshot::SnapshotManifest =
+        serde_json::from_slice(&bytes).map_err(|_| SnapshotManifestError::Invalid)?;
+    for file in &manifest.files {
+        verinoo_state::snapshot::validate_snapshot_path(&file.path)
+            .map_err(|_| SnapshotManifestError::Invalid)?;
+    }
+    Ok(manifest)
+}
 
 /// Public snapshot reads: the manifest is the signed JSON document produced by
 /// `verinoo-node snapshot create`. No API key is required; snapshots are public
-/// chain state. Paths are validated by the state layer and every component is
-/// rejected if it is a symlink.
+/// chain state. The root is canonicalized once and the manifest itself must be
+/// a regular file under it.
 async fn snapshot_manifest(State(shared): State<Arc<Shared>>) -> Response {
     let Some(dir) = &shared.snapshot_dir else {
         return snapshot_not_found("snapshot serving is not configured");
     };
-    let path = dir.join("manifest.json");
+    let root = match resolve_snapshot_root(dir).await {
+        Ok(root) => root,
+        Err(_) => return snapshot_not_found("snapshot manifest not found"),
+    };
+    let path = root.join("manifest.json");
     let meta = match tokio::fs::symlink_metadata(&path).await {
         Ok(meta) => meta,
         Err(_) => return snapshot_not_found("snapshot manifest not found"),
     };
     if meta.file_type().is_symlink() || !meta.is_file() {
         return snapshot_not_found("snapshot manifest not found");
+    }
+    if meta.len() > MAX_SNAPSHOT_MANIFEST_BYTES {
+        return snapshot_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "snapshot manifest is too large",
+        );
     }
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
@@ -1415,7 +1475,11 @@ async fn snapshot_file(
     let Some(dir) = &shared.snapshot_dir else {
         return snapshot_not_found("snapshot serving is not configured");
     };
-    let path = match resolve_snapshot_file(dir, &relative).await {
+    let root = match resolve_snapshot_root(dir).await {
+        Ok(root) => root,
+        Err(_) => return snapshot_not_found("snapshot file not found"),
+    };
+    let path = match resolve_snapshot_file(&root, &relative).await {
         Ok(path) => path,
         Err(SnapshotPathError::Invalid) => {
             return snapshot_error(StatusCode::BAD_REQUEST, "invalid snapshot path")
@@ -1426,6 +1490,33 @@ async fn snapshot_file(
         Err(SnapshotPathError::NotFound) => return snapshot_not_found("snapshot file not found"),
     };
 
+    let manifest = match load_snapshot_manifest(&root).await {
+        Ok(manifest) => manifest,
+        Err(SnapshotManifestError::NotFound) => {
+            return snapshot_not_found("snapshot manifest not found")
+        }
+        Err(SnapshotManifestError::TooLarge) => {
+            return snapshot_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "snapshot manifest is too large",
+            )
+        }
+        Err(SnapshotManifestError::Invalid) => {
+            return snapshot_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "snapshot manifest is not valid",
+            )
+        }
+    };
+    let listed: BTreeSet<&str> = manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    if !listed.contains(relative.as_str()) {
+        return snapshot_not_found("snapshot file not found");
+    }
+
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(_) => return snapshot_not_found("snapshot file not found"),
@@ -1434,6 +1525,12 @@ async fn snapshot_file(
         Ok(meta) if meta.is_file() => meta.len(),
         _ => return snapshot_not_found("snapshot file not found"),
     };
+    let Some(declared) = manifest.files.iter().find(|file| file.path == relative) else {
+        return snapshot_not_found("snapshot file not found");
+    };
+    if declared.size != len {
+        return snapshot_not_found("snapshot file not found");
+    }
 
     let requested = match headers
         .get(header::RANGE)
@@ -2964,6 +3061,38 @@ mod tests {
         headers
     }
 
+    fn write_serving_manifest(root: &std::path::Path, files: &[(&str, u64)]) {
+        let files: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(path, size)| {
+                serde_json::json!({
+                    "path": path,
+                    "size": size,
+                    "sha256": "00".repeat(32)
+                })
+            })
+            .collect();
+        let manifest = serde_json::json!({
+            "v": 1,
+            "kind": "verinoo-state-snapshot",
+            "chainId": "verinoo-test-1",
+            "height": 1,
+            "blockHash": "aa",
+            "parentHash": "bb",
+            "stateRoot": "cc",
+            "modelSetHash": "dd",
+            "modelHashes": {},
+            "validatorSetHash": "ee",
+            "createdAt": 1,
+            "files": files
+        });
+        std::fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn snapshot_manifest_is_404_without_a_configured_or_present_snapshot() {
         let shared = test_shared_with_snapshot(None);
@@ -2997,6 +3126,7 @@ mod tests {
         std::fs::create_dir_all(snapshot_dir.join("state")).unwrap();
         let bytes: Vec<u8> = (0..=255u8).collect();
         std::fs::write(snapshot_dir.join("state/data.bin"), &bytes).unwrap();
+        write_serving_manifest(&snapshot_dir, &[("state/data.bin", bytes.len() as u64)]);
         let shared = test_shared_with_snapshot(Some(snapshot_dir));
 
         let response = snapshot_file(
@@ -3064,6 +3194,7 @@ mod tests {
         let snapshot_dir = temp.path().join("snapshot");
         std::fs::create_dir_all(snapshot_dir.join("state")).unwrap();
         std::fs::write(snapshot_dir.join("state/ok.bin"), b"ok").unwrap();
+        write_serving_manifest(&snapshot_dir, &[("state/ok.bin", 2)]);
         let shared = test_shared_with_snapshot(Some(snapshot_dir.clone()));
 
         for path in [
@@ -3105,6 +3236,74 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_file_serves_only_manifest_listed_files() {
+        let temp = SnapshotTempDir::new("listed");
+        let snapshot_dir = temp.path().join("snapshot");
+        std::fs::create_dir_all(snapshot_dir.join("state")).unwrap();
+        std::fs::write(snapshot_dir.join("state/listed.bin"), b"listed").unwrap();
+        std::fs::write(snapshot_dir.join("state/unlisted.bin"), b"secret").unwrap();
+        write_serving_manifest(&snapshot_dir, &[("state/listed.bin", 6)]);
+        let shared = test_shared_with_snapshot(Some(snapshot_dir));
+
+        let response = snapshot_file(
+            State(shared.clone()),
+            AxumPath("state/listed.bin".into()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = snapshot_file(
+            State(shared),
+            AxumPath("state/unlisted.bin".into()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn snapshot_manifest_rejects_an_oversized_document() {
+        let temp = SnapshotTempDir::new("manifest-large");
+        let snapshot_dir = temp.path().join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        let oversized = vec![b' '; (MAX_SNAPSHOT_MANIFEST_BYTES + 1) as usize];
+        std::fs::write(snapshot_dir.join("manifest.json"), oversized).unwrap();
+        let shared = test_shared_with_snapshot(Some(snapshot_dir));
+
+        let response = snapshot_manifest(State(shared)).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_endpoints_accept_a_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = SnapshotTempDir::new("symlink-root");
+        let real = temp.path().join("real-snapshot");
+        std::fs::create_dir_all(real.join("state")).unwrap();
+        std::fs::write(real.join("state/data.bin"), b"data").unwrap();
+        write_serving_manifest(&real, &[("state/data.bin", 4)]);
+        let link = temp.path().join("linked-snapshot");
+        symlink(&real, &link).unwrap();
+        let shared = test_shared_with_snapshot(Some(link));
+
+        let response = snapshot_manifest(State(shared.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = snapshot_file(
+            State(shared),
+            AxumPath("state/data.bin".into()),
+            HeaderMap::new(),
+        )
+        .await;
+        let (status, _headers, body) = response_parts(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"data");
     }
 
     #[tokio::test]

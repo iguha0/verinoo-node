@@ -86,7 +86,12 @@ systemctl start verinoo-node
 ```
 
 `create` opens the database read-write, so it fails if the node is still
-running. Keep the signer seed in the host secret manager; it is separate from
+running. It records the compiled chain id when a database predates the
+`meta:chainId` field, requires a checkpoint head whose hash/version/state root
+are self-consistent, and requires a `VNN_MODEL_DIR`
+(default `./models`) that exists and loads at least one installed model. A
+missing or model-less directory is an error; it never signs a builtin-only
+snapshot. Keep the signer seed in the host secret manager; it is separate from
 `VNN_KEY_SEED` unless you deliberately reuse it. `create` prints the signer
 public key and the key is stored in `manifest.json.signatures`; publish it out
 of band to verifiers.
@@ -99,10 +104,12 @@ VNN_SNAPSHOT_SIGNERS=<signer-pubkey-hex>[,<signer-pubkey-hex>...]
 ```
 
 `GET /snapshot/manifest` and `GET /snapshot/files/state/...` are public reads.
-The file endpoint supports a single HTTP `Range` for resumable downloads.
-Paths are restricted to `state/` and symlinks/traversal are rejected by the
-node. If `/snapshot/` is exposed publicly, rate-limit or egress-cap it at the
-proxy; snapshots can be large.
+The file endpoint supports a single HTTP `Range` for resumable downloads and
+serves only files listed in the manifest. Paths are restricted to `state/` and
+symlinks/traversal are rejected by the node; a symlinked `VNN_SNAPSHOT_DIR` is
+resolved once and works for both endpoints. The manifest is capped at 16 MiB.
+If `/snapshot/` is exposed publicly, rate-limit or egress-cap it at the proxy;
+snapshots can be large.
 
 Verify and apply on the target host:
 
@@ -118,6 +125,7 @@ verinoo-node snapshot apply \
   --snapshot /var/lib/verinoo/incoming/snapshot-<height> \
   --db /var/lib/verinoo/data \
   --backup /var/lib/verinoo/data.pre-snapshot-$(date -u +%Y%m%dT%H%M%SZ) \
+  --chain-id verinoo-test-1 \
   --signer "$SNAPSHOT_SIGNER_PUBKEY"
 systemctl start verinoo-node
 curl -fsS localhost:7100/health
@@ -126,17 +134,24 @@ curl -fsS localhost:7100/ready
 
 `verify` checks signatures/threshold, manifest and file hashes, recomputes the
 state root from the checkpoint read-only, recomputes the validator-set hash,
-checks the checkpoint head, and compares the local model set. `apply` repeats
-verification, probes the target RocksDB lock (so a running node fails apply),
-moves the old database to `--backup`, and never deletes it. Set `VNN_MODEL_DIR`
-when verifying a snapshot that contains installed models; with it unset only
-builtin models are compared and the check fails closed.
+validates the checkpoint head (recomputed header hash, version range, and head
+state root), and compares the local model set. `apply` repeats verification
+with `--chain-id`, opens the target read-write and keeps the RocksDB lock for
+the whole rename (so a running node fails apply), reads the target's recorded
+chain id and head, and rejects a chain mismatch or a snapshot at or below the
+target height (same height is always rejected). It then re-checks the verified
+manifest digest and every file hash immediately before the rename, moves the
+old database to `--backup`, and never deletes it. An existing `--backup` path
+is rejected even when the target does not exist. The target path is briefly
+absent between the two renames; keep the node stopped for the whole command so
+nothing recreates `VNN_DB` in that window. Set `VNN_MODEL_DIR` when verifying a
+snapshot that contains installed models; with it unset only builtin models are
+compared and the check fails closed, and when set the directory must exist.
 
-Do not apply a snapshot at or below the local head, or one at the same height
-with a different hash. The CLI verifies the snapshot in isolation and does not
-compare it to the old target head. Applying a snapshot is not promotion and
-does not fence a validator; follow the manual stop/fence/start procedure in
-the HA recipe below.
+Do not rely on the CLI alone to decide promotion: review the verify output and
+confirm the snapshot is from the intended chain and signer. Applying a snapshot
+is not promotion and does not fence a validator; follow the manual
+stop/fence/start procedure in the HA recipe below.
 
 ## API key rotation (no downtime)
 

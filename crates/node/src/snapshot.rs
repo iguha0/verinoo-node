@@ -13,10 +13,11 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use verinoo_exec::engine::{Block, HEADER_VERSION, MIN_HEADER_VERSION};
 use verinoo_state::snapshot::{
-    apply_verified_snapshot, create_snapshot, manifest_signing_bytes, read_snapshot_manifest,
-    verify_snapshot, write_snapshot_manifest, ModelHashes, SnapshotExpectations, SnapshotManifest,
-    SnapshotMetadata, SnapshotSignature, SIGNING_DOMAIN,
+    apply_verified_snapshot_bound, create_snapshot, manifest_signing_bytes, read_snapshot_manifest,
+    verify_snapshot_verified, write_snapshot_manifest, ModelHashes, SnapshotExpectations,
+    SnapshotManifest, SnapshotMetadata, SnapshotSignature, VerifiedSnapshot, SIGNING_DOMAIN,
 };
 use verinoo_state::StateStore;
 
@@ -25,6 +26,7 @@ use crate::readiness;
 const MANIFEST_NAME: &str = "manifest.json";
 const DEFAULT_MODEL_DIR: &str = "./models";
 const SIGNERS_ENV: &str = "VNN_SNAPSHOT_SIGNERS";
+const MAX_SNAPSHOT_SIGNATURES: usize = 64;
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
 
@@ -52,7 +54,7 @@ fn print_help() {
     println!("Commands:");
     println!("  create --db <path> --out <dir> [--key-seed <string>] [--signer <pubkey-hex>]...");
     println!("  verify --snapshot <dir> --signer <pubkey-hex> [--signer ...] [--threshold N] [--chain-id <id>]");
-    println!("  apply  --snapshot <dir> --db <target> --backup <dir> --signer <pubkey-hex> [--signer ...] [--threshold N]");
+    println!("  apply  --snapshot <dir> --db <target> --backup <dir> --chain-id <id> --signer <pubkey-hex> [--signer ...] [--threshold N]");
     println!();
     println!("Environment:");
     println!("  VNN_KEY_SEED          default signing seed for `create`");
@@ -61,8 +63,10 @@ fn print_help() {
     println!();
     println!("Trust boundary: snapshot signatures are operator-attested, not BFT.");
     println!("verify recomputes the state root and validator hash from the checkpoint");
-    println!("and compares the local model set. The target database must be stopped for");
-    println!("apply; the old database is moved to --backup and never deleted.");
+    println!("and compares the local model set. create requires a model directory that");
+    println!("loads at least one installed model. apply requires --chain-id, rejects a");
+    println!("snapshot at or below the target head, holds the target database lock");
+    println!("across the rename, and moves the old database to --backup (never deleted).");
 }
 
 fn create_cmd(args: &[String]) -> CliResult<()> {
@@ -190,6 +194,7 @@ fn apply_cmd(args: &[String]) -> CliResult<()> {
     let mut backup: Option<PathBuf> = None;
     let mut signers = Vec::new();
     let mut threshold = 1usize;
+    let mut chain_id: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -204,6 +209,10 @@ fn apply_cmd(args: &[String]) -> CliResult<()> {
             }
             "--backup" if i + 1 < args.len() => {
                 backup = Some(PathBuf::from(&args[i + 1]));
+                i += 1;
+            }
+            "--chain-id" if i + 1 < args.len() => {
+                chain_id = Some(args[i + 1].clone());
                 i += 1;
             }
             "--signer" if i + 1 < args.len() => {
@@ -224,6 +233,7 @@ fn apply_cmd(args: &[String]) -> CliResult<()> {
     let snapshot_dir = snapshot_dir.ok_or("apply requires --snapshot <dir>")?;
     let target = target.ok_or("apply requires --db <target>")?;
     let backup = backup.ok_or("apply requires --backup <dir>")?;
+    let chain_id = chain_id.ok_or("apply requires --chain-id <id>")?;
     let signers = with_env_signers(signers)?;
     let model_dir = std::env::var("VNN_MODEL_DIR").ok().map(PathBuf::from);
 
@@ -233,18 +243,19 @@ fn apply_cmd(args: &[String]) -> CliResult<()> {
         &backup,
         &signers,
         threshold,
+        &chain_id,
         model_dir.as_deref(),
     )?;
     println!("snapshot applied: {}", snapshot_dir.display());
-    println!("height: {}", report.manifest.height);
-    println!("manifest hash: {}", report.manifest_hash);
+    println!("height: {}", report.verify.manifest.height);
+    println!("manifest hash: {}", report.verify.manifest_hash);
     println!("target: {}", target.display());
-    if backup.exists() {
-        println!("backup: {}", backup.display());
+    if let Some(path) = &report.backup {
+        println!("backup: {}", path.display());
     } else {
         println!("backup: none (target did not exist)");
     }
-    println!("signers: {}", report.signers.join(","));
+    println!("signers: {}", report.verify.signers.join(","));
     Ok(())
 }
 
@@ -285,6 +296,13 @@ struct VerifyReport {
     manifest: SnapshotManifest,
     manifest_hash: String,
     signers: Vec<String>,
+    verified: VerifiedSnapshot,
+}
+
+#[derive(Debug)]
+struct ApplyReport {
+    verify: VerifyReport,
+    backup: Option<PathBuf>,
 }
 
 fn create_at(
@@ -311,6 +329,8 @@ fn create_at(
         ));
     }
 
+    require_model_directory(model_dir)?;
+
     // Opening read-write also requires the node to be stopped: RocksDB refuses
     // a second writer while the live process holds the lock.
     let store = StateStore::open(db).map_err(|error| {
@@ -319,17 +339,23 @@ fn create_at(
             db.display()
         )
     })?;
-    let head = verinoo_exec::engine::current_head(&store)
-        .ok_or_else(|| format!("database {} has no chain head", db.display()))?;
     let state_root = verinoo_exec::engine::compute_state_root(&store);
+    let head = validate_checkpoint_head(&store, &state_root, None)?;
     let base_fee = store.get_meta("baseFee").and_then(|value| value.as_u64());
     let (model_hashes, model_set_hash, problems) = local_model_hashes(Some(model_dir))?;
     for problem in problems {
         eprintln!("model warning: {problem}");
     }
+    if model_hashes.len() <= 1 {
+        return Err(format!(
+            "model directory {} loaded no models beyond the builtin; refusing to sign a builtin-only snapshot",
+            model_dir.display()
+        ));
+    }
+    let chain_id = ensure_database_chain_id(&store, &format!("database {}", db.display()))?;
     let validator_set_hash = readiness::validator_set_hash(&store.validator_addresses());
     let metadata = SnapshotMetadata {
-        chain_id: verinoo_state::genesis::CHAIN_ID.to_string(),
+        chain_id,
         height: head.header.index,
         block_hash: head.header.hash.clone(),
         parent_hash: head.header.previous_hash.clone(),
@@ -368,8 +394,28 @@ fn verify_at(
     model_dir: Option<&Path>,
 ) -> Result<VerifyReport, String> {
     let allowed = parse_signer_keys(signer_hex)?;
-    let manifest = read_snapshot_manifest(snapshot_dir)
+    let candidate = read_snapshot_manifest(snapshot_dir)
         .map_err(|error| format!("reading snapshot manifest failed: {error}"))?;
+    if let Some(expected) = expected_chain_id {
+        if candidate.chain_id != expected {
+            return Err(format!(
+                "snapshot chain id mismatch: expected {expected}, got {}",
+                candidate.chain_id
+            ));
+        }
+    }
+    let signers = verify_manifest_signatures(&candidate, &allowed, threshold)?;
+
+    // The state layer re-reads the manifest and returns a digest-bound handle.
+    // Require the manifest it verified to equal the one the signatures covered,
+    // then pass the digest into apply so a later swap is rejected.
+    let expectations = SnapshotExpectations::from_metadata(&manifest_metadata(&candidate));
+    let verified = verify_snapshot_verified(snapshot_dir, &expectations)
+        .map_err(|error| format!("snapshot file verification failed: {error}"))?;
+    if verified.manifest() != &candidate {
+        return Err("snapshot manifest changed during verification".into());
+    }
+    let manifest = verified.manifest();
     if let Some(expected) = expected_chain_id {
         if manifest.chain_id != expected {
             return Err(format!(
@@ -377,17 +423,6 @@ fn verify_at(
                 manifest.chain_id
             ));
         }
-    }
-    let signers = verify_manifest_signatures(&manifest, &allowed, threshold)?;
-
-    // The state layer re-reads the manifest. Compare the result to the signed
-    // manifest so a swapped manifest cannot be verified under the old
-    // signatures.
-    let expectations = SnapshotExpectations::from_metadata(&manifest_metadata(&manifest));
-    let verified = verify_snapshot(snapshot_dir, &expectations)
-        .map_err(|error| format!("snapshot file verification failed: {error}"))?;
-    if verified != manifest {
-        return Err("snapshot manifest changed during verification".into());
     }
 
     let state_dir = snapshot_dir.join("state");
@@ -404,6 +439,7 @@ fn verify_at(
             manifest.state_root
         ));
     }
+    validate_checkpoint_head(&store, &recomputed_root, Some(manifest))?;
     let validator_set_hash = readiness::validator_set_hash(&store.validator_addresses());
     if validator_set_hash != manifest.validator_set_hash {
         return Err(format!(
@@ -411,28 +447,11 @@ fn verify_at(
             manifest.validator_set_hash
         ));
     }
-    let head = verinoo_exec::engine::current_head(&store)
-        .ok_or_else(|| "snapshot checkpoint has no chain head".to_string())?;
-    if head.header.index != manifest.height {
-        return Err(format!(
-            "snapshot head height mismatch: manifest {}, checkpoint {}",
-            manifest.height, head.header.index
-        ));
-    }
-    if head.header.hash != manifest.block_hash {
-        return Err(format!(
-            "snapshot head block hash mismatch: manifest {}, checkpoint {}",
-            manifest.block_hash, head.header.hash
-        ));
-    }
-    if head.header.previous_hash != manifest.parent_hash {
-        return Err(format!(
-            "snapshot parent hash mismatch: manifest {}, checkpoint {}",
-            manifest.parent_hash, head.header.previous_hash
-        ));
-    }
     drop(store);
 
+    if let Some(dir) = model_dir {
+        require_model_directory(dir)?;
+    }
     let (local_hashes, local_set_hash, problems) = local_model_hashes(model_dir)?;
     for problem in problems {
         eprintln!("model warning: {problem}");
@@ -450,11 +469,12 @@ fn verify_at(
         ));
     }
 
-    let manifest_hash = hash_manifest_file(snapshot_dir)?;
+    let manifest_hash = verified.manifest_digest();
     Ok(VerifyReport {
-        manifest,
+        manifest: verified.manifest().clone(),
         manifest_hash,
         signers,
+        verified,
     })
 }
 
@@ -464,32 +484,186 @@ fn apply_at(
     backup: &Path,
     signer_hex: &[String],
     threshold: usize,
+    chain_id: &str,
     model_dir: Option<&Path>,
-) -> Result<VerifyReport, String> {
-    let report = verify_at(snapshot_dir, signer_hex, threshold, None, model_dir)?;
+) -> Result<ApplyReport, String> {
+    let report = verify_at(
+        snapshot_dir,
+        signer_hex,
+        threshold,
+        Some(chain_id),
+        model_dir,
+    )?;
+    if report.manifest.chain_id != chain_id {
+        return Err(format!(
+            "snapshot chain id mismatch: expected {chain_id}, got {}",
+            report.manifest.chain_id
+        ));
+    }
 
-    // A read-only probe would not detect a live writer. Opening read-write
-    // without create takes the RocksDB lock, so a running node fails here.
-    if target.exists() {
-        if !target.is_dir() {
-            return Err(format!(
-                "apply target is not a directory: {}",
-                target.display()
-            ));
+    // Hold the target's RocksDB write lock (not just a probe) for the whole
+    // rename. A node started after the probe therefore cannot open the old
+    // database while it is being moved aside.
+    let target_exists = match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "apply target is not a directory: {}",
+                    target.display()
+                ));
+            }
+            true
         }
-        let probe = StateStore::open_existing(target).map_err(|error| {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect apply target {}: {error}",
+                target.display()
+            ))
+        }
+    };
+
+    let _target_lock = if target_exists {
+        let lock = StateStore::open_existing(target).map_err(|error| {
             format!(
                 "target database {} is not closed or cannot be opened (stop the node before apply): {error}",
                 target.display()
             )
         })?;
-        drop(probe);
-    }
+        let target_chain_id =
+            database_chain_id(&lock, &format!("target database {}", target.display()))?;
+        if target_chain_id != chain_id {
+            return Err(format!(
+                "target chain id mismatch: snapshot {}, target {target_chain_id}",
+                chain_id
+            ));
+        }
+        if let Some(head) = verinoo_exec::engine::current_head(&lock) {
+            if report.manifest.height <= head.header.index {
+                return Err(format!(
+                    "snapshot height {} is not greater than target head height {}; refusing to apply a stale or same-height snapshot",
+                    report.manifest.height, head.header.index
+                ));
+            }
+        }
+        Some(lock)
+    } else {
+        None
+    };
 
     let expectations = SnapshotExpectations::from_metadata(&manifest_metadata(&report.manifest));
-    apply_verified_snapshot(snapshot_dir, &expectations, target, backup)
-        .map_err(|error| format!("snapshot apply failed: {error}"))?;
-    Ok(report)
+    apply_verified_snapshot_bound(
+        snapshot_dir,
+        &report.verified,
+        &expectations,
+        target,
+        backup,
+    )
+    .map_err(|error| format!("snapshot apply failed: {error}"))?;
+    drop(_target_lock);
+
+    Ok(ApplyReport {
+        backup: target_exists.then(|| backup.to_path_buf()),
+        verify: report,
+    })
+}
+
+fn validate_checkpoint_head(
+    store: &StateStore,
+    computed_state_root: &str,
+    expected: Option<&SnapshotManifest>,
+) -> Result<Block, String> {
+    let head = verinoo_exec::engine::current_head(store).ok_or("checkpoint has no chain head")?;
+    if head.header.version < MIN_HEADER_VERSION || head.header.version > HEADER_VERSION {
+        return Err(format!(
+            "checkpoint head version {} is outside {}..={}",
+            head.header.version, MIN_HEADER_VERSION, HEADER_VERSION
+        ));
+    }
+    let recomputed = verinoo_exec::engine::hash_header(&head.header);
+    if recomputed != head.header.hash {
+        return Err(format!(
+            "checkpoint head hash mismatch: header {}, recomputed {recomputed}",
+            head.header.hash
+        ));
+    }
+    if head.header.state_root != computed_state_root {
+        return Err(format!(
+            "checkpoint head state root mismatch: header {}, recomputed {computed_state_root}",
+            head.header.state_root
+        ));
+    }
+    if let Some(manifest) = expected {
+        if head.header.index != manifest.height {
+            return Err(format!(
+                "snapshot head height mismatch: manifest {}, checkpoint {}",
+                manifest.height, head.header.index
+            ));
+        }
+        if head.header.hash != manifest.block_hash {
+            return Err(format!(
+                "snapshot head block hash mismatch: manifest {}, checkpoint {}",
+                manifest.block_hash, head.header.hash
+            ));
+        }
+        if head.header.previous_hash != manifest.parent_hash {
+            return Err(format!(
+                "snapshot parent hash mismatch: manifest {}, checkpoint {}",
+                manifest.parent_hash, head.header.previous_hash
+            ));
+        }
+        if head.header.state_root != manifest.state_root {
+            return Err(format!(
+                "snapshot head state root mismatch: manifest {}, checkpoint {}",
+                manifest.state_root, head.header.state_root
+            ));
+        }
+    }
+    Ok(head)
+}
+
+/// Read the database chain id, recording the compiled chain id on databases
+/// that predate the metadata. Create opens the database read-write anyway.
+fn ensure_database_chain_id(store: &StateStore, label: &str) -> Result<String, String> {
+    if let Some(id) = store
+        .get_meta("chainId")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|id| !id.trim().is_empty())
+    {
+        return Ok(id);
+    }
+    let id = verinoo_state::genesis::CHAIN_ID.to_string();
+    store.set_meta("chainId", &serde_json::json!(id));
+    eprintln!("{label} had no chain id; recorded `{id}` before snapshotting");
+    Ok(id)
+}
+
+fn database_chain_id(store: &StateStore, label: &str) -> Result<String, String> {
+    store
+        .get_meta("chainId")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{label} has no chain id; start the node once with this release to record it before creating or applying a snapshot"
+            )
+        })
+}
+
+fn require_model_directory(model_dir: &Path) -> Result<(), String> {
+    let meta = std::fs::metadata(model_dir).map_err(|error| {
+        format!(
+            "model directory {} is missing or unreadable: {error}",
+            model_dir.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "model directory {} is not a directory",
+            model_dir.display()
+        ));
+    }
+    Ok(())
 }
 
 fn manifest_metadata(manifest: &SnapshotManifest) -> SnapshotMetadata {
@@ -574,6 +748,12 @@ fn verify_manifest_signatures(
         return Err(format!(
             "signature threshold {threshold} exceeds {} configured signer(s)",
             allowed.len()
+        ));
+    }
+    if manifest.signatures.len() > MAX_SNAPSHOT_SIGNATURES {
+        return Err(format!(
+            "snapshot has too many signatures: {} (max {MAX_SNAPSHOT_SIGNATURES})",
+            manifest.signatures.len()
         ));
     }
     let bytes = manifest_signing_bytes(manifest)
@@ -737,6 +917,15 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             path
         }
+
+        fn model_dir(&self) -> PathBuf {
+            let path = self.0.join("models");
+            fs::create_dir_all(&path).unwrap();
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../models/intent-transformer-v1.json");
+            fs::copy(source, path.join("intent-transformer-v1.json")).unwrap();
+            path
+        }
     }
 
     impl Drop for TempDir {
@@ -745,24 +934,31 @@ mod tests {
         }
     }
 
-    fn head(index: u64, hash: &str, parent: &str) -> verinoo_exec::engine::Block {
-        verinoo_exec::engine::Block {
-            header: verinoo_exec::engine::BlockHeader {
-                hash: hash.into(),
-                version: verinoo_exec::engine::HEADER_VERSION,
-                index,
-                timestamp: 1_000,
-                previous_hash: parent.into(),
-                validator: "validator".into(),
-                validator_pub_key: String::new(),
-                validator_signature: "sig".into(),
-                state_root: "00".repeat(32),
-                tx_root: "00".repeat(32),
-                inference_tasks_root: "00".repeat(32),
-                compute_root: "00".repeat(32),
-            },
+    fn valid_block(store: &StateStore, index: u64, parent: &str) -> Block {
+        let mut header = verinoo_exec::engine::BlockHeader {
+            hash: String::new(),
+            version: HEADER_VERSION,
+            index,
+            timestamp: 1_000,
+            previous_hash: parent.into(),
+            validator: "validator".into(),
+            validator_pub_key: String::new(),
+            validator_signature: "sig".into(),
+            state_root: verinoo_exec::engine::compute_state_root(store),
+            tx_root: "00".repeat(32),
+            inference_tasks_root: "00".repeat(32),
+            compute_root: "00".repeat(32),
+        };
+        header.hash = verinoo_exec::engine::hash_header(&header);
+        Block {
+            header,
             transactions: vec![],
         }
+    }
+
+    fn install_head(store: &StateStore, index: u64) {
+        let block = valid_block(store, index, &"bb".repeat(32));
+        verinoo_exec::engine::set_head(store, &block);
     }
 
     fn populated_store(path: &Path) -> StateStore {
@@ -775,8 +971,21 @@ mod tests {
             updated_at: 9,
         });
         store.set_meta_u64("baseFee", 3);
-        let block = head(7, &"aa".repeat(32), &"bb".repeat(32));
-        verinoo_exec::engine::set_head(&store, &block);
+        store.set_meta(
+            "chainId",
+            &serde_json::json!(verinoo_state::genesis::CHAIN_ID),
+        );
+        install_head(&store, 7);
+        store
+    }
+
+    fn target_store(path: &Path, chain_id: &str, height: Option<u64>) -> StateStore {
+        let store = StateStore::open(path).unwrap();
+        store.set_meta("chainId", &serde_json::json!(chain_id));
+        store.set_meta_u64("baseFee", 99);
+        if let Some(height) = height {
+            install_head(&store, height);
+        }
         store
     }
 
@@ -789,7 +998,7 @@ mod tests {
         let root = TempDir::new(tag);
         let db = root.path().join("db");
         let snapshot_dir = root.path().join("snapshot");
-        let models = root.empty_model_dir();
+        let models = root.model_dir();
         {
             let _store = populated_store(&db);
         }
@@ -814,19 +1023,22 @@ mod tests {
 
         let target = root.path().join("target");
         let backup = root.path().join("backup");
-        {
-            let old = StateStore::open(&target).unwrap();
-            old.set_meta_u64("baseFee", 99);
-        }
-        apply_at(
+        drop(target_store(
+            &target,
+            verinoo_state::genesis::CHAIN_ID,
+            Some(3),
+        ));
+        let report = apply_at(
             &snapshot_dir,
             &target,
             &backup,
             &[public_key],
             1,
+            verinoo_state::genesis::CHAIN_ID,
             Some(&models),
         )
         .unwrap();
+        assert_eq!(report.backup.as_deref(), Some(backup.as_path()));
         assert!(backup.is_dir());
         let applied = StateStore::open(&target).unwrap();
         assert_eq!(applied.get_account("ai_alice").unwrap().balance, 500);
@@ -928,7 +1140,7 @@ mod tests {
         let root = TempDir::new("pin");
         let db = root.path().join("db");
         let snapshot_dir = root.path().join("snapshot");
-        let models = root.empty_model_dir();
+        let models = root.model_dir();
         drop(populated_store(&db));
         let (other_key, _) = signer_seed("other-seed");
         let error =
@@ -941,6 +1153,11 @@ mod tests {
         let (root, snapshot_dir, models, public_key) = fixture("locked");
         let target = root.path().join("target");
         let backup = root.path().join("backup");
+        drop(target_store(
+            &target,
+            verinoo_state::genesis::CHAIN_ID,
+            Some(1),
+        ));
         let live = StateStore::open(&target).unwrap();
         let error = apply_at(
             &snapshot_dir,
@@ -948,6 +1165,7 @@ mod tests {
             &backup,
             &[public_key],
             1,
+            verinoo_state::genesis::CHAIN_ID,
             Some(&models),
         )
         .unwrap_err();
@@ -960,6 +1178,7 @@ mod tests {
             &backup,
             &[public_key],
             1,
+            verinoo_state::genesis::CHAIN_ID,
             Some(&models),
         )
         .unwrap();
@@ -968,12 +1187,207 @@ mod tests {
     #[test]
     fn model_mismatch_fails_closed() {
         let (_root, snapshot_dir, _models, public_key) = fixture("models");
-        // The fixture created the snapshot with the builtin-only set; loading
+        // The fixture created the snapshot with one installed model; loading
         // the repository models (or a different dir) must not be trusted.
         let repo_models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
         let error =
             verify_at(&snapshot_dir, &[public_key], 1, None, Some(&repo_models)).unwrap_err();
         assert!(error.contains("model"), "{error}");
+    }
+
+    #[test]
+    fn apply_rejects_chain_mismatch_stale_and_same_height_targets() {
+        let (root, snapshot_dir, models, public_key) = fixture("stale");
+        let signers = [public_key];
+        let chain = verinoo_state::genesis::CHAIN_ID;
+
+        let target = root.path().join("target-chain");
+        let backup = root.path().join("backup-chain");
+        drop(target_store(&target, "other-chain", Some(1)));
+        let error = apply_at(
+            &snapshot_dir,
+            &target,
+            &backup,
+            &signers,
+            1,
+            chain,
+            Some(&models),
+        )
+        .unwrap_err();
+        assert!(error.contains("target chain id mismatch"), "{error}");
+        assert!(!backup.exists());
+        assert!(target.exists());
+
+        for height in [7, 8] {
+            let target = root.path().join(format!("target-{height}"));
+            let backup = root.path().join(format!("backup-{height}"));
+            drop(target_store(&target, chain, Some(height)));
+            let error = apply_at(
+                &snapshot_dir,
+                &target,
+                &backup,
+                &signers,
+                1,
+                chain,
+                Some(&models),
+            )
+            .unwrap_err();
+            assert!(error.contains("not greater"), "{error}");
+            assert!(!backup.exists());
+        }
+
+        let target = root.path().join("target-no-chain");
+        let backup = root.path().join("backup-no-chain");
+        drop(StateStore::open(&target).unwrap());
+        let error = apply_at(
+            &snapshot_dir,
+            &target,
+            &backup,
+            &signers,
+            1,
+            chain,
+            Some(&models),
+        )
+        .unwrap_err();
+        assert!(error.contains("has no chain id"), "{error}");
+        assert!(!backup.exists());
+        assert!(snapshot_dir.join("state").exists());
+    }
+
+    #[test]
+    fn apply_refuses_an_existing_backup_even_without_a_target() {
+        let (root, snapshot_dir, models, public_key) = fixture("backup-absent");
+        let target = root.path().join("target-absent");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("sentinel"), b"keep").unwrap();
+
+        let error = apply_at(
+            &snapshot_dir,
+            &target,
+            &backup,
+            &[public_key],
+            1,
+            verinoo_state::genesis::CHAIN_ID,
+            Some(&models),
+        )
+        .unwrap_err();
+        assert!(error.contains("backup path already exists"), "{error}");
+        assert!(!target.exists());
+        assert_eq!(fs::read(backup.join("sentinel")).unwrap(), b"keep");
+        assert!(snapshot_dir.join("state").exists());
+    }
+
+    #[test]
+    fn tampered_manifest_after_verify_is_not_applied() {
+        let (root, snapshot_dir, models, public_key) = fixture("bound-apply");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        drop(target_store(
+            &target,
+            verinoo_state::genesis::CHAIN_ID,
+            Some(3),
+        ));
+        let report = verify_at(
+            &snapshot_dir,
+            &[public_key],
+            1,
+            Some(verinoo_state::genesis::CHAIN_ID),
+            Some(&models),
+        )
+        .unwrap();
+
+        // `createdAt` is signed but not part of the apply expectations, so a
+        // swapped manifest still passes expectation checks. The digest bound
+        // into `report.verified` is what rejects it.
+        let manifest_path = snapshot_dir.join(MANIFEST_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        value["createdAt"] = serde_json::json!(value["createdAt"].as_u64().unwrap() + 1);
+        fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let expectations =
+            SnapshotExpectations::from_metadata(&manifest_metadata(&report.manifest));
+        let error = apply_verified_snapshot_bound(
+            &snapshot_dir,
+            &report.verified,
+            &expectations,
+            &target,
+            &backup,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                verinoo_state::snapshot::SnapshotError::ManifestChanged { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(!backup.exists());
+        let untouched = StateStore::open(&target).unwrap();
+        assert!(untouched.get_account("ai_alice").is_none());
+        assert_eq!(untouched.meta_u64_or("baseFee", 0), 99);
+    }
+
+    #[test]
+    fn create_requires_a_model_directory_with_installed_models() {
+        let root = TempDir::new("model-required");
+        let db = root.path().join("db");
+        drop(populated_store(&db));
+
+        let missing = root.path().join("missing-models");
+        let out = root.path().join("snapshot-missing");
+        let error = create_at(&db, &out, "operator-seed", &[], &missing).unwrap_err();
+        assert!(error.contains("model directory"), "{error}");
+        assert!(!out.exists());
+
+        let empty = root.empty_model_dir();
+        let out = root.path().join("snapshot-empty");
+        let error = create_at(&db, &out, "operator-seed", &[], &empty).unwrap_err();
+        assert!(error.contains("loaded no models"), "{error}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn checkpoint_head_validation_rejects_forged_headers() {
+        let root = TempDir::new("forged-head");
+        let db = root.path().join("db");
+        let store = populated_store(&db);
+        let computed = verinoo_exec::engine::compute_state_root(&store);
+        validate_checkpoint_head(&store, &computed, None).unwrap();
+
+        let mut block = valid_block(&store, 7, &"bb".repeat(32));
+        block.header.hash = "aa".repeat(32);
+        verinoo_exec::engine::set_head(&store, &block);
+        let error = validate_checkpoint_head(&store, &computed, None).unwrap_err();
+        assert!(error.contains("hash mismatch"), "{error}");
+
+        let mut block = valid_block(&store, 7, &"bb".repeat(32));
+        block.header.version = HEADER_VERSION + 1;
+        block.header.hash = verinoo_exec::engine::hash_header(&block.header);
+        verinoo_exec::engine::set_head(&store, &block);
+        let error = validate_checkpoint_head(&store, &computed, None).unwrap_err();
+        assert!(error.contains("version"), "{error}");
+
+        let mut block = valid_block(&store, 7, &"bb".repeat(32));
+        block.header.state_root = "00".repeat(32);
+        block.header.hash = verinoo_exec::engine::hash_header(&block.header);
+        verinoo_exec::engine::set_head(&store, &block);
+        let error = validate_checkpoint_head(&store, &computed, None).unwrap_err();
+        assert!(error.contains("state root mismatch"), "{error}");
+    }
+
+    #[test]
+    fn signature_list_is_capped() {
+        let (_root, snapshot_dir, _models, public_key) = fixture("signature-cap");
+        let mut manifest = read_snapshot_manifest(&snapshot_dir).unwrap();
+        let first = manifest.signatures[0].clone();
+        while manifest.signatures.len() <= MAX_SNAPSHOT_SIGNATURES {
+            manifest.signatures.push(first.clone());
+        }
+        let allowed = parse_signer_keys(&[public_key]).unwrap();
+        let error = verify_manifest_signatures(&manifest, &allowed, 1).unwrap_err();
+        assert!(error.contains("too many signatures"), "{error}");
     }
 
     #[test]

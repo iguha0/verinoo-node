@@ -486,6 +486,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = StateStore::open(&cfg.db_path)?;
 
+    // Bind the database to a chain id so snapshot apply can reject a snapshot
+    // from another chain without trusting the operator to pass the right one.
+    match store
+        .get_meta("chainId")
+        .and_then(|value| value.as_str().map(str::to_owned))
+    {
+        Some(existing) if existing != cfg.genesis.chain_id => {
+            return Err(format!(
+                "database chain id mismatch: database has `{existing}`, configured chain is `{}`",
+                cfg.genesis.chain_id
+            )
+            .into());
+        }
+        Some(_) => {}
+        None => store.set_meta("chainId", &serde_json::json!(cfg.genesis.chain_id)),
+    }
+
     // Model set: graph models executed deterministically inside block
     // application. Every node in a network must run the same set, otherwise
     // the state root diverges and peers reject each other's blocks.

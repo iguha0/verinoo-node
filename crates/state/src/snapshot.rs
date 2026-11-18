@@ -34,6 +34,35 @@ pub type ModelHashes = BTreeMap<String, String>;
 
 type ManifestDigest = [u8; 32];
 
+/// Opaque result of a successful [`verify_snapshot`] call.
+///
+/// Carries the exact manifest bytes digest observed during verification. Apply
+/// requires this value so a manifest (and its file set) cannot be swapped for a
+/// different internally consistent snapshot between verify and apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSnapshot {
+    manifest: SnapshotManifest,
+    digest: ManifestDigest,
+}
+
+impl VerifiedSnapshot {
+    /// Verified manifest.
+    pub fn manifest(&self) -> &SnapshotManifest {
+        &self.manifest
+    }
+
+    /// Lowercase hex SHA-256 over the exact `manifest.json` bytes that were
+    /// verified.
+    pub fn manifest_digest(&self) -> String {
+        hex::encode(self.digest)
+    }
+
+    /// Consume the verified snapshot and return its manifest.
+    pub fn into_manifest(self) -> SnapshotManifest {
+        self.manifest
+    }
+}
+
 /// Caller-supplied metadata for a snapshot. The state layer records these
 /// values but cannot derive or validate their truth; `state_root` must come
 /// from `verinoo-exec` and the hashes from the local model/validator registries.
@@ -330,8 +359,17 @@ pub fn verify_snapshot(
     snapshot_dir: &Path,
     expected: &SnapshotExpectations,
 ) -> Result<SnapshotManifest, SnapshotError> {
-    let (manifest, _) = verify_snapshot_with_digest(snapshot_dir, expected)?;
-    Ok(manifest)
+    Ok(verify_snapshot_verified(snapshot_dir, expected)?.into_manifest())
+}
+
+/// Like [`verify_snapshot`], but returns a [`VerifiedSnapshot`] that apply can
+/// bind to.
+pub fn verify_snapshot_verified(
+    snapshot_dir: &Path,
+    expected: &SnapshotExpectations,
+) -> Result<VerifiedSnapshot, SnapshotError> {
+    let (manifest, digest) = verify_snapshot_with_digest(snapshot_dir, expected)?;
+    Ok(VerifiedSnapshot { manifest, digest })
 }
 
 fn verify_snapshot_with_digest(
@@ -439,21 +477,45 @@ pub fn apply_snapshot(
 /// Full expectations are re-verified immediately before the state directory is
 /// moved, not just file integrity. Apply is bound to the exact manifest bytes
 /// seen by the first verification, so a snapshot swapped for a different valid
-/// snapshot is rejected. The snapshot directory must still be immutable and
-/// trusted: an attacker who can rewrite it between the final check and the
-/// rename can still race the apply.
+/// snapshot is rejected. Prefer [`apply_verified_snapshot_bound`]: callers that
+/// already hold a [`VerifiedSnapshot`] pass its digest across the node-level
+/// signature check and close the swap window between that check and apply.
+///
+/// The snapshot directory must still be immutable and trusted: an attacker who
+/// can rewrite it between the final check and the rename can still race the
+/// apply.
 pub fn apply_verified_snapshot(
     snapshot_dir: &Path,
     expected: &SnapshotExpectations,
     target_db: &Path,
     backup_dir: &Path,
 ) -> Result<SnapshotManifest, SnapshotError> {
+    let verified = verify_snapshot_verified(snapshot_dir, expected)?;
+    apply_verified_snapshot_bound(snapshot_dir, &verified, expected, target_db, backup_dir)
+}
+
+/// Apply the exact snapshot described by `verified`.
+///
+/// `verified` must have been produced by [`verify_snapshot_verified`] (or a
+/// node-level verifier that ran the same state-layer check and then verified
+/// signatures over [`VerifiedSnapshot::manifest`]). This function re-reads the
+/// manifest, requires its digest to equal `verified.manifest_digest()`, and
+/// re-verifies expectations and every file hash immediately before the state
+/// directory is moved. A manifest or file swapped after the node verified
+/// signatures therefore cannot be applied.
+pub fn apply_verified_snapshot_bound(
+    snapshot_dir: &Path,
+    verified: &VerifiedSnapshot,
+    expected: &SnapshotExpectations,
+    target_db: &Path,
+    backup_dir: &Path,
+) -> Result<SnapshotManifest, SnapshotError> {
     let (manifest, digest) = verify_snapshot_with_digest(snapshot_dir, expected)?;
-    verify_manifest_unchanged(snapshot_dir, &digest)?;
+    ensure_manifest_unchanged(&verified.digest, &digest)?;
     apply_verified_state_dir(snapshot_dir, target_db, backup_dir, || {
         let (_, actual) =
             verify_snapshot_with_digest(snapshot_dir, expected).map_err(io::Error::other)?;
-        ensure_manifest_unchanged(&digest, &actual).map_err(io::Error::other)?;
+        ensure_manifest_unchanged(&verified.digest, &actual).map_err(io::Error::other)?;
         Ok(())
     })?;
     Ok(manifest)
@@ -820,14 +882,17 @@ where
         return Err(SnapshotError::OverlappingPaths(backup_dir.to_path_buf()));
     }
 
+    // The backup path must be free even when the target does not exist. A
+    // stale backup at that path would be silently reused or overwritten later.
+    match fs::symlink_metadata(backup_dir) {
+        Ok(_) => return Err(SnapshotError::BackupExists(backup_dir.to_path_buf())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(backup_dir, e)),
+    }
+
     if let Some(meta) = &target_meta {
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(SnapshotError::TargetNotDirectory(target_db.to_path_buf()));
-        }
-        match fs::symlink_metadata(backup_dir) {
-            Ok(_) => return Err(SnapshotError::BackupExists(backup_dir.to_path_buf())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_err(backup_dir, e)),
         }
         fs::rename(target_db, backup_dir).map_err(|e| io_err(target_db, e))?;
     }
@@ -1219,6 +1284,21 @@ mod tests {
     }
 
     #[test]
+    fn apply_refuses_a_backup_path_when_the_target_is_absent() {
+        let (root, _meta, snapshot_dir) = fixture("backup-absent-target");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("sentinel"), b"backup").unwrap();
+
+        let err = apply_snapshot(&snapshot_dir, &target, &backup).unwrap_err();
+        assert!(matches!(err, SnapshotError::BackupExists(_)));
+        assert!(!target.exists());
+        assert_eq!(fs::read(backup.join("sentinel")).unwrap(), b"backup");
+        assert!(snapshot_dir.join(STATE_DIR).exists());
+    }
+
+    #[test]
     fn apply_restores_target_when_state_move_fails() {
         let (root, _meta, snapshot_dir) = fixture("rollback");
         let target = root.path().join("target");
@@ -1322,6 +1402,38 @@ mod tests {
 
         assert!(state_dir.exists());
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn bound_apply_rejects_a_manifest_swapped_after_verify() {
+        let (root, meta, snapshot_dir) = fixture("bound-manifest");
+        let target = root.path().join("target");
+        let backup = root.path().join("backup");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("sentinel"), b"old").unwrap();
+
+        let expected = SnapshotExpectations::from_metadata(&meta);
+        let verified = verify_snapshot_verified(&snapshot_dir, &expected).unwrap();
+
+        // `createdAt` is not part of the caller expectations, so this swapped
+        // manifest still passes structural and expectation checks. Only the
+        // digest binding can catch it.
+        let manifest_path = snapshot_dir.join(MANIFEST_NAME);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        value["createdAt"] = json!(value["createdAt"].as_u64().unwrap() + 1);
+        fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let err =
+            apply_verified_snapshot_bound(&snapshot_dir, &verified, &expected, &target, &backup)
+                .unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::ManifestChanged { .. }),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"old");
+        assert!(!backup.exists());
+        assert!(snapshot_dir.join(STATE_DIR).exists());
     }
 
     #[test]

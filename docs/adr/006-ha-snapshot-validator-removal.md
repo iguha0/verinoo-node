@@ -2,23 +2,27 @@
 
 ## Status
 
-**Partially implemented — readiness observability and the state-layer snapshot
-format.** `GET /ready`, the `syncing` flag, `peerCount`, `validatorSetHash`, and
-`validatorSetConsistent` are implemented as described in "API failover, health
-checks, DNS, and load balancer". The state layer also implements local snapshot
-create/verify/apply (`crates/state/src/snapshot.rs`, documented in
-`docs/snapshots.md`): RocksDB checkpointing, a hashed file manifest, strict
-path and file verification, and atomic apply with rollback and a backup when
-replacing an existing database. Node snapshot endpoints, manifest signing and
-signature verification, state-root recomputation for snapshots using
-`crates/exec`, and BFT certificates remain unimplemented. The rest of this
-document remains a target design: no code in this repository implements
-automatic failover, split-brain
-protection, state snapshot transfer over the network, or a consensus
-validator-set change. Do not cite anything else here as shipped behavior.
+**Partially implemented — readiness observability, snapshot create/verify/apply,
+and snapshot serving endpoints.** `GET /ready`, the `syncing` flag,
+`peerCount`, `validatorSetHash`, and `validatorSetConsistent` are implemented
+as described in "API failover, health checks, DNS, and load balancer". The
+state layer implements local snapshot create/verify/apply
+(`crates/state/src/snapshot.rs`, documented in `docs/snapshots.md`): RocksDB
+checkpointing, a hashed file manifest, strict path and file verification,
+digest-bound apply, and atomic apply with rollback and a backup when replacing
+an existing database. The node implements `snapshot create|verify|apply`,
+operator Ed25519 manifest signatures with thresholds, state-root and
+validator-set recomputation using `crates/exec`, checkpoint head validation,
+`--chain-id` plus target chain/head checks, the target RocksDB lock held across
+the rename, and `GET /snapshot/manifest` / `GET /snapshot/files/*path`. BFT
+certificates remain unimplemented. The rest of this document remains a target
+design: no code in this repository implements automatic failover, split-brain
+protection, automatic snapshot download/apply, or a consensus validator-set
+change. Do not cite anything else here as shipped behavior.
 
 Date: 2026-11-15 (readiness surface implemented 2026-11-15; hardened 2026-11-16;
-state-layer snapshot create/verify/apply added 2026-11-17)
+state-layer snapshot create/verify/apply added 2026-11-17; signature-bound
+apply, target stale/chain checks, and snapshot serving hardened 2026-11-18)
 Scope: `crates/node`, `crates/state`, `crates/exec`, `crates/network`,
 `scripts/`, and operations documentation.
 
@@ -326,18 +330,24 @@ must be immutable and trusted for the whole verify/apply operation. Keep the
 old directory until the node has applied at least one new block and produced a
 matching state root.
 
-State-layer scope today: `verify_snapshot` performs the local file-set checks
-from steps 3-4 (size/SHA-256, path safety, metadata comparison, and
-`baseFee` when the caller supplies `SnapshotExpectations.base_fee`) for an
-already-downloaded snapshot. `apply_snapshot` implements the rename and
-rollback portion of step 8 and consumes `state/`, leaving the backup in place
-when it replaces an existing database. Apply re-runs integrity or full
-expectations immediately before the state rename and is bound to the manifest
-bytes verified at entry, but the snapshot directory must still be immutable and
-trusted; the target database must be closed. Network download/resume,
-state-root recomputation (step 4), signature verification (step 2), certificate
-verification (step 7), and head/catch-up setup (step 9) are not implemented.
-The state layer treats `stateRoot`, `modelSetHash`, `modelHashes`,
+Implemented today: `verify_snapshot` performs the local file-set checks from
+step 3 (size/SHA-256, path safety, metadata comparison, and `baseFee` when the
+caller supplies `SnapshotExpectations.base_fee`) and returns a
+`VerifiedSnapshot` carrying the exact manifest digest. `apply_snapshot` and
+`apply_verified_snapshot_bound` implement the rename and rollback portion of
+step 8 and consume `state/`, leaving the backup in place when it replaces an
+existing database. Apply re-runs file hashes and expectations and requires the
+manifest digest to equal the verified one immediately before the rename, and
+rejects an existing backup path even when the target is absent. The node CLI
+implements step 2: signatures over the verified manifest, `--chain-id`, target
+chain-id and current-head reads, rejection of a snapshot at or below the target
+head, and checkpoint head validation (recomputed header hash, header version
+range, and `head.header.state_root == compute_state_root`). It holds the target
+RocksDB lock across the rename. The snapshot directory must still be immutable
+and trusted: an attacker who can rewrite its state files between the final
+check and the rename can race apply. Network download/resume, automatic apply,
+certificate verification (step 7), and head/catch-up setup (step 9) are not
+implemented. The state layer treats `stateRoot`, `modelSetHash`, `modelHashes`,
 `validatorSetHash`, and `baseFee` as caller/node-level assertions; it does not
 derive or cryptographically verify them.
 
@@ -528,15 +538,16 @@ Do the prerequisites before the visible features:
    still the configured list, so the node does not refuse to run with a
    mismatched set. This coverage is a prerequisite for on-chain removal and for
    BFT.
-2. **Snapshot format, manifest, and verifier (1-2 wk).** The state layer now has
-   `StateStore::checkpoint`, a manifest builder/verifier, and atomic
-   apply/rollback (`crates/state/src/snapshot.rs`; `docs/snapshots.md`).
-   Signing, node download/verify orchestration, state-root recomputation, and
-   serving endpoints remain. Do not serve snapshots until the node verifier
-   rejects tampered files, stale heights, and unauthorized signatures.
-3. **Catch-up from a snapshot (0.5-1 wk).** Start `sync_once` at the snapshot
-   height; keep `/blocks/since` unchanged. Add `/snapshot/manifest` and a file
-   endpoint behind a flag.
+2. **Snapshot format, manifest, and verifier (1-2 wk).** Implemented:
+   `StateStore::checkpoint`, a manifest builder/verifier, digest-bound atomic
+   apply/rollback (`crates/state/src/snapshot.rs`), node signing and signature
+   verification, state-root/validator-set/head recomputation, `--chain-id` and
+   target stale/chain checks, and serving endpoints. The node verifier rejects
+   tampered files, stale/same-height targets, chain mismatches, and
+   unauthorized signatures. BFT certificates remain.
+3. **Catch-up from a snapshot (0.5-1 wk).** `/snapshot/manifest` and the file
+   endpoint exist. Remaining: start `sync_once` at an applied snapshot height
+   automatically; keep `/blocks/since` unchanged.
 4. **HA runbook and fencing (1 wk).** `/ready`, height/lag checks, `peerCount`,
    `syncing`, and `validatorSetHash` are implemented. A promotion script that
    refuses to run while the old process is alive and split-brain alerts remain.
@@ -567,12 +578,16 @@ Snapshot tests (the state-layer cases run in `crates/state/src/snapshot.rs`;
 the remaining cases are integration or node-level):
 
 The state-layer suite covers create/verify/apply, tampered files (including a
-manifest or state file changed between verify and apply), metadata mismatches
-(including `baseFee` expectations), path traversal/absolute paths/duplicates/
-missing files, successful replacement with an intact readable backup, rejected
-overlapping snapshot/target/backup paths, backup/rollback, and stable signing
-bytes. The cases below that require a network endpoint, signature policy,
-state-root recomputation, or BFT remain unimplemented.
+manifest or state file changed between verify and apply), a manifest digest
+swapped after verify, metadata mismatches (including `baseFee` expectations),
+path traversal/absolute paths/duplicates/missing files, an existing backup
+with an absent target, successful replacement with an intact readable backup,
+rejected overlapping snapshot/target/backup paths, backup/rollback, and stable
+signing bytes. The node suite covers signature policy and caps, checkpoint head
+hash/version/state-root forgeries, model-directory fail-closed creation,
+chain-mismatched and stale/same-height targets, a manifest tampered after
+verify, manifest-listed file serving, oversized manifests, and a symlinked
+snapshot root. Network download/resume and BFT cases remain unimplemented.
 
 1. Build a store at height H, checkpoint it, write a manifest, apply it to a
    fresh temp store. Assert the state root, head hash, height, base fee, model
@@ -648,9 +663,12 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
   the configured list. These signals do not elect a leader, fence a host,
   transfer state, or change consensus membership.
 - **Not implemented.** There is no automatic failover, leader lease, fencing
-  primitive, snapshot HTTP endpoint, node-level manifest signing/verification,
-  state-root recomputation during snapshot verification, epoch activation,
+  primitive, automatic snapshot download/apply, epoch activation,
   `BindValidatorKey`, or state-derived consensus set in this repository.
+  Snapshot HTTP serving, node-level manifest signing/verification,
+  state-root recomputation, target stale/chain rejection, and the target
+  database lock across apply are implemented; they do not add consensus or
+  finality.
 - **No automatic HA.** Promotion is manual and requires an external fencing
   step. Running the same validator key on two hosts is not prevented by the
   node; it is detected, at best, after the fact.
@@ -658,11 +676,11 @@ Validator-set tests (`crates/exec/tests/` and a consensus harness):
   leader election. `/ready`, `peerCount`, and `validatorSetHash` make a
   divergent head or set visible, but they do not prevent it. ADR 004's evidence
   collection is not a prevention mechanism.
-- **No snapshot transfer over the network today.** The state layer can create,
-  verify, and apply a local snapshot (`crates/state/src/snapshot.rs`,
-  `docs/snapshots.md`), but no endpoint serves one and no node downloads one. A
-  late node still replays from genesis via `VNN_SYNC_URLS`; join time is
-  O(chain length).
+- **No automatic snapshot transfer.** The node serves snapshots over
+  `/snapshot/manifest` and `/snapshot/files/*path`, but no node downloads,
+  verifies, and applies one automatically. Operators run the CLI on a stopped
+  target. A late node still replays from genesis via `VNN_SYNC_URLS`; join time
+  is O(chain length).
 - **No signature or state-root verification in the state layer.** Snapshot
   metadata is caller-provided. The state layer compares `stateRoot`,
   `modelSetHash`, `modelHashes`, and `validatorSetHash` to expected values and
