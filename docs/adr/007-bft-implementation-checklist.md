@@ -2,9 +2,12 @@
 
 ## Status
 
-**Proposed checklist — not implemented.** ADR 004
-(`docs/adr/004-bft-finality.md`) is the design; this file is the execution
-order, review checklist, and claim boundary. It does not replace ADR 004.
+**Partially implemented.** ADR 004 (`docs/adr/004-bft-finality.md`) is the
+design. Implemented: Phase 1 signed types, Phase 2 in-process round/lock state
+machine, Phase 3 proposal/vote/evidence transport, and partial Phase 4
+quorum certificates/evidence/persisted finality in the node. Not implemented:
+commit-only-after-finality gating, node view changes/timeouts for an offline
+leader, Phase 5 certified sync/evidence API and Phase 6 activation tooling.
 Date: 2026-11-15. Scope: `crates/consensus` (new), `crates/node`,
 `crates/exec`, `crates/network`, `crates/state`.
 

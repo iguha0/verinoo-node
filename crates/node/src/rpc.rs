@@ -245,6 +245,22 @@ async fn status(
         ),
         None => (0, String::new(), String::new(), 0),
     };
+    let (finalized_height, finalized_hash) = if let Some(manager) = &shared.finality {
+        let manager = manager.lock().await;
+        (
+            manager.finalized_height(),
+            manager.finalized_hash().to_string(),
+        )
+    } else {
+        (
+            shared.store.meta_u64_or("finalizedHeight", 0),
+            shared
+                .store
+                .get_meta("finalizedHash")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+        )
+    };
     Json(serde_json::json!({
         "chainId": shared.params.chain_id,
         "height": height,
@@ -255,6 +271,9 @@ async fn status(
         "syncing": shared.syncing.load(Ordering::Relaxed),
         "validatorSetHash": shared.validator_set_hash(),
         "validatorSetConsistent": shared.validator_set_consistent(),
+        "finalizedHeight": finalized_height,
+        "finalizedHash": finalized_hash,
+        "consensus": shared.consensus_mode,
         "mempool": shared.mempool.lock().await.len(),
         "validators": shared.params.validators,
     }))
@@ -1763,6 +1782,8 @@ mod tests {
             request_policy,
             task_streams: Arc::new(tokio::sync::Semaphore::new(crate::MAX_ACTIVE_TASK_STREAMS)),
             snapshot_dir,
+            finality: None,
+            consensus_mode: "legacy".into(),
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
     }

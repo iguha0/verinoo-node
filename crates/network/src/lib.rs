@@ -1,11 +1,14 @@
-//! Verinoo P2P networking — libp2p gossipsub for block/tx propagation.
+//! Verinoo P2P networking — libp2p gossipsub for block/tx/consensus propagation.
 //!
 //! Design (Phase R2):
-//!   - Two topics: `verinoo/blocks/1` and `verinoo/txs/1`
+//!   - Five topics: blocks, txs, proposals, votes and evidence
 //!   - Messages carry hex-encoded canonical JSON payloads
 //!   - Duplicate suppression via seen-set with LRU-ish cap
 //!   - Peer scoring skeleton: ban list with expiry (R3 extends to
 //!     automatic bans on invalid blocks)
+//!
+//! Receive-side payload caps: proposals <= 1 MiB, votes <= 4 KiB,
+//! evidence <= 16 KiB. Blocks and txs keep their existing receive path.
 //!
 //! The engine boundary stays hostile-network safe: every received block
 //! MUST pass validate_block before persistence — enforced by the caller.
@@ -22,6 +25,16 @@ use tokio::sync::mpsc;
 
 pub const BLOCKS_TOPIC: &str = "verinoo/blocks/1";
 pub const TXS_TOPIC: &str = "verinoo/txs/1";
+pub const PROPOSALS_TOPIC: &str = "verinoo/proposals/1";
+pub const VOTES_TOPIC: &str = "verinoo/votes/1";
+pub const EVIDENCE_TOPIC: &str = "verinoo/evidence/1";
+
+/// Maximum accepted proposal payload on the wire (1 MiB).
+pub const MAX_PROPOSAL_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum accepted vote payload on the wire (4 KiB).
+pub const MAX_VOTE_PAYLOAD_BYTES: usize = 4 * 1024;
+/// Maximum accepted evidence payload on the wire (16 KiB).
+pub const MAX_EVIDENCE_PAYLOAD_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
 pub enum NetworkEvent {
@@ -29,8 +42,82 @@ pub enum NetworkEvent {
     Block(String),
     /// A transaction payload arrived on the txs topic.
     Tx(String),
+    /// A consensus proposal payload arrived on the proposals topic (hex JSON).
+    Proposal(String),
+    /// A consensus vote payload arrived on the votes topic (hex JSON).
+    Vote(String),
+    /// Consensus evidence payload arrived on the evidence topic (hex JSON).
+    Evidence(String),
     /// A peer was banned (id, reason).
     PeerBanned(String, String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopicKind {
+    Block,
+    Tx,
+    Proposal,
+    Vote,
+    Evidence,
+}
+
+impl TopicKind {
+    fn from_topic(topic: &str) -> Option<Self> {
+        [
+            (BLOCKS_TOPIC, Self::Block),
+            (TXS_TOPIC, Self::Tx),
+            (PROPOSALS_TOPIC, Self::Proposal),
+            (VOTES_TOPIC, Self::Vote),
+            (EVIDENCE_TOPIC, Self::Evidence),
+        ]
+        .into_iter()
+        .find_map(|(suffix, kind)| has_topic_suffix(topic, suffix).then_some(kind))
+    }
+
+    fn max_payload_len(self) -> Option<usize> {
+        match self {
+            Self::Block | Self::Tx => None,
+            Self::Proposal => Some(MAX_PROPOSAL_PAYLOAD_BYTES),
+            Self::Vote => Some(MAX_VOTE_PAYLOAD_BYTES),
+            Self::Evidence => Some(MAX_EVIDENCE_PAYLOAD_BYTES),
+        }
+    }
+
+    fn into_event(self, payload: String) -> Option<NetworkEvent> {
+        if let Some(max) = self.max_payload_len() {
+            if payload.len() > max {
+                tracing::warn!(
+                    topic = ?self,
+                    len = payload.len(),
+                    max,
+                    "dropping oversized gossip payload"
+                );
+                return None;
+            }
+        }
+
+        Some(match self {
+            Self::Block => NetworkEvent::Block(payload),
+            Self::Tx => NetworkEvent::Tx(payload),
+            Self::Proposal => NetworkEvent::Proposal(payload),
+            Self::Vote => NetworkEvent::Vote(payload),
+            Self::Evidence => NetworkEvent::Evidence(payload),
+        })
+    }
+}
+
+fn has_topic_suffix(topic: &str, suffix: &str) -> bool {
+    topic
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'))
+}
+
+fn chain_topic(chain_id: &str, suffix: &str) -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new(format!("{chain_id}/{suffix}"))
+}
+
+fn route_message(topic: &str, payload: String) -> Option<NetworkEvent> {
+    TopicKind::from_topic(topic)?.into_event(payload)
 }
 
 /// Holds established connections open.
@@ -166,9 +253,13 @@ pub struct Behaviour {
 
 /// Publish-only handle (cloneable). Event stream comes back separately;
 /// dedup + ban policy live with the node's shared state.
+#[allow(clippy::enum_variant_names)]
 enum Command {
     PublishBlock(String),
     PublishTx(String),
+    PublishProposal(String),
+    PublishVote(String),
+    PublishEvidence(String),
 }
 
 /// Publish-only handle (cloneable). Event stream comes back separately;
@@ -194,9 +285,10 @@ impl NetworkNode {
         let key = identity::Keypair::ed25519_from_bytes(key_seed)?;
         let peer_id = identity::PeerId::from(key.public());
 
-        // Gossipsub: sign messages, 1MB max, per-topic mesh.
+        // Gossipsub: sign messages, 1 MiB payloads plus protocol overhead,
+        // per-topic mesh.
         let gs_config = gossipsub::ConfigBuilder::default()
-            .max_transmit_size(1_000_000)
+            .max_transmit_size(MAX_PROPOSAL_PAYLOAD_BYTES + 4096)
             .validation_mode(gossipsub::ValidationMode::Strict)
             .heartbeat_interval(Duration::from_millis(500))
             .mesh_n_low(1) // 2-node meshes are legal on the testnet
@@ -214,10 +306,16 @@ impl NetworkNode {
         )
         .map_err(|e| format!("gossipsub: {e:?}"))?;
 
-        let blocks_topic = gossipsub::IdentTopic::new(format!("{chain_id}/{BLOCKS_TOPIC}"));
-        let txs_topic = gossipsub::IdentTopic::new(format!("{chain_id}/{TXS_TOPIC}"));
+        let blocks_topic = chain_topic(chain_id, BLOCKS_TOPIC);
+        let txs_topic = chain_topic(chain_id, TXS_TOPIC);
+        let proposals_topic = chain_topic(chain_id, PROPOSALS_TOPIC);
+        let votes_topic = chain_topic(chain_id, VOTES_TOPIC);
+        let evidence_topic = chain_topic(chain_id, EVIDENCE_TOPIC);
         gossipsub.subscribe(&blocks_topic)?;
         gossipsub.subscribe(&txs_topic)?;
+        gossipsub.subscribe(&proposals_topic)?;
+        gossipsub.subscribe(&votes_topic)?;
+        gossipsub.subscribe(&evidence_topic)?;
 
         let ping = libp2p::ping::Behaviour::new(libp2p::ping::Config::new());
         let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
@@ -264,6 +362,9 @@ impl NetworkNode {
         // Bridge: outbound publishes + inbound events pumped in one task.
         let blocks_topic_str = blocks_topic.to_string();
         let txs_topic_str = txs_topic.to_string();
+        let proposals_topic_str = proposals_topic.to_string();
+        let votes_topic_str = votes_topic.to_string();
+        let evidence_topic_str = evidence_topic.to_string();
         let seed_addrs: Vec<Multiaddr> = seed_peers.iter().filter_map(|p| p.parse().ok()).collect();
         tokio::spawn(async move {
             let mut peers: HashSet<PeerId> = HashSet::new();
@@ -308,6 +409,39 @@ impl NetworkNode {
                                     }
                                 }
                             }
+                            Some(Command::PublishProposal(payload)) => {
+                                if let Err(e) = swarm.behaviour_mut().gossipsub
+                                    .publish(gossipsub::IdentTopic::new(proposals_topic_str.clone()), payload.as_bytes())
+                                {
+                                    if matches!(e, gossipsub::PublishError::InsufficientPeers) {
+                                        tracing::debug!("proposal not gossiped: no peers yet");
+                                    } else {
+                                        tracing::warn!("publish proposal failed: {e:?}");
+                                    }
+                                }
+                            }
+                            Some(Command::PublishVote(payload)) => {
+                                if let Err(e) = swarm.behaviour_mut().gossipsub
+                                    .publish(gossipsub::IdentTopic::new(votes_topic_str.clone()), payload.as_bytes())
+                                {
+                                    if matches!(e, gossipsub::PublishError::InsufficientPeers) {
+                                        tracing::debug!("vote not gossiped: no peers yet");
+                                    } else {
+                                        tracing::warn!("publish vote failed: {e:?}");
+                                    }
+                                }
+                            }
+                            Some(Command::PublishEvidence(payload)) => {
+                                if let Err(e) = swarm.behaviour_mut().gossipsub
+                                    .publish(gossipsub::IdentTopic::new(evidence_topic_str.clone()), payload.as_bytes())
+                                {
+                                    if matches!(e, gossipsub::PublishError::InsufficientPeers) {
+                                        tracing::debug!("evidence not gossiped: no peers yet");
+                                    } else {
+                                        tracing::warn!("publish evidence failed: {e:?}");
+                                    }
+                                }
+                            }
                             None => break,
                         }
                     }
@@ -318,14 +452,9 @@ impl NetworkNode {
                             )) => {
                                 let topic = message.topic.as_str();
                                 if let Ok(payload) = String::from_utf8(message.data) {
-                                    let ev = if topic.ends_with(BLOCKS_TOPIC) {
-                                        NetworkEvent::Block(payload)
-                                    } else if topic.ends_with(TXS_TOPIC) {
-                                        NetworkEvent::Tx(payload)
-                                    } else {
-                                        continue;
-                                    };
-                                    let _ = event_tx.send(ev);
+                                    if let Some(ev) = route_message(topic, payload) {
+                                        let _ = event_tx.send(ev);
+                                    }
                                 }
                             }
                             libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
@@ -395,9 +524,114 @@ impl NetworkNode {
         let _ = self.command_tx.send(Command::PublishTx(payload.into()));
     }
 
+    /// Broadcast a consensus proposal payload.
+    pub fn publish_proposal(&self, payload: &str) {
+        let _ = self
+            .command_tx
+            .send(Command::PublishProposal(payload.into()));
+    }
+
+    /// Broadcast a consensus vote payload.
+    pub fn publish_vote(&self, payload: &str) {
+        let _ = self.command_tx.send(Command::PublishVote(payload.into()));
+    }
+
+    /// Broadcast consensus evidence payload.
+    pub fn publish_evidence(&self, payload: &str) {
+        let _ = self
+            .command_tx
+            .send(Command::PublishEvidence(payload.into()));
+    }
+
     /// Currently connected peers. A validator uses this to avoid producing
     /// blocks that no other node will ever see.
     pub fn peer_count(&self) -> usize {
         self.peers.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topics_are_chain_prefixed() {
+        let chain_id = "verinoo-test-1";
+        let expected = [
+            (BLOCKS_TOPIC, "verinoo/blocks/1"),
+            (TXS_TOPIC, "verinoo/txs/1"),
+            (PROPOSALS_TOPIC, "verinoo/proposals/1"),
+            (VOTES_TOPIC, "verinoo/votes/1"),
+            (EVIDENCE_TOPIC, "verinoo/evidence/1"),
+        ];
+
+        for (suffix, topic) in expected {
+            assert_eq!(
+                chain_topic(chain_id, suffix).to_string(),
+                format!("{chain_id}/{topic}")
+            );
+        }
+    }
+
+    #[test]
+    fn routes_topics_by_exact_suffix() {
+        assert!(matches!(
+            route_message(BLOCKS_TOPIC, "payload".into()),
+            Some(NetworkEvent::Block(p)) if p == "payload"
+        ));
+        assert!(matches!(
+            route_message("chain/verinoo/txs/1", "payload".into()),
+            Some(NetworkEvent::Tx(p)) if p == "payload"
+        ));
+        assert!(matches!(
+            route_message("chain/verinoo/proposals/1", "payload".into()),
+            Some(NetworkEvent::Proposal(p)) if p == "payload"
+        ));
+        assert!(matches!(
+            route_message("chain/verinoo/votes/1", "payload".into()),
+            Some(NetworkEvent::Vote(p)) if p == "payload"
+        ));
+        assert!(matches!(
+            route_message("chain/verinoo/evidence/1", "payload".into()),
+            Some(NetworkEvent::Evidence(p)) if p == "payload"
+        ));
+    }
+
+    #[test]
+    fn proposals_do_not_route_as_blocks() {
+        assert!(matches!(
+            route_message("chain/verinoo/proposals/1", "payload".into()),
+            Some(NetworkEvent::Proposal(_))
+        ));
+        assert!(route_message("chain/verinoo/proposals/2", "payload".into()).is_none());
+        assert!(route_message("chain/verinoo/notproposals/1", "payload".into()).is_none());
+        assert!(route_message("chain/verinoo/blocksx/1", "payload".into()).is_none());
+    }
+
+    #[test]
+    fn receive_caps_drop_oversized_consensus_payloads() {
+        let cases = [
+            (
+                "chain/verinoo/proposals/1",
+                MAX_PROPOSAL_PAYLOAD_BYTES,
+                TopicKind::Proposal,
+            ),
+            (
+                "chain/verinoo/votes/1",
+                MAX_VOTE_PAYLOAD_BYTES,
+                TopicKind::Vote,
+            ),
+            (
+                "chain/verinoo/evidence/1",
+                MAX_EVIDENCE_PAYLOAD_BYTES,
+                TopicKind::Evidence,
+            ),
+        ];
+
+        for (topic, max, kind) in cases {
+            assert_eq!(TopicKind::from_topic(topic), Some(kind));
+            assert!(route_message(topic, "a".repeat(max)).is_some());
+            assert!(route_message(topic, "a".repeat(max + 1)).is_none());
+        }
     }
 }

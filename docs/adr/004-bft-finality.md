@@ -2,10 +2,14 @@
 
 ## Status
 
-**Proposed — not implemented.** This document describes a target design and
-the integration work required. No code in this repository implements
-prevotes, precommits, commit certificates, finality, or equivocation handling
-today. Nothing here may be cited as shipped behavior.
+**Partially implemented.** `crates/consensus` implements signed prevotes,
+precommits, commit certificates, quorum verification, equivocation evidence and
+an in-process round/lock state machine. `VNN_CONSENSUS=bft` adds node-level
+finality certificates over validated blocks, vote/evidence gossip, persisted
+`finalizedHeight`/`finalizedHash` and a four-validator local test. Not
+implemented: node view changes for an offline leader, separate proposal
+envelopes in the node, certificate-aware catch-up/finalized sync, slashing and
+automatic removal. The default is legacy; the live testnet is single-validator.
 
 Date: 2026-11-14
 Scope: `crates/node`, `crates/exec`, `crates/network`, `crates/state`, plus a
