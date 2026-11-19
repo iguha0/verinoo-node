@@ -17,9 +17,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use verinoo_consensus::{Proposal, Schedule};
 use verinoo_exec::engine::{
     commit_finalized, current_head, produce_block_with_report, propose_block_with_report, set_head,
-    validate_block, Block,
+    validate_block, verify_block_on_checkpoint, Block,
 };
 use verinoo_network::NetworkEvent;
 use verinoo_state::genesis::GenesisParams;
@@ -203,11 +204,10 @@ impl Shared {
         output: finality::FinalityOutput,
     ) {
         for vote in output.votes {
-            let kind = vote.kind.as_str();
-            self.store.set_meta(
-                &format!("consensusOwnVote:{}:{}:{}", vote.height, vote.round, kind),
-                &serde_json::to_value(&vote).expect("vote serialize"),
-            );
+            // Persist before broadcast: a crash between the two still leaves
+            // the signed vote on disk, so a restart rebroadcasts it verbatim
+            // instead of signing a second, different vote.
+            persist_own_vote(&self.store, &vote);
             net.publish_vote(&serde_json::to_string(&vote).expect("vote serialize"));
         }
         for evidence in output.evidence {
@@ -225,12 +225,24 @@ impl Shared {
         if let Some((height, block_hash, certificate)) = output.finalized {
             if let Err(e) = shared_finality_commit(self, height, &block_hash, &certificate) {
                 // Certificate-gated mode: without a committed block there is
-                // nothing final to persist; the head stays where it was.
+                // nothing final to persist; the head stays where it was, and
+                // the manager must not keep a finalized height the head
+                // cannot ever reach again (the next height's commit would
+                // fail too). Roll back to the last committable height, then
+                // halt loudly — a commit failure means this node's execution
+                // diverged from the quorum (model set, store corruption).
                 tracing::error!(
                     "bft-v2 did not finalize #{} {block_hash}: {e} — head not advanced",
                     height
                 );
-                return;
+                rollback_finality(self, output.previous_finalized).await;
+                tracing::error!(
+                    "bft-v2 halting: the finalized block #{} cannot be committed \
+                     (state root or model set divergence?) — restarting in legacy mode \
+                     is not safe; investigate before resuming",
+                    height
+                );
+                std::process::exit(1);
             }
             persist_finalized(self, height, &block_hash, &certificate);
             tracing::info!(
@@ -299,12 +311,15 @@ fn shared_finality_commit(
         ));
     }
     // Re-run the hostile-network gate: the block may have been stored for a
-    // while and this is the last check before canonical state changes.
-    validate_block(
+    // while and this is the last check before canonical state changes. The
+    // producer slot is the certificate's round leader — a view change may
+    // have produced this block away from the height's round-robin leader.
+    verinoo_exec::engine::validate_block_with_policy(
         &block,
         &head.header,
         &shared.allowed_validators(),
         shared.now_ms(),
+        &verinoo_exec::leader::RoundLeader(certificate.round),
     )
     .map_err(|e| format!("finalized block #{height} re-validation failed: {e}"))?;
     let producer = block.header.validator.clone();
@@ -331,6 +346,227 @@ fn persist_finalized(
         &format!("commit:{height}"),
         &serde_json::to_value(certificate).expect("certificate serialize"),
     );
+}
+
+/// Persist a signed own vote before it is broadcast, keyed
+/// `consensusOwnVote:<height>:<round>:<kind>`. On restart these are
+/// restored into the finality manager so the node rebroadcasts the exact
+/// vote instead of signing a second one.
+fn persist_own_vote(store: &verinoo_state::StateStore, vote: &verinoo_consensus::Vote) {
+    store.set_meta(
+        &format!(
+            "consensusOwnVote:{}:{}:{}",
+            vote.height,
+            vote.round,
+            vote.kind.as_str()
+        ),
+        &serde_json::to_value(vote).expect("vote serialize"),
+    );
+}
+
+/// Roll the finality manager back to the pre-finalization `(height, hash)`
+/// after a failed certificate commit, so in-memory finality never runs
+/// ahead of the canonical head.
+async fn rollback_finality(shared: &Shared, previous: Option<(u64, String)>) {
+    let Some(manager) = &shared.finality else {
+        return;
+    };
+    let Some((height, hash)) = previous else {
+        return;
+    };
+    manager.lock().await.rollback_finalization(height, &hash);
+}
+
+/// Meta key holding the last proposal this leader signed:
+/// `{height, round, blockHash}`.
+const LAST_PROPOSED_META_KEY: &str = "consensusLastProposed";
+
+/// Persist the last-proposed `(height, round, hash)` before broadcasting the
+/// proposal message. A restarted leader re-publishes this exact block and is
+/// never allowed to sign a different one for the same `(height, round)`.
+fn persist_last_proposed(shared: &Shared, height: u64, round: u64, block_hash: &str) {
+    shared.store.set_meta(
+        LAST_PROPOSED_META_KEY,
+        &serde_json::json!({ "height": height, "round": round, "blockHash": block_hash }),
+    );
+}
+
+/// The last-proposed `(height, round, hash)`, if this leader signed one.
+fn stored_last_proposed(shared: &Shared) -> Option<(u64, u64, String)> {
+    let value = shared.store.get_meta(LAST_PROPOSED_META_KEY)?;
+    Some((
+        value.get("height")?.as_u64()?,
+        value.get("round")?.as_u64()?,
+        value.get("blockHash")?.as_str()?.to_string(),
+    ))
+}
+
+/// What a leader restarting into `(height, round)` must do before building
+/// any block.
+#[derive(Debug, Clone, PartialEq)]
+enum Reproposal {
+    /// No stored proposal binds this `(height, round)`: build a fresh one.
+    Fresh,
+    /// Re-publish this exact block and never sign a different one for the
+    /// same `(height, round)` (that would be slashable double-proposal
+    /// evidence).
+    Republish(Box<Block>),
+    /// The stored proposal binds this `(height, round)` but its block is
+    /// gone from the store; signing anything else would equivocate, so this
+    /// round must be skipped loudly.
+    Refuse,
+}
+
+fn reproposal_for(shared: &Shared, height: u64, round: u64) -> Reproposal {
+    let Some((stored_height, stored_round, stored_hash)) = stored_last_proposed(shared) else {
+        return Reproposal::Fresh;
+    };
+    if (stored_height, stored_round) != (height, round) {
+        return Reproposal::Fresh;
+    }
+    match shared
+        .store
+        .get_block_by_hash(&stored_hash)
+        .and_then(|value| serde_json::from_value::<Block>(value).ok())
+    {
+        Some(block) => Reproposal::Republish(Box::new(block)),
+        None => Reproposal::Refuse,
+    }
+}
+
+/// Publish a signed round proposal plus its block on the proposals topic,
+/// store the block by hash, persist `(height, round, hash)`, and feed the
+/// finality manager so the leader prevotes its own proposal.
+async fn publish_bft_v2_proposal(
+    shared: &Shared,
+    net: &NetworkNodeAlias,
+    signing: &ed25519_dalek::SigningKey,
+    addr: &str,
+    height: u64,
+    round: u64,
+    block: &Block,
+) {
+    let block_hash = block.header.hash.clone();
+    let proposal = Proposal::sign(
+        &shared.params.chain_id,
+        height,
+        round,
+        &block_hash,
+        addr,
+        signing,
+    );
+    shared.store.put_block_by_hash(
+        &block_hash,
+        &serde_json::to_value(block).expect("block serialize"),
+    );
+    persist_last_proposed(shared, height, round, &block_hash);
+    let message = finality::ProposalMessage {
+        proposal: proposal.clone(),
+        block: block.clone(),
+    };
+    net.publish_proposal(&serde_json::to_string(&message).expect("proposal serialize"));
+    tracing::info!(
+        "proposed block #{height} round {round} | {}",
+        &block_hash[..16.min(block_hash.len())]
+    );
+    let output = {
+        let Some(manager) = &shared.finality else {
+            return;
+        };
+        let mut manager = manager.lock().await;
+        manager.on_proposal(&proposal, true)
+    };
+    shared.apply_finality_output(net, output).await;
+}
+
+/// Receive-side gate for a gossiped round proposal block: admission with
+/// the round-aware leader policy, then execution on a checkpoint clone so
+/// the state root this node derives must match the header. The canonical
+/// store is never touched.
+fn validate_proposal_block(shared: &Shared, block: &Block, round: u64) -> Result<(), String> {
+    admit_round_block(shared, block, round)?;
+    verify_block_on_checkpoint(&shared.store, &shared.proposal_work_dir, block)
+        .map_err(|e| e.to_string())
+}
+
+/// Handle a `ProposalMessage` from the proposals topic (`bft-v2` only):
+/// classify it cheaply, verify the leader envelope, admit the block, check
+/// the state root on a checkpoint clone, then feed the finality manager.
+/// Any failure still feeds the manager so the active round is prevoted
+/// nil instead of silently ignored.
+async fn handle_bft_v2_proposal(
+    shared: &Shared,
+    net: &NetworkNodeAlias,
+    message: finality::ProposalMessage,
+) {
+    let finality::ProposalMessage { proposal, block } = message;
+    let manager_ref = shared
+        .finality
+        .as_ref()
+        .expect("bft-v2 always constructs a finality manager");
+    let (relevance, validators) = {
+        let manager = manager_ref.lock().await;
+        (
+            manager.classify_proposal(&proposal),
+            manager.validators().to_vec(),
+        )
+    };
+    if relevance == finality::ProposalRelevance::Irrelevant {
+        tracing::debug!(
+            height = proposal.height,
+            round = proposal.round,
+            "irrelevant proposal dropped"
+        );
+        return;
+    }
+
+    let mut block_valid = false;
+    if proposal.block_hash != block.header.hash || proposal.height != block.header.index {
+        tracing::warn!(
+            "proposal #{} round {} does not bind its block",
+            proposal.height,
+            proposal.round
+        );
+    } else if let Err(e) = proposal.verify_with_chain(&shared.params.chain_id, &validators) {
+        tracing::warn!(
+            "proposal #{} round {} failed envelope verification: {e}",
+            proposal.height,
+            proposal.round
+        );
+    } else if let Err(e) = validate_proposal_block(shared, &block, proposal.round) {
+        tracing::warn!(
+            "proposal #{} round {} failed block validation: {e}",
+            proposal.height,
+            proposal.round
+        );
+    } else {
+        block_valid = true;
+    }
+
+    if block_valid {
+        shared.store.put_block_by_hash(
+            &block.header.hash,
+            &serde_json::to_value(&block).expect("block serialize"),
+        );
+        tracing::info!(
+            "admitted proposal #{} round {} | {}",
+            block.header.index,
+            proposal.round,
+            &block.header.hash[..16.min(block.header.hash.len())]
+        );
+    } else {
+        tracing::warn!(
+            "prevoting nil for #{} round {} — the proposal did not validate",
+            proposal.height,
+            proposal.round
+        );
+    }
+
+    let output = {
+        let mut manager = manager_ref.lock().await;
+        manager.on_proposal(&proposal, block_valid)
+    };
+    shared.apply_finality_output(net, output).await;
 }
 
 /// Local finalized tip. The BFT manager is authoritative when present; legacy
@@ -362,6 +598,22 @@ fn admit_block(shared: &Shared, block: &Block) -> Result<(), String> {
         &head.header,
         &shared.allowed_validators(),
         shared.now_ms(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The hostile-network gate for a `bft-v2` round proposal: identical
+/// structural checks, but the producer slot is the `(height, round)`
+/// leader the consensus election picks (a view change rotates it away from
+/// the height's round-robin producer).
+fn admit_round_block(shared: &Shared, block: &Block, round: u64) -> Result<(), String> {
+    let head = shared.head().ok_or("no head")?;
+    verinoo_exec::engine::validate_block_with_policy(
+        block,
+        &head.header,
+        &shared.allowed_validators(),
+        shared.now_ms(),
+        &verinoo_exec::leader::RoundLeader(round),
     )
     .map_err(|e| e.to_string())
 }
@@ -430,7 +682,8 @@ fn requeue_gas_skipped(
     *mempool = merged;
 }
 
-/// Validator loop: produce on interval from the mempool and broadcast.
+/// Validator loop for `legacy` and `bft` (v1) modes: produce on interval from
+/// the mempool and broadcast. `bft-v2` uses [`bft_v2_consensus_loop`] instead.
 async fn validator_loop(
     shared: Arc<Shared>,
     net: NetworkNodeAlias,
@@ -438,6 +691,7 @@ async fn validator_loop(
     block_time_ms: u64,
 ) {
     use sha2::Digest as _;
+    use verinoo_exec::leader::LeaderPolicy as _;
     let vk = sk.verifying_key();
     let pk_hex = hex::encode(vk.to_bytes());
     let mut h = sha2::Sha256::new();
@@ -447,18 +701,10 @@ async fn validator_loop(
     let producer = verinoo_exec::engine::ProducerKey::from_parts(addr.clone(), sk);
     let mut ticker =
         tokio::time::interval(std::time::Duration::from_millis(block_time_ms.max(500)));
-    use verinoo_exec::leader::LeaderPolicy as _;
     // `interval` fires immediately; consume that tick so peers have one block
     // time to connect and exchange gossip subscriptions first. Producing at
     // t=0 publishes into a mesh that does not exist yet and the block is lost.
     ticker.tick().await;
-
-    // bft-v2 round 0 proposes each height exactly once; the pacemaker that
-    // would retry or advance rounds is Phase B. Track the last height this
-    // leader proposed so the head not moving (no certificate yet) does not
-    // stack a second, conflicting proposal on the same height.
-    let bft_v2 = shared.consensus_mode == "bft-v2";
-    let mut last_proposed: u64 = 0;
 
     loop {
         ticker.tick().await;
@@ -485,53 +731,9 @@ async fn validator_loop(
             );
             continue;
         }
-        if bft_v2 && next_height <= last_proposed {
-            // Still waiting for the round-0 proposal to gather a certificate.
-            continue;
-        }
         let batch: Vec<_> = shared.mempool.lock().await.drain(..).collect();
 
         let _guard = shared.chain_lock.lock().await;
-        if bft_v2 {
-            // Proposal path: build on a checkpoint clone, store by hash, and
-            // publish. The canonical head is NOT advanced here; it moves only
-            // when the finality manager emits Finalized with a certificate
-            // (see `shared_finality_commit`).
-            match propose_block_with_report(
-                &shared.store,
-                &batch,
-                &producer,
-                shared.now_ms(),
-                &shared.proposal_work_dir,
-            ) {
-                Ok(report) => {
-                    let block = report.block;
-                    let n = block.transactions.len();
-                    last_proposed = block.header.index;
-                    shared.store.put_block_by_hash(
-                        &block.header.hash,
-                        &serde_json::to_value(&block).expect("block serialize"),
-                    );
-                    {
-                        let mut mempool = shared.mempool.lock().await;
-                        requeue_gas_skipped(&mut mempool, &batch, &report.skipped);
-                    }
-                    tracing::info!(
-                        "proposed block #{} | {} txs | {}",
-                        block.header.index,
-                        n,
-                        &block.header.hash[..16.min(block.header.hash.len())]
-                    );
-                    net.publish_block(&serde_json::to_string(&block).expect("block serialize"));
-                    shared.finality_observe(&net, &block).await;
-                }
-                Err(e) => {
-                    shared.mempool.lock().await.extend(batch);
-                    tracing::error!("propose failed: {e}");
-                }
-            }
-            continue;
-        }
         match produce_block_with_report(&shared.store, &batch, &producer, shared.now_ms()) {
             Ok(report) => {
                 let block = report.block;
@@ -553,6 +755,178 @@ async fn validator_loop(
             Err(e) => {
                 shared.mempool.lock().await.extend(batch);
                 tracing::error!("produce failed: {e}");
+            }
+        }
+    }
+}
+
+/// Poll cadence of the bft-v2 consensus driver. Also the view-change
+/// detection granularity: a round timeout fires within one poll of its
+/// deadline.
+const BFT_V2_POLL_MS: u64 = 100;
+
+/// bft-v2 consensus driver: arms the round timer from the pacemaker
+/// schedule, fires view changes on timeout, and proposes whenever this
+/// validator is the leader of the active `(height, round)`. Proposals are
+/// gossiped as [`finality::ProposalMessage`] on the proposals topic; the
+/// head still moves only on a verified commit certificate.
+///
+/// `VNN_BFT_TIMERS=0` (Phase E staged activation) keeps Phase A semantics:
+/// the round timer never fires, so an offline round-0 leader stalls the
+/// chain exactly as documented for Phase B of the activation runbook.
+async fn bft_v2_consensus_loop(
+    shared: Arc<Shared>,
+    net: NetworkNodeAlias,
+    signing: ed25519_dalek::SigningKey,
+    timers_enabled: bool,
+) {
+    let addr = verinoo_exec::engine::public_key_to_address(&hex::encode(
+        signing.verifying_key().to_bytes(),
+    ))
+    .expect("the node already derived its address at startup");
+    let producer = verinoo_exec::engine::ProducerKey::from_parts(addr.clone(), signing.clone());
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(BFT_V2_POLL_MS));
+    // Consume the immediate tick: give the gossip mesh one beat to form
+    // before the first proposal, like the legacy validator loop.
+    ticker.tick().await;
+
+    // Deadline of the armed `(height, round)` timer. Re-armed only when the
+    // `(height, round)` changes, so polling never resets a running timer.
+    let mut armed: Option<(u64, u64, std::time::Instant)> = None;
+    let mut proposed: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
+    loop {
+        ticker.tick().await;
+
+        // 1) Activate the height above the finalized tip and pick up the
+        //    round schedule (also replays inputs buffered for round 0). The
+        //    chain lock is held across the manager call and its output so a
+        //    commit here never interleaves with the event pump's commits.
+        let schedule = {
+            let _guard = shared.chain_lock.lock().await;
+            let output = {
+                let Some(manager) = &shared.finality else {
+                    break;
+                };
+                let mut manager = manager.lock().await;
+                let target_height = manager.finalized_height() + 1;
+                manager.start_height(target_height)
+            };
+            let schedule = output.start_round;
+            shared.apply_finality_output(&net, output).await;
+            schedule
+        };
+        let Some(Schedule::Timeout {
+            height,
+            round,
+            timeout_ms,
+        }) = schedule
+        else {
+            continue;
+        };
+
+        // 2) Arm the round timer when the (height, round) changed.
+        if armed.as_ref().map(|(h, r, _)| (*h, *r)) != Some((height, round)) {
+            armed = Some((
+                height,
+                round,
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1)),
+            ));
+            tracing::debug!(height, round, timeout_ms, "bft-v2 round timer armed");
+        }
+
+        // 3) Fire the view change when the armed round's deadline passed
+        //    and the manager is still in that round. The pacemaker
+        //    nil-prevotes the timed-out round and advances exactly one
+        //    round; the next leader proposes on a later tick.
+        if timers_enabled
+            && armed.is_some_and(|(h, r, deadline)| {
+                (h, r) == (height, round) && std::time::Instant::now() >= deadline
+            })
+        {
+            armed = None;
+            let _guard = shared.chain_lock.lock().await;
+            let output = {
+                let Some(manager) = &shared.finality else {
+                    break;
+                };
+                let mut manager = manager.lock().await;
+                manager.on_timeout(height, round)
+            };
+            tracing::info!(height, round, "bft-v2 round timed out — advancing round");
+            shared.apply_finality_output(&net, output).await;
+            continue;
+        }
+
+        // 4) Propose when this validator leads the active round and has not
+        //    proposed for it yet.
+        let is_leader = {
+            let Some(manager) = &shared.finality else {
+                break;
+            };
+            let manager = manager.lock().await;
+            manager.round_leader(height, round).as_deref() == Some(addr.as_str())
+        };
+        if !is_leader || proposed.contains(&(height, round)) {
+            continue;
+        }
+        // An isolated validator would propose into a mesh nobody hears; a
+        // single-validator set is the expected one-node testnet.
+        if shared.allowed_validators().len() > 1 && net.peer_count() == 0 {
+            tracing::debug!(
+                "no peers connected — holding the round-{round} proposal for #{height}"
+            );
+            continue;
+        }
+        // A restarted leader re-publishes its exact last proposal for this
+        // `(height, round)`; it must never sign a different block for the
+        // same round (that would be slashable double-proposal evidence).
+        match reproposal_for(&shared, height, round) {
+            Reproposal::Fresh => {}
+            Reproposal::Republish(block) => {
+                let _guard = shared.chain_lock.lock().await;
+                publish_bft_v2_proposal(&shared, &net, &signing, &addr, height, round, &block)
+                    .await;
+                tracing::info!(
+                    "re-published last proposal #{} round {round} | {}",
+                    height,
+                    &block.header.hash[..16.min(block.header.hash.len())]
+                );
+                proposed.insert((height, round));
+                continue;
+            }
+            Reproposal::Refuse => {
+                tracing::error!(
+                    "the last-proposed block for #{height} round {round} is missing from \
+                     the store; refusing to sign a different proposal"
+                );
+                proposed.insert((height, round));
+                continue;
+            }
+        }
+
+        let batch: Vec<_> = shared.mempool.lock().await.drain(..).collect();
+        let _guard = shared.chain_lock.lock().await;
+        match propose_block_with_report(
+            &shared.store,
+            &batch,
+            &producer,
+            shared.now_ms(),
+            &shared.proposal_work_dir,
+        ) {
+            Ok(report) => {
+                let block = report.block;
+                {
+                    let mut mempool = shared.mempool.lock().await;
+                    requeue_gas_skipped(&mut mempool, &batch, &report.skipped);
+                }
+                publish_bft_v2_proposal(&shared, &net, &signing, &addr, height, round, &block)
+                    .await;
+                proposed.insert((height, round));
+            }
+            Err(e) => {
+                shared.mempool.lock().await.extend(batch);
+                tracing::error!("propose failed: {e}");
             }
         }
     }
@@ -824,6 +1198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let consensus_mode = std::env::var("VNN_CONSENSUS").unwrap_or_else(|_| "legacy".into());
+    let bft_v2_mode = consensus_mode == "bft-v2";
     if !matches!(consensus_mode.as_str(), "legacy" | "bft" | "bft-v2") {
         return Err(format!(
             "VNN_CONSENSUS must be `legacy`, `bft`, or `bft-v2`, got `{consensus_mode}`"
@@ -833,6 +1208,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if consensus_mode != "legacy" && !validator {
         return Err(format!("VNN_CONSENSUS={consensus_mode} requires VNN_VALIDATOR=true").into());
     }
+    // View-change timers default ON in bft-v2. Phase E of the activation
+    // runbook stages the rollout with VNN_BFT_TIMERS=0 (Phase A semantics:
+    // an offline round-0 leader stalls the chain; view changes are off).
+    let bft_timers = if bft_v2_mode {
+        let enabled = match std::env::var("VNN_BFT_TIMERS") {
+            Ok(raw) => match raw.trim() {
+                "" | "1" | "true" => true,
+                "0" | "false" => false,
+                other => {
+                    return Err(format!("VNN_BFT_TIMERS must be 0 or 1, got `{other}`").into());
+                }
+            },
+            Err(_) => true,
+        };
+        if enabled {
+            tracing::info!("bft-v2: view-change timers enabled (VNN_BFT_TIMERS=1)");
+        } else {
+            tracing::warn!(
+                "bft-v2: VNN_BFT_TIMERS=0 — Phase A semantics; an offline round-0 \
+                 leader stalls the chain until it returns"
+            );
+        }
+        enabled
+    } else {
+        false
+    };
     let finalized_height = store.meta_u64_or("finalizedHeight", 0);
     let finalized_hash = store
         .get_meta("finalizedHash")
@@ -858,7 +1259,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if consensus_mode == "bft-v2" {
         tracing::info!("bft-v2: head advances only on a 2f+1 commit certificate");
     }
-
     let shared = Arc::new(Shared {
         store,
         params: cfg.genesis.clone(),
@@ -877,6 +1277,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         proposal_work_dir,
         policy: std::sync::Mutex::new(Policy::default()),
     });
+
+    // Restore persisted own votes before any consensus activity (BFT and
+    // bft-v2): the manager rebroadcasts the stored vote verbatim and refuses
+    // to sign a second, different vote for the same (height, round, kind).
+    if let Some(manager) = &shared.finality {
+        let restored = {
+            let mut manager = manager.lock().await;
+            manager.restore_own_votes_from_store(&shared.store)
+        };
+        if restored > 0 {
+            tracing::info!("restored {restored} persisted own vote(s) after restart");
+        }
+    }
+
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
         cfg.p2p_port,
         cfg.key_seed,
@@ -1039,10 +1453,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => tracing::debug!("bad block payload: {e}"),
                     }
                 }
-                NetworkEvent::Proposal(_payload) => {
-                    // Round > 0 proposals are not used by the single-producer
-                    // finality integration; the block topic is the round-0
-                    // proposal.
+                NetworkEvent::Proposal(payload) => {
+                    // Round proposals are a bft-v2 wire message; `legacy`
+                    // and `bft` (v1) never parse them.
+                    if shared.consensus_mode != "bft-v2" {
+                        tracing::debug!(
+                            "proposal payload ignored in {} mode",
+                            shared.consensus_mode
+                        );
+                        continue;
+                    }
+                    if !shared.mark_seen(&payload) {
+                        continue;
+                    }
+                    match serde_json::from_str::<finality::ProposalMessage>(&payload) {
+                        Ok(message) => {
+                            // A vote quorum inside the manager can commit to
+                            // the canonical store; serialize with production.
+                            let _guard = shared.chain_lock.lock().await;
+                            handle_bft_v2_proposal(&shared, &net, message).await;
+                        }
+                        Err(e) => tracing::debug!("bad proposal payload: {e}"),
+                    }
                 }
                 NetworkEvent::Vote(payload) => {
                     match serde_json::from_str::<verinoo_consensus::Vote>(&payload) {
@@ -1082,11 +1514,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Validator loop (optional). Block time is a network-wide setting: every
-    // validator must use the same value or slots drift.
+    // validator must use the same value or slots drift. bft-v2 replaces the
+    // producer ticker with the consensus driver: rounds, view-change timers
+    // and round-leader proposals all live there.
     if cfg.validator {
         let v_shared = shared.clone();
         let v_net = net.clone();
-        tokio::spawn(validator_loop(v_shared, v_net, signing, block_time_ms));
+        if bft_v2_mode {
+            tokio::spawn(bft_v2_consensus_loop(v_shared, v_net, signing, bft_timers));
+        } else {
+            tokio::spawn(validator_loop(v_shared, v_net, signing, block_time_ms));
+        }
     }
 
     // Catch-up sync: poll peer HTTP APIs and replay missing blocks through the
@@ -1302,7 +1740,10 @@ async fn apply_finalized_pairs(
                     ));
                 }
             } else if height == head_height + 1 {
-                admit_block(shared, &block)?;
+                // The certificate binds the block to its round; admission
+                // checks the round leader, not the height's round-robin
+                // slot (a view change may have produced this block).
+                admit_round_block(shared, &block, certificate.round)?;
                 let producer = block.header.validator.clone();
                 if shared.consensus_mode == "bft-v2" {
                     // Same commit gate as the gossip path: apply, verify the
@@ -2289,5 +2730,353 @@ mod tests {
         let certificate = test_certificate(&chain_id, &block, &keys);
         assert!(shared_finality_commit(&shared, 1, &block.header.hash, &certificate).is_err());
         assert_eq!(shared.head().unwrap().header.index, 0);
+    }
+
+    /// Feed gossiped votes straight into the shared manager the way the
+    /// event pump does; own signatures are already self-fed by the manager.
+    async fn feed_votes(
+        shared: &Shared,
+        keys: &[verinoo_exec::engine::ProducerKey],
+        indices: &[usize],
+        kind: verinoo_consensus::VoteKind,
+        height: u64,
+        round: u64,
+        block_hash: &str,
+    ) -> finality::FinalityOutput {
+        let chain_id = GenesisParams::default().chain_id;
+        let mut merged = finality::FinalityOutput::default();
+        let mut manager = shared.finality.as_ref().unwrap().lock().await;
+        for index in indices {
+            let vote = verinoo_consensus::Vote::sign(
+                &chain_id,
+                kind,
+                height,
+                round,
+                block_hash,
+                &keys[*index].address,
+                &keys[*index].signing,
+            );
+            let output = manager.on_vote(&vote);
+            merged.votes.extend(output.votes);
+            if output.finalized.is_some() {
+                merged.finalized = output.finalized;
+            }
+            if merged.previous_finalized.is_none() {
+                merged.previous_finalized = output.previous_finalized;
+            }
+        }
+        merged
+    }
+
+    #[tokio::test]
+    async fn bft_v2_offline_leader_view_change_commits_the_round_one_block() {
+        let keys = test_validators(4);
+        // keys are sorted by address, so the height-1 leaders are
+        // keys[0] (round 0, kept offline) and keys[1] (round 1).
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 3);
+
+        // Height activation arms the round-0 timer.
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.start_height(1)
+        };
+        assert_eq!(
+            output.start_round,
+            Some(Schedule::Timeout {
+                height: 1,
+                round: 0,
+                timeout_ms: 1_000,
+            })
+        );
+
+        // The round-0 timer fires with no proposal in sight: nil prevote,
+        // pacemaker advances to round 1.
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.on_timeout(1, 0)
+        };
+        assert_eq!(
+            output.start_round,
+            Some(Schedule::Timeout {
+                height: 1,
+                round: 1,
+                timeout_ms: 1_500,
+            })
+        );
+        assert!(output.votes.iter().any(|vote| {
+            vote.round == 0
+                && vote.kind == verinoo_consensus::VoteKind::Prevote
+                && vote.block_hash.is_empty()
+        }));
+
+        // The round-1 leader proposes. This node validates the block through
+        // the same receive-side gate the proposals-topic handler uses
+        // (admission + execution on a checkpoint clone), stores it, and
+        // prevotes via the manager.
+        let chain_id = GenesisParams::default().chain_id;
+        let leader_store = test_store_with_genesis();
+        let block =
+            verinoo_exec::engine::produce_block(&leader_store, &[], &keys[1], 1_000).unwrap();
+        let proposal = verinoo_consensus::Proposal::sign(
+            &chain_id,
+            1,
+            1,
+            &block.header.hash,
+            &keys[1].address,
+            &keys[1].signing,
+        );
+        validate_proposal_block(&shared, &block, 1)
+            .expect("the round-1 proposal block validates on a checkpoint clone");
+        shared
+            .store
+            .put_block_by_hash(&block.header.hash, &serde_json::to_value(&block).unwrap());
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.on_proposal(&proposal, true)
+        };
+        assert!(output.votes.iter().any(|vote| {
+            vote.kind == verinoo_consensus::VoteKind::Prevote
+                && vote.block_hash == block.header.hash
+        }));
+
+        // The online validators reach the 3-of-4 quorum in round 1: the
+        // prevote quorum emits this node's precommit, the precommit quorum
+        // finalizes.
+        let output = feed_votes(
+            &shared,
+            &keys,
+            &[1, 2],
+            verinoo_consensus::VoteKind::Prevote,
+            1,
+            1,
+            &block.header.hash,
+        )
+        .await;
+        assert!(output
+            .votes
+            .iter()
+            .any(|vote| vote.kind == verinoo_consensus::VoteKind::Precommit));
+        let output = feed_votes(
+            &shared,
+            &keys,
+            &[1, 2],
+            verinoo_consensus::VoteKind::Precommit,
+            1,
+            1,
+            &block.header.hash,
+        )
+        .await;
+        let (height, hash, certificate) = output.finalized.expect("round-1 finality");
+        assert_eq!(height, 1);
+        assert_eq!(hash, block.header.hash);
+        assert_eq!(certificate.round, 1);
+        assert_eq!(
+            output.previous_finalized,
+            Some((0, String::new())),
+            "the rollback target is the pre-finalization state"
+        );
+
+        // The certificate commits the stored proposal: the head advances even
+        // though the scheduled round-0 leader never proposed.
+        shared_finality_commit(&shared, height, &hash, &certificate)
+            .expect("the round-1 certificate commits the stored proposal");
+        persist_finalized(&shared, height, &hash, &certificate);
+        let head = shared.head().unwrap();
+        assert_eq!(head.header.index, 1);
+        assert_eq!(head.header.hash, block.header.hash);
+        assert_eq!(shared.store.meta_u64_or("finalizedHeight", 0), 1);
+    }
+
+    #[tokio::test]
+    async fn bft_v2_proposal_gossip_wrong_state_root_prevotes_nil() {
+        let keys = test_validators(4);
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 1);
+        {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.start_height(1);
+        }
+        let chain_id = GenesisParams::default().chain_id;
+
+        // An honest round-0 proposal passes the full receive-side gate.
+        let leader_store = test_store_with_genesis();
+        let block =
+            verinoo_exec::engine::produce_block(&leader_store, &[], &keys[0], 1_000).unwrap();
+        let proposal = verinoo_consensus::Proposal::sign(
+            &chain_id,
+            1,
+            0,
+            &block.header.hash,
+            &keys[0].address,
+            &keys[0].signing,
+        );
+        {
+            let manager = shared.finality.as_ref().unwrap().lock().await;
+            assert_eq!(
+                manager.classify_proposal(&proposal),
+                finality::ProposalRelevance::Current
+            );
+        }
+        validate_proposal_block(&shared, &block, 0).expect("the honest proposal validates");
+
+        // The same envelope over a block whose state root this node does not
+        // derive: structural admission still passes (header re-signed), but
+        // checkpoint execution fails, so the round is prevoted nil.
+        let mut bad = block.clone();
+        bad.header.state_root = "00".repeat(32);
+        bad.header.hash = verinoo_exec::engine::hash_header(&bad.header);
+        use ed25519_dalek::Signer as _;
+        bad.header.validator_signature =
+            hex::encode(keys[0].signing.sign(bad.header.hash.as_bytes()).to_bytes());
+        admit_block(&shared, &bad).expect("re-signed header passes structural admission");
+        assert!(validate_proposal_block(&shared, &bad, 0).is_err());
+
+        let bad_proposal = verinoo_consensus::Proposal::sign(
+            &chain_id,
+            1,
+            0,
+            &bad.header.hash,
+            &keys[0].address,
+            &keys[0].signing,
+        );
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.on_proposal(&bad_proposal, false)
+        };
+        let [vote] = output.votes.as_slice() else {
+            panic!("a proposal that fails validation still emits a nil prevote");
+        };
+        assert_eq!(vote.kind, verinoo_consensus::VoteKind::Prevote);
+        assert_eq!(vote.round, 0);
+        assert!(vote.block_hash.is_empty(), "nil prevote");
+        assert!(shared.store.get_block_by_hash(&bad.header.hash).is_none());
+    }
+
+    #[tokio::test]
+    async fn bft_v2_restarted_leader_reproposes_the_exact_same_block() {
+        let keys = test_validators(4);
+        // keys[0] is the round-0 leader for height 1.
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 0);
+        {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.start_height(1);
+        }
+
+        // Leader path: the proposal is built on a checkpoint clone, stored,
+        // and the (height, round, hash) persisted before publishing.
+        let report = propose_block_with_report(
+            &shared.store,
+            &[],
+            &keys[0],
+            1_000,
+            &shared.proposal_work_dir,
+        )
+        .unwrap();
+        let block = report.block;
+        shared
+            .store
+            .put_block_by_hash(&block.header.hash, &serde_json::to_value(&block).unwrap());
+        persist_last_proposed(&shared, 1, 0, &block.header.hash);
+        assert_eq!(
+            stored_last_proposed(&shared),
+            Some((1, 0, block.header.hash.clone()))
+        );
+
+        // A restart into the same (height, round) must re-publish the stored
+        // block, not build a new one.
+        assert_eq!(
+            reproposal_for(&shared, 1, 0),
+            Reproposal::Republish(Box::new(block.clone()))
+        );
+        // A different (height, round) proposes fresh.
+        assert_eq!(reproposal_for(&shared, 2, 0), Reproposal::Fresh);
+        assert_eq!(reproposal_for(&shared, 1, 1), Reproposal::Fresh);
+
+        // A stored proposal whose block is gone from the store refuses to
+        // sign anything else for that (height, round).
+        let restarted = test_bft_v2_shared(test_store_with_genesis(), &keys, 0);
+        persist_last_proposed(&restarted, 1, 0, &"ff".repeat(32));
+        assert_eq!(reproposal_for(&restarted, 1, 0), Reproposal::Refuse);
+
+        // Ed25519 is deterministic: re-signing the same envelope reproduces
+        // the identical proposal, so a re-publish is byte-identical.
+        let chain_id = GenesisParams::default().chain_id;
+        let signed_once = Proposal::sign(
+            &chain_id,
+            1,
+            0,
+            &block.header.hash,
+            &keys[0].address,
+            &keys[0].signing,
+        );
+        let signed_twice = Proposal::sign(
+            &chain_id,
+            1,
+            0,
+            &block.header.hash,
+            &keys[0].address,
+            &keys[0].signing,
+        );
+        assert_eq!(signed_once, signed_twice);
+        // And the wire envelope round-trips through the proposals topic
+        // payload format.
+        let message = finality::ProposalMessage {
+            proposal: signed_once,
+            block: block.clone(),
+        };
+        let payload = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<finality::ProposalMessage>(&payload).unwrap(),
+            message
+        );
+        assert!(payload.contains("\"blockHash\""));
+    }
+
+    #[tokio::test]
+    async fn bft_v2_commit_failure_rolls_finality_back_to_the_committed_head() {
+        let keys = test_validators(1);
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 0);
+        {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.start_height(1);
+        }
+
+        // Single validator: the manager finalizes, but the block was never
+        // stored so the certificate cannot commit (the exact failure
+        // `apply_finality_output` handles).
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.observe_block(1, "hash-x")
+        };
+        let (height, hash, certificate) = output.finalized.expect("single-validator finality");
+        assert_eq!(
+            output.previous_finalized,
+            Some((0, String::new())),
+            "the manager reports what to roll back to"
+        );
+        assert!(shared_finality_commit(&shared, height, &hash, &certificate).is_err());
+
+        // Rollback the same way `apply_finality_output` does: the manager
+        // again agrees with the canonical head instead of being stranded one
+        // finalized height ahead of it.
+        rollback_finality(&shared, output.previous_finalized).await;
+        {
+            let manager = shared.finality.as_ref().unwrap().lock().await;
+            assert_eq!(manager.finalized_height(), 0);
+            assert_eq!(manager.finalized_hash(), "");
+        }
+        assert_eq!(shared.head().unwrap().header.index, 0);
+        assert_eq!(shared.store.meta_u64_or("finalizedHeight", 0), 0);
+
+        // The manager is usable again after the rollback: the height can be
+        // re-observed and re-finalized once the divergence is fixed.
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.observe_block(1, "hash-y")
+        };
+        assert!(output.finalized.is_some());
+        {
+            let manager = shared.finality.as_ref().unwrap().lock().await;
+            assert_eq!(manager.finalized_height(), 1);
+        }
     }
 }

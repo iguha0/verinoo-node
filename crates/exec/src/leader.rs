@@ -30,6 +30,30 @@ impl LeaderPolicy for RoundRobin {
     }
 }
 
+/// `bft-v2` round election: the leader of `(height, round)` over the active
+/// set sorted by address — the same formula the consensus crate applies.
+/// [`RoundLeader(0)`] agrees with [`RoundRobin`] on every height, so
+/// round-0 proposals pass both gates.
+///
+/// The engine's block gate cannot see consensus rounds, so the node passes
+/// this policy with the round from the proposal envelope or commit
+/// certificate (`validate_block_with_policy`).
+#[derive(Debug, Clone, Copy)]
+pub struct RoundLeader(pub u64);
+
+impl LeaderPolicy for RoundLeader {
+    fn leader_at(&self, height: u64, validators: &[String]) -> Option<String> {
+        if validators.is_empty() || height == 0 {
+            return None;
+        }
+        let mut sorted = validators.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        let idx = ((height - 1).saturating_add(self.0) as usize) % sorted.len();
+        Some(sorted[idx].clone())
+    }
+}
+
 /// Stake-weighted leader selection: validators with more stake produce
 /// proportionally more blocks. Uses cumulative-weight sampling with a
 /// deterministic seed derived from the height.
@@ -74,4 +98,43 @@ pub fn stake_weighted_leader(
         }
     }
     sorted.last().map(|(a, _)| a.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addresses(n: u64) -> Vec<String> {
+        (0..n).map(|i| format!("ai_{i:02}")).collect()
+    }
+
+    #[test]
+    fn round_zero_agrees_with_round_robin() {
+        let validators = vec![addresses(4)[3].clone(), addresses(4)[0].clone()];
+        for height in 1..=6 {
+            assert_eq!(
+                RoundLeader(0).leader_at(height, &validators),
+                RoundRobin.leader_at(height, &validators)
+            );
+        }
+    }
+
+    #[test]
+    fn rounds_rotate_one_validator_per_round() {
+        let validators = addresses(4);
+        for height in 1..=3 {
+            for round in 0..4u64 {
+                let expected = &validators[((height - 1 + round) % 4) as usize];
+                assert_eq!(
+                    RoundLeader(round).leader_at(height, &validators).as_deref(),
+                    Some(expected.as_str())
+                );
+            }
+        }
+        // Rounds past the set size wrap around.
+        assert_eq!(
+            RoundLeader(4).leader_at(1, &validators),
+            RoundLeader(0).leader_at(1, &validators)
+        );
+    }
 }

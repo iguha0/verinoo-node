@@ -17,21 +17,18 @@
 //! # Remaining node work (not in this crate)
 //!
 //! This is the pure core only; it does not by itself provide live liveness.
-//! The node must still:
+//! The node wires the live protocol:
 //!
-//! - gossip proposal envelopes and route them to [`ConsensusState::on_proposal`];
-//! - run a timer actor that arms/cancels from [`Schedule`] or
-//!   [`Action::StartRound`] and calls [`ConsensusState::on_timeout`] when a
-//!   round expires;
-//! - persist and restore own votes per `(height, round, kind)` via
-//!   [`ConsensusState::restore_own_vote`] before broadcasting;
-//! - gate head advancement on [`Action::Finalized`] / a verified commit
-//!   certificate (commit gating) instead of applying a produced block
-//!   directly;
-//! - wire round-aware proposal validation and peer/rate limits.
+//! - proposal gossip (`ProposalMessage` on the proposals topic) routed to
+//!   [`ConsensusState::on_proposal`] after envelope and block validation;
+//! - a timer actor that arms/cancels from [`Schedule`] or
+//!   [`Action::StartRound`] and calls `on_timeout` when a round expires
+//!   (`VNN_BFT_TIMERS`, on by default in `bft-v2`);
+//! - persist-before-broadcast of own votes and their restore on restart
+//!   via [`ConsensusState::restore_own_vote`] (no double-signing);
+//! - commit gating on [`Action::Finalized`] / a verified commit certificate.
 //!
-//! Until the node does those, an offline round-0 leader still stalls the live
-//! network even though this crate can move rounds in-process.
+//! Buffers for future-round inputs live in the node's `FinalityManager`.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -51,6 +48,16 @@ pub use state::*;
 
 pub fn quorum(n: usize) -> usize {
     n * 2 / 3 + 1
+}
+
+/// Deterministic round leader over a sorted validator set: the same election
+/// [`ConsensusState::leader_for`] applies, usable before any round state
+/// exists (restart, catch-up, timer actor).
+///
+/// Returns `None` only for an empty validator set.
+pub fn round_leader(validators: &[String], height: u64, round: u64) -> Option<&str> {
+    let index = (height.saturating_sub(1).saturating_add(round) as usize) % validators.len().max(1);
+    validators.get(index).map(String::as_str)
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

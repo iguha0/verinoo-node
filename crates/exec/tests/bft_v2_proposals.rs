@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use verinoo_exec::engine::{
     commit_finalized, compute_state_root, current_head, produce_block, produce_block_with_report,
-    propose_block, propose_block_with_report, set_head, Block, ProducerKey, GAS_LIMIT_SKIP_REASON,
+    propose_block, propose_block_with_report, set_head, verify_block_on_checkpoint, Block,
+    ProducerKey, GAS_LIMIT_SKIP_REASON,
 };
 use verinoo_state::genesis::INITIAL_BASE_FEE;
 use verinoo_state::StateStore;
@@ -276,4 +277,55 @@ fn commit_finalized_rejects_a_wrong_state_root_and_keeps_the_head() {
     let head = current_head(&chain.store).unwrap();
     assert_eq!(head.header.index, 0);
     assert_eq!(head.header.hash, "0".repeat(64));
+}
+
+#[test]
+fn verify_block_on_checkpoint_checks_the_state_root_without_touching_canonical_state() {
+    let chain = Chain::fresh();
+    let sender = keypair("verify-sender");
+    let sender_addr = address_of(&sender);
+    chain.fund(&sender_addr, 1_000);
+    let txs = vec![make_tx(&sender, &sender_addr, "ai_recipient", 100, 1)];
+
+    let root = TempDir::new("verify");
+    let work_dir = root.path().join("clone");
+    let block =
+        propose_block(&chain.store, &txs, &chain.producer, chain.now_ms, &work_dir).unwrap();
+
+    let before_root = compute_state_root(&chain.store);
+    let before_head = current_head(&chain.store).unwrap();
+
+    // A proposal built on the same state verifies cleanly.
+    verify_block_on_checkpoint(&chain.store, &work_dir, &block).unwrap();
+
+    // Canonical state is untouched by the verification clone: head, state
+    // root and the work directory are all exactly as before, so the
+    // sender's nonce was never consumed and the same proposal would
+    // verify again.
+    assert_eq!(current_head(&chain.store).unwrap(), before_head);
+    assert_eq!(compute_state_root(&chain.store), before_root);
+    assert_eq!(std::fs::read_dir(&work_dir).unwrap().count(), 0);
+    verify_block_on_checkpoint(&chain.store, &work_dir, &block).unwrap();
+
+    // A certificate for an invalid block carries a state root this node does
+    // not derive: the proposal must fail verification.
+    let mut bad = block.clone();
+    bad.header.state_root = "00".repeat(32);
+    bad.header.hash = verinoo_exec::engine::hash_header(&bad.header);
+    let signature = {
+        use ed25519_dalek::Signer;
+        hex::encode(
+            chain
+                .producer
+                .signing
+                .sign(bad.header.hash.as_bytes())
+                .to_bytes(),
+        )
+    };
+    bad.header.validator_signature = signature;
+    let err = verify_block_on_checkpoint(&chain.store, &work_dir, &bad).unwrap_err();
+    assert!(err.to_string().contains("state root mismatch"));
+    // And the failed verification still did not touch canonical state.
+    assert_eq!(current_head(&chain.store).unwrap(), before_head);
+    assert_eq!(compute_state_root(&chain.store), before_root);
 }
