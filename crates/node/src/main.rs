@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use verinoo_exec::engine::{
-    current_head, produce_block_with_report, set_head, validate_block, Block,
+    commit_finalized, current_head, produce_block_with_report, propose_block_with_report, set_head,
+    validate_block, Block,
 };
 use verinoo_network::NetworkEvent;
 use verinoo_state::genesis::GenesisParams;
@@ -66,8 +67,11 @@ pub struct Shared {
     pub snapshot_dir: Option<PathBuf>,
     /// BFT finality certificate manager. `None` in legacy mode.
     pub finality: Option<tokio::sync::Mutex<finality::FinalityManager>>,
-    /// `legacy` or `bft` (VNN_CONSENSUS).
+    /// `legacy`, `bft` or `bft-v2` (VNN_CONSENSUS).
     pub consensus_mode: String,
+    /// Parent directory for the RocksDB checkpoint clones `bft-v2` leaders
+    /// build proposals on. Created on demand; clones are removed after use.
+    pub proposal_work_dir: PathBuf,
     policy: std::sync::Mutex<Policy>,
 }
 
@@ -219,6 +223,15 @@ impl Shared {
             );
         }
         if let Some((height, block_hash, certificate)) = output.finalized {
+            if let Err(e) = shared_finality_commit(self, height, &block_hash, &certificate) {
+                // Certificate-gated mode: without a committed block there is
+                // nothing final to persist; the head stays where it was.
+                tracing::error!(
+                    "bft-v2 did not finalize #{} {block_hash}: {e} — head not advanced",
+                    height
+                );
+                return;
+            }
             persist_finalized(self, height, &block_hash, &certificate);
             tracing::info!(
                 "finalized block #{height} {}",
@@ -239,6 +252,64 @@ impl Shared {
         self.best_peer_height
             .store(height.unwrap_or(0), Ordering::Relaxed);
     }
+}
+
+/// Commit the block a finality certificate binds to the canonical store.
+///
+/// `bft` (v1) applies blocks optimistically on arrival, so a finality output
+/// only persists metadata. `bft-v2` never applies an uncertified block: the
+/// head can only advance here, after the stored proposal is looked up by
+/// hash and the certificate is re-verified against the configured set.
+/// A certificate for an unknown, invalid, or non-extending block is an error
+/// and finality is not persisted.
+fn shared_finality_commit(
+    shared: &Shared,
+    height: u64,
+    block_hash: &str,
+    certificate: &verinoo_consensus::CommitCertificate,
+) -> Result<(), String> {
+    if shared.consensus_mode != "bft-v2" {
+        return Ok(());
+    }
+    if certificate.height != height || certificate.block_hash != block_hash {
+        return Err("finalized certificate does not bind its height and block hash".into());
+    }
+    // Same canonicalisation the FinalityManager applies, so quorum checks
+    // agree with the set that produced the certificate.
+    let mut validators = shared.params.validators.clone();
+    validators.sort();
+    validators.dedup();
+    verinoo_consensus::verify_certificate(certificate, &validators)
+        .map_err(|e| format!("finalized certificate rejected: {e}"))?;
+    let value = shared
+        .store
+        .get_block_by_hash(block_hash)
+        .ok_or_else(|| format!("certificate for unknown block {block_hash}"))?;
+    let block: Block = serde_json::from_value(value)
+        .map_err(|e| format!("stored proposal {block_hash} is malformed: {e}"))?;
+    if block.header.hash != block_hash || block.header.index != height {
+        return Err("stored block does not match its certificate".into());
+    }
+    let head = shared.head().ok_or("no head")?;
+    if head.header.index + 1 != height || head.header.hash != block.header.previous_hash {
+        return Err(format!(
+            "finalized block #{height} does not extend head #{} ({})",
+            head.header.index,
+            &head.header.hash[..16.min(head.header.hash.len())]
+        ));
+    }
+    // Re-run the hostile-network gate: the block may have been stored for a
+    // while and this is the last check before canonical state changes.
+    validate_block(
+        &block,
+        &head.header,
+        &shared.allowed_validators(),
+        shared.now_ms(),
+    )
+    .map_err(|e| format!("finalized block #{height} re-validation failed: {e}"))?;
+    let producer = block.header.validator.clone();
+    commit_finalized(&shared.store, &block, &producer)
+        .map_err(|e| format!("commit_finalized at #{height} failed: {e}"))
 }
 
 /// Persist finalized height/hash and the certificate that proves them.
@@ -382,6 +453,13 @@ async fn validator_loop(
     // t=0 publishes into a mesh that does not exist yet and the block is lost.
     ticker.tick().await;
 
+    // bft-v2 round 0 proposes each height exactly once; the pacemaker that
+    // would retry or advance rounds is Phase B. Track the last height this
+    // leader proposed so the head not moving (no certificate yet) does not
+    // stack a second, conflicting proposal on the same height.
+    let bft_v2 = shared.consensus_mode == "bft-v2";
+    let mut last_proposed: u64 = 0;
+
     loop {
         ticker.tick().await;
         let Some(head) = shared.head() else {
@@ -407,9 +485,53 @@ async fn validator_loop(
             );
             continue;
         }
+        if bft_v2 && next_height <= last_proposed {
+            // Still waiting for the round-0 proposal to gather a certificate.
+            continue;
+        }
         let batch: Vec<_> = shared.mempool.lock().await.drain(..).collect();
 
         let _guard = shared.chain_lock.lock().await;
+        if bft_v2 {
+            // Proposal path: build on a checkpoint clone, store by hash, and
+            // publish. The canonical head is NOT advanced here; it moves only
+            // when the finality manager emits Finalized with a certificate
+            // (see `shared_finality_commit`).
+            match propose_block_with_report(
+                &shared.store,
+                &batch,
+                &producer,
+                shared.now_ms(),
+                &shared.proposal_work_dir,
+            ) {
+                Ok(report) => {
+                    let block = report.block;
+                    let n = block.transactions.len();
+                    last_proposed = block.header.index;
+                    shared.store.put_block_by_hash(
+                        &block.header.hash,
+                        &serde_json::to_value(&block).expect("block serialize"),
+                    );
+                    {
+                        let mut mempool = shared.mempool.lock().await;
+                        requeue_gas_skipped(&mut mempool, &batch, &report.skipped);
+                    }
+                    tracing::info!(
+                        "proposed block #{} | {} txs | {}",
+                        block.header.index,
+                        n,
+                        &block.header.hash[..16.min(block.header.hash.len())]
+                    );
+                    net.publish_block(&serde_json::to_string(&block).expect("block serialize"));
+                    shared.finality_observe(&net, &block).await;
+                }
+                Err(e) => {
+                    shared.mempool.lock().await.extend(batch);
+                    tracing::error!("propose failed: {e}");
+                }
+            }
+            continue;
+        }
         match produce_block_with_report(&shared.store, &batch, &producer, shared.now_ms()) {
             Ok(report) => {
                 let block = report.block;
@@ -702,20 +824,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let consensus_mode = std::env::var("VNN_CONSENSUS").unwrap_or_else(|_| "legacy".into());
-    if consensus_mode != "legacy" && consensus_mode != "bft" {
-        return Err(
-            format!("VNN_CONSENSUS must be `legacy` or `bft`, got `{consensus_mode}`").into(),
-        );
+    if !matches!(consensus_mode.as_str(), "legacy" | "bft" | "bft-v2") {
+        return Err(format!(
+            "VNN_CONSENSUS must be `legacy`, `bft`, or `bft-v2`, got `{consensus_mode}`"
+        )
+        .into());
     }
-    if consensus_mode == "bft" && !validator {
-        return Err("VNN_CONSENSUS=bft requires VNN_VALIDATOR=true".into());
+    if consensus_mode != "legacy" && !validator {
+        return Err(format!("VNN_CONSENSUS={consensus_mode} requires VNN_VALIDATOR=true").into());
     }
     let finalized_height = store.meta_u64_or("finalizedHeight", 0);
     let finalized_hash = store
         .get_meta("finalizedHash")
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default();
-    let finality = if consensus_mode == "bft" {
+    let finality = if consensus_mode != "legacy" {
         Some(tokio::sync::Mutex::new(finality::FinalityManager::new(
             &cfg.genesis.chain_id,
             cfg.genesis.validators.clone(),
@@ -728,6 +851,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Checkpoint clones for bft-v2 proposals live under this directory.
+    let proposal_work_dir = std::env::var("VNN_PROPOSE_WORK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| cfg.db_path.join("propose-work"));
+    if consensus_mode == "bft-v2" {
+        tracing::info!("bft-v2: head advances only on a 2f+1 commit certificate");
+    }
 
     let shared = Arc::new(Shared {
         store,
@@ -744,6 +874,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_dir,
         finality,
         consensus_mode,
+        proposal_work_dir,
         policy: std::sync::Mutex::new(Policy::default()),
     });
     let (net, mut event_rx) = verinoo_network::NetworkNode::new(
@@ -873,13 +1004,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match admit_block(&shared, &block) {
                                 Ok(()) => {
                                     let producer = block.header.validator.clone();
-                                    tracing::info!(
-                                        "admitted block #{} from {}",
-                                        block.header.index,
-                                        &producer[..12.min(producer.len())]
-                                    );
-                                    if commit_block(&shared, &block, &producer) {
+                                    if shared.consensus_mode == "bft-v2" {
+                                        // Receiver path: store the proposal by
+                                        // hash and vote, but do not apply or
+                                        // advance the head. The head moves only
+                                        // when the manager emits Finalized
+                                        // with a certificate.
+                                        shared.store.put_block_by_hash(
+                                            &block.header.hash,
+                                            &serde_json::to_value(&block).expect("block serialize"),
+                                        );
+                                        tracing::info!(
+                                            "admitted proposal #{} from {}",
+                                            block.header.index,
+                                            &producer[..12.min(producer.len())]
+                                        );
                                         shared.finality_observe(&net, &block).await;
+                                    } else {
+                                        tracing::info!(
+                                            "admitted block #{} from {}",
+                                            block.header.index,
+                                            &producer[..12.min(producer.len())]
+                                        );
+                                        if commit_block(&shared, &block, &producer) {
+                                            shared.finality_observe(&net, &block).await;
+                                        }
                                     }
                                 }
                                 Err(reason) => {
@@ -897,7 +1046,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 NetworkEvent::Vote(payload) => {
                     match serde_json::from_str::<verinoo_consensus::Vote>(&payload) {
-                        Ok(vote) => shared.finality_vote(&net, vote).await,
+                        Ok(vote) => {
+                            if shared.consensus_mode == "bft-v2" {
+                                // A vote quorum can commit to the canonical
+                                // store here; hold the chain lock so commits
+                                // never interleave with proposal production.
+                                let _guard = shared.chain_lock.lock().await;
+                                shared.finality_vote(&net, vote).await;
+                            } else {
+                                shared.finality_vote(&net, vote).await;
+                            }
+                        }
                         Err(e) => tracing::debug!("bad vote payload: {e}"),
                     }
                 }
@@ -1145,7 +1304,17 @@ async fn apply_finalized_pairs(
             } else if height == head_height + 1 {
                 admit_block(shared, &block)?;
                 let producer = block.header.validator.clone();
-                if !commit_block(shared, &block, &producer) {
+                if shared.consensus_mode == "bft-v2" {
+                    // Same commit gate as the gossip path: apply, verify the
+                    // derived state root, only then advance the head. The
+                    // certificate binding this block was verified above.
+                    verinoo_exec::engine::commit_finalized(&shared.store, &block, &producer)
+                        .map_err(|e| {
+                            format!(
+                                "finalized block #{height} did not advance head (state root or model set mismatch?): {e}"
+                            )
+                        })?;
+                } else if !commit_block(shared, &block, &producer) {
                     return Err(format!(
                         "finalized block #{height} did not advance head (state root or model set mismatch?)"
                     ));
@@ -1206,9 +1375,11 @@ async fn sync_once(
     // BFT nodes exchange certificates, not just blocks: a late node adopts
     // finalized history first so it never votes for heights that are already
     // final. A peer without the endpoint still gets the legacy block path and
-    // leaves local finality untouched.
+    // leaves local finality untouched. In bft-v2 this is the only path that
+    // may move the head during catch-up: certificates are verified before any
+    // block is applied.
     let mut finalized_applied = 0usize;
-    if shared.consensus_mode == "bft" {
+    if shared.consensus_mode != "legacy" {
         let peer_finalized = status["finalizedHeight"].as_u64().unwrap_or(0);
         let (local_finalized, _) = current_finalized(shared).await;
         if peer_finalized > local_finalized {
@@ -1221,9 +1392,17 @@ async fn sync_once(
                         tracing::info!("adopted {adopted} finalized block(s) from {base}");
                     }
                 }
-                None => tracing::debug!(
-                    "peer {base} does not serve /finalized/since; falling back to block catch-up"
-                ),
+                None => {
+                    if shared.consensus_mode == "bft-v2" {
+                        tracing::warn!(
+                            "peer {base} does not serve /finalized/since; bft-v2 catch-up is certificate-only"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "peer {base} does not serve /finalized/since; falling back to block catch-up"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1233,6 +1412,15 @@ async fn sync_once(
             applied: finalized_applied,
             peer_height: Some(peer_height),
         });
+    }
+    if shared.consensus_mode == "bft-v2" {
+        // Plain block catch-up would apply uncertified blocks; the bft-v2 head
+        // advances only on a verified commit certificate.
+        let frontier = our_height + 1;
+        return Err(format!(
+            "peer {base} has uncertified blocks #{frontier}..#{peer_height}; \
+             bft-v2 refuses to adopt blocks without certificates"
+        ));
     }
     let blocks: Vec<Block> = client
         .get(format!("{base}/blocks/since/{our_height}"))
@@ -1528,6 +1716,14 @@ async fn wallet_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Unique scratch directory for bft-v2 proposal checkpoints in tests.
+#[cfg(test)]
+pub(crate) fn test_proposal_work_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!("verinoo-propose-test-{}-{n}", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1635,6 +1831,18 @@ mod tests {
         finalized_height: u64,
         finalized_hash: &str,
     ) -> Arc<Shared> {
+        test_bft_shared_mode(store, keys, 0, finalized_height, finalized_hash, "bft")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_bft_shared_mode(
+        store: verinoo_state::StateStore,
+        keys: &[verinoo_exec::engine::ProducerKey],
+        local_index: usize,
+        finalized_height: u64,
+        finalized_hash: &str,
+        consensus_mode: &str,
+    ) -> Arc<Shared> {
         let params = GenesisParams {
             validators: keys.iter().map(|key| key.address.clone()).collect(),
             ..GenesisParams::default()
@@ -1642,8 +1850,8 @@ mod tests {
         let manager = finality::FinalityManager::new(
             &params.chain_id,
             params.validators.clone(),
-            &keys[0].address,
-            keys[0].signing.clone(),
+            &keys[local_index].address,
+            keys[local_index].signing.clone(),
             finalized_height,
             finalized_hash,
             1_000,
@@ -1664,9 +1872,56 @@ mod tests {
             task_streams: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_TASK_STREAMS)),
             snapshot_dir: None,
             finality: Some(tokio::sync::Mutex::new(manager)),
-            consensus_mode: "bft".into(),
+            consensus_mode: consensus_mode.into(),
+            proposal_work_dir: test_proposal_work_dir(),
             policy: std::sync::Mutex::new(Policy::default()),
         })
+    }
+
+    fn test_bft_v2_shared(
+        store: verinoo_state::StateStore,
+        keys: &[verinoo_exec::engine::ProducerKey],
+        local_index: usize,
+    ) -> Arc<Shared> {
+        test_bft_shared_mode(store, keys, local_index, 0, "", "bft-v2")
+    }
+
+    fn signed_transfer(
+        signer: &ed25519_dalek::SigningKey,
+        from: &str,
+        to: &str,
+        value: u64,
+        nonce: u64,
+    ) -> verinoo_types::tx::TxEnvelope {
+        use ed25519_dalek::Signer as _;
+        use verinoo_types::canonical::UnsignedPayload;
+        let data = verinoo_types::tx::TxData {
+            r#type: verinoo_types::tx::TxKind::Transfer,
+            data: serde_json::json!({}),
+        };
+        let payload = UnsignedPayload {
+            data: serde_json::to_value(&data).unwrap(),
+            from: from.into(),
+            nonce,
+            to: to.into(),
+            value,
+            gas_limit: None,
+            gas_price: None,
+        };
+        let tx_id = payload.tx_id().unwrap();
+        let signature = hex::encode(signer.sign(tx_id.as_bytes()).to_bytes());
+        verinoo_types::tx::TxEnvelope {
+            tx_id,
+            from: from.into(),
+            to: to.into(),
+            value,
+            nonce,
+            data,
+            gas_limit: None,
+            gas_price: None,
+            public_key: hex::encode(signer.verifying_key().to_bytes()),
+            signature,
+        }
     }
 
     fn test_certificate(
@@ -1861,5 +2116,178 @@ mod tests {
         let (finalized_height, finalized_hash) = current_finalized(&shared).await;
         assert_eq!(finalized_height, 0);
         assert!(finalized_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bft_v2_single_validator_finalizes_and_commits_only_with_a_certificate() {
+        let keys = test_validators(1);
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 0);
+
+        // Fund a sender so the proposal carries a real transaction.
+        let sender = verinoo_exec::engine::ProducerKey::deterministic("bft-v2-sender", 0);
+        let mut acc = shared.store.account_or_default(&sender.address);
+        acc.balance = 1_000;
+        shared.store.set_account(&acc);
+        let tx = signed_transfer(&sender.signing, &sender.address, "ai_recipient", 25, 1);
+
+        // Leader path: build the block on a checkpoint clone.
+        let report = propose_block_with_report(
+            &shared.store,
+            std::slice::from_ref(&tx),
+            &keys[0],
+            1_000,
+            &shared.proposal_work_dir,
+        )
+        .unwrap();
+        let block = report.block;
+        assert_eq!(block.header.index, 1);
+        assert_eq!(block.transactions.len(), 1);
+        // The clone was cleaned up.
+        assert_eq!(
+            std::fs::read_dir(&shared.proposal_work_dir)
+                .map(|entries| entries.count())
+                .unwrap_or(1),
+            0
+        );
+
+        // Proposing did not touch canonical state.
+        assert_eq!(shared.head().unwrap().header.index, 0);
+        assert_eq!(
+            shared.store.get_account(&sender.address).unwrap().balance,
+            1_000
+        );
+
+        // The leader stores the proposal by hash and feeds the finality
+        // manager; a single validator reaches quorum on its own.
+        shared
+            .store
+            .put_block_by_hash(&block.header.hash, &serde_json::to_value(&block).unwrap());
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.observe_block(block.header.index, &block.header.hash)
+        };
+        let (height, hash, certificate) = output
+            .finalized
+            .expect("single validator reaches quorum alone");
+        assert_eq!(height, 1);
+        assert_eq!(hash, block.header.hash);
+
+        // The certificate exists, but the head has not moved yet.
+        assert_eq!(shared.head().unwrap().header.index, 0);
+
+        shared_finality_commit(&shared, height, &hash, &certificate)
+            .expect("certificate commits the stored proposal");
+        let head = shared.head().unwrap();
+        assert_eq!(head.header.index, 1);
+        assert_eq!(head.header.hash, block.header.hash);
+        assert_eq!(
+            shared.store.get_account("ai_recipient").unwrap().balance,
+            25
+        );
+        assert!(shared.store.get_account(&sender.address).unwrap().balance < 1_000);
+    }
+
+    #[tokio::test]
+    async fn bft_v2_receiver_does_not_advance_the_head_before_a_certificate() {
+        let keys = test_validators(2); // keys[0] = leader, keys[1] = receiver
+        let chain_id = GenesisParams::default().chain_id;
+
+        // The leader runs its own store and publishes a proposal at height 1.
+        let leader_store = test_store_with_genesis();
+        let block =
+            verinoo_exec::engine::produce_block(&leader_store, &[], &keys[0], 1_000).unwrap();
+        verinoo_exec::engine::set_head(&leader_store, &block);
+
+        // The receiver starts at genesis; it is a validator but not the leader.
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 1);
+
+        admit_block(&shared, &block).expect("proposal extends the receiver head");
+        shared
+            .store
+            .put_block_by_hash(&block.header.hash, &serde_json::to_value(&block).unwrap());
+        assert_eq!(shared.head().unwrap().header.index, 0);
+
+        // Feeding the manager emits the receiver's prevote but cannot finalize
+        // a two-validator set alone, and it must not move the head either.
+        let output = {
+            let mut manager = shared.finality.as_ref().unwrap().lock().await;
+            manager.observe_block(block.header.index, &block.header.hash)
+        };
+        assert!(output.finalized.is_none());
+        assert!(output
+            .votes
+            .iter()
+            .any(|vote| vote.validator == keys[1].address));
+        assert_eq!(shared.head().unwrap().header.index, 0);
+
+        // Once a 2f+1 certificate over the proposal exists, the receiver
+        // commits and only then advances the head.
+        let certificate = test_certificate(&chain_id, &block, &keys);
+        shared_finality_commit(&shared, 1, &block.header.hash, &certificate)
+            .expect("certificate commits the stored proposal");
+        let head = shared.head().unwrap();
+        assert_eq!(head.header.index, 1);
+        assert_eq!(head.header.hash, block.header.hash);
+    }
+
+    #[tokio::test]
+    async fn bft_v2_certificates_for_unknown_or_invalid_blocks_do_not_finalize() {
+        let keys = test_validators(4);
+        let chain_id = GenesisParams::default().chain_id;
+        let shared = test_bft_v2_shared(test_store_with_genesis(), &keys, 0);
+
+        // Certificate for a block this node never admitted.
+        let unknown = "ff".repeat(32);
+        let certificate = {
+            let votes = keys
+                .iter()
+                .map(|key| {
+                    verinoo_consensus::Vote::sign(
+                        &chain_id,
+                        verinoo_consensus::VoteKind::Precommit,
+                        1,
+                        0,
+                        &unknown,
+                        &key.address,
+                        &key.signing,
+                    )
+                })
+                .collect();
+            verinoo_consensus::CommitCertificate {
+                chain_id: chain_id.clone(),
+                height: 1,
+                round: 0,
+                block_hash: unknown.clone(),
+                votes,
+            }
+        };
+        assert!(shared_finality_commit(&shared, 1, &unknown, &certificate).is_err());
+        assert_eq!(shared.head().unwrap().header.index, 0);
+
+        // Certificate for a stored block whose state root does not match what
+        // applying derives. The header is re-signed so every structural check
+        // passes and only the execution check can reject it.
+        let leader_store = test_store_with_genesis();
+        let mut block =
+            verinoo_exec::engine::produce_block(&leader_store, &[], &keys[0], 1_000).unwrap();
+        block.header.state_root = "00".repeat(32);
+        block.header.hash = verinoo_exec::engine::hash_header(&block.header);
+        let signature = {
+            use ed25519_dalek::Signer as _;
+            hex::encode(
+                keys[0]
+                    .signing
+                    .sign(block.header.hash.as_bytes())
+                    .to_bytes(),
+            )
+        };
+        block.header.validator_signature = signature;
+        admit_block(&shared, &block).expect("re-signed header passes structural admission");
+        shared
+            .store
+            .put_block_by_hash(&block.header.hash, &serde_json::to_value(&block).unwrap());
+        let certificate = test_certificate(&chain_id, &block, &keys);
+        assert!(shared_finality_commit(&shared, 1, &block.header.hash, &certificate).is_err());
+        assert_eq!(shared.head().unwrap().header.index, 0);
     }
 }

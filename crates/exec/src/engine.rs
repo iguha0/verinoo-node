@@ -5,6 +5,8 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use verinoo_state::models::{
     Account, AgentAccount, ComputeNode, InferenceTask, ModelRegistryEntry,
 };
@@ -1680,4 +1682,114 @@ pub fn set_head(store: &StateStore, block: &Block) {
         &format!("blockheight:{}", block.header.index),
         &serde_json::json!(block.header.hash),
     );
+}
+
+// ============================ bft-v2 propose / commit ============================
+
+/// Throwaway clone of the canonical store used to build a proposal without
+/// touching canonical state. A RocksDB checkpoint is taken under `work_dir`;
+/// the handle is closed and the directory removed when the guard drops.
+struct ProposalWorkspace {
+    dir: PathBuf,
+    store: Option<StateStore>,
+}
+
+impl ProposalWorkspace {
+    fn create(store: &StateStore, work_dir: &Path) -> Result<Self, EngineError> {
+        std::fs::create_dir_all(work_dir)
+            .map_err(|e| EngineError::Db(format!("create proposal work dir: {e}")))?;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = work_dir.join(format!("propose-{}-{n}-{nanos}", std::process::id()));
+        // RocksDB creates `dir` itself; it must not already exist.
+        store
+            .checkpoint(&dir)
+            .map_err(|e| EngineError::Db(format!("state checkpoint: {e}")))?;
+        let clone =
+            StateStore::open(&dir).map_err(|e| EngineError::Db(format!("open checkpoint: {e}")))?;
+        Ok(Self {
+            dir,
+            store: Some(clone),
+        })
+    }
+
+    fn store(&self) -> &StateStore {
+        self.store
+            .as_ref()
+            .expect("proposal store lives until drop")
+    }
+}
+
+impl Drop for ProposalWorkspace {
+    fn drop(&mut self) {
+        // Close the database handle before deleting so the directory can be
+        // removed even on platforms that lock open files.
+        self.store.take();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Build the next block on a clone of the canonical store (`bft-v2`
+/// proposal path), discarding the skip report. See
+/// [`propose_block_with_report`] for callers that need to requeue
+/// gas-limited transactions.
+pub fn propose_block(
+    store: &StateStore,
+    txs: &[TxEnvelope],
+    producer: &ProducerKey,
+    now_ms: u64,
+    work_dir: &Path,
+) -> Result<Block, EngineError> {
+    Ok(propose_block_with_report(store, txs, producer, now_ms, work_dir)?.block)
+}
+
+/// Build the next block on a RocksDB checkpoint of `store` and return it
+/// without applying anything: the canonical store, its head and its base fee
+/// are untouched. The production logic ([`produce_block_with_report`]) runs
+/// against the clone, so the block is byte-identical to what production
+/// would build from the same mempool. The clone is removed afterwards.
+pub fn propose_block_with_report(
+    store: &StateStore,
+    txs: &[TxEnvelope],
+    producer: &ProducerKey,
+    now_ms: u64,
+    work_dir: &Path,
+) -> Result<ProducedBlock, EngineError> {
+    let workspace = ProposalWorkspace::create(store, work_dir)?;
+    produce_block_with_report(workspace.store(), txs, producer, now_ms)
+    // `workspace` drops: handle closed, checkpoint directory removed.
+}
+
+/// Apply a certified block to the canonical store and advance the head
+/// (`bft-v2` commit path). The caller is responsible for having validated
+/// the block and for holding a certificate that binds its hash; this
+/// function only executes, checks the derived state root against the
+/// header, and persists the head. It never produces or signs anything.
+///
+/// On a state-root mismatch the head is not advanced, but transactions
+/// already applied remain in the store (the same failure mode as the
+/// optimistic path's commit gate).
+pub fn commit_finalized(
+    store: &StateStore,
+    block: &Block,
+    producer_address: &str,
+) -> Result<(), EngineError> {
+    let base_fee = store.meta_u64_or("baseFee", INITIAL_BASE_FEE);
+    let applied = apply_block(store, block, base_fee, producer_address)?;
+    let root = compute_state_root(store);
+    if root != block.header.state_root {
+        let ours = &root[..16.min(root.len())];
+        let theirs = &block.header.state_root[..16.min(block.header.state_root.len())];
+        return Err(EngineError::Validation(format!(
+            "state root mismatch at #{} (ours {ours}, block {theirs}) — model set differs?",
+            block.header.index
+        )));
+    }
+    store.set_meta_u64("baseFee", applied.next_base_fee);
+    set_head(store, block);
+    Ok(())
 }

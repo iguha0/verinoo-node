@@ -1874,6 +1874,7 @@ mod tests {
             snapshot_dir,
             finality: None,
             consensus_mode: "legacy".into(),
+            proposal_work_dir: crate::test_proposal_work_dir(),
             policy: std::sync::Mutex::new(crate::Policy::default()),
         })
     }
