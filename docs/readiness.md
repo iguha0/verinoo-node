@@ -80,7 +80,10 @@ claims a technical buyer will test in the first diligence call.
    view-change for an offline leader and no slashing/removal. A late BFT node
    can now adopt certified finalized history (`/finalized/since`), but
    production liveness still depends on the scheduled leader. The default is
-   legacy; the live testnet is single-validator.
+   legacy; the live testnet is single-validator. The v2 activation and
+   operations runbook (certificate-gated commit, view changes) is
+   [`docs/upgrade-bft-v2.md`](upgrade-bft-v2.md); `bft-v2` is in progress and
+   not deployed.
 3. **The dispute game is not live over RPC for a real model.** With consensus
    re-execution, verification is recomputation and there is nothing to dispute
    in the deterministic path. The game that exists targets the manual-claim
@@ -359,4 +362,8 @@ domain still belong to the older reference node.
   operator-attested and do not provide trustless sync, automatic download or
   BFT certificates. Per-task sampling is v2-only and requires a coordinated
   validator upgrade.
-  "BFT" — the finality design is not implemented.
+  "BFT" — full Byzantine fault tolerance is not shipped: the live node is a
+  single validator running the v1 certificate layer; `bft-v2`
+  (certificate-gated commit, view changes) is in progress per
+  [`docs/upgrade-bft-v2.md`](upgrade-bft-v2.md), not deployed and not
+  audited. N=4 (quorum 3) is the minimum that tolerates one Byzantine fault.
