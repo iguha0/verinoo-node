@@ -89,6 +89,10 @@ pub enum Error {
     NotEquivocation,
     #[error("evidence votes disagree on validator, chain, height, round, or kind")]
     EvidenceMismatch,
+    #[error("evidence proposals disagree on proposer, chain, height, or round")]
+    ProposalEvidenceMismatch,
+    #[error("evidence proposals have the same block hash")]
+    NotDoubleProposal,
     #[error(transparent)]
     Canonical(#[from] verinoo_types::canonical::CanonicalError),
 }
@@ -156,6 +160,17 @@ pub struct Evidence {
     pub kind: VoteKind,
     pub a: Vote,
     pub b: Vote,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalEvidence {
+    pub chain_id: String,
+    pub proposer: String,
+    pub height: u64,
+    pub round: u64,
+    pub a: Proposal,
+    pub b: Proposal,
 }
 
 pub fn public_key_to_address(public_key_hex: &str) -> Result<String, Error> {
@@ -397,6 +412,13 @@ impl Evidence {
         if a.block_hash == b.block_hash {
             return Err(Error::NotEquivocation);
         }
+        let (a, b) = if (a.block_hash.as_str(), a.signature.as_str())
+            <= (b.block_hash.as_str(), b.signature.as_str())
+        {
+            (a, b)
+        } else {
+            (b, a)
+        };
         Ok(Evidence {
             chain_id: a.chain_id.clone(),
             validator: a.validator.clone(),
@@ -431,11 +453,78 @@ impl Evidence {
     }
 
     pub fn id(&self) -> String {
-        let value = serde_json::to_value(self).expect("evidence is serializable");
-        let canonical =
-            canonical_json(&value).expect("evidence fields are always canonically encodable");
-        let mut h = Sha256::new();
-        h.update(canonical.as_bytes());
-        hex::encode(h.finalize())
+        canonical_id(self)
     }
+}
+
+impl ProposalEvidence {
+    pub fn new(a: Proposal, b: Proposal) -> Result<ProposalEvidence, Error> {
+        if a.chain_id != b.chain_id
+            || a.proposer != b.proposer
+            || a.height != b.height
+            || a.round != b.round
+        {
+            return Err(Error::ProposalEvidenceMismatch);
+        }
+        if a.block_hash == b.block_hash {
+            return Err(Error::NotDoubleProposal);
+        }
+        let (a, b) = if (a.block_hash.as_str(), a.signature.as_str())
+            <= (b.block_hash.as_str(), b.signature.as_str())
+        {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        Ok(ProposalEvidence {
+            chain_id: a.chain_id.clone(),
+            proposer: a.proposer.clone(),
+            height: a.height,
+            round: a.round,
+            a,
+            b,
+        })
+    }
+
+    pub fn verify(&self, validators: &[String]) -> Result<(), Error> {
+        self.verify_inner(None, validators)
+    }
+
+    pub fn verify_with_chain(&self, chain_id: &str, validators: &[String]) -> Result<(), Error> {
+        self.verify_inner(Some(chain_id), validators)
+    }
+
+    fn verify_inner(&self, chain_id: Option<&str>, validators: &[String]) -> Result<(), Error> {
+        check_chain(&self.chain_id, chain_id)?;
+        if self.a.chain_id != self.chain_id
+            || self.b.chain_id != self.chain_id
+            || self.a.proposer != self.proposer
+            || self.b.proposer != self.proposer
+            || self.a.height != self.height
+            || self.b.height != self.height
+            || self.a.round != self.round
+            || self.b.round != self.round
+        {
+            return Err(Error::ProposalEvidenceMismatch);
+        }
+        if self.a.block_hash == self.b.block_hash {
+            return Err(Error::NotDoubleProposal);
+        }
+        self.a.verify_inner(chain_id, validators)?;
+        self.b.verify_inner(chain_id, validators)?;
+        Ok(())
+    }
+
+    pub fn id(&self) -> String {
+        canonical_id(self)
+    }
+}
+
+fn canonical_id<T: Serialize>(value: &T) -> String {
+    let value = serde_json::to_value(value).expect("evidence is serializable");
+    let canonical =
+        canonical_json(&value).expect("evidence fields are always canonically encodable");
+    let mut h = Sha256::new();
+    h.update(canonical.as_bytes());
+    hex::encode(h.finalize())
 }
