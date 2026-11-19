@@ -147,9 +147,7 @@ impl ConsensusState {
     }
 
     pub fn leader_for(&self, height: u64, round: u64) -> &str {
-        let index =
-            (height.saturating_sub(1).saturating_add(round) as usize) % self.validators.len();
-        &self.validators[index]
+        super::round_leader(&self.validators, height, round).expect("validator set is non-empty")
     }
 
     pub fn is_leader(&self) -> bool {

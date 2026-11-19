@@ -1793,3 +1793,30 @@ pub fn commit_finalized(
     set_head(store, block);
     Ok(())
 }
+
+/// Execute a received proposal on a throwaway checkpoint clone and check the
+/// state root this node derives against the header (`bft-v2` vote path).
+/// Canonical state, the head and the fee market are untouched: the clone is
+/// removed when the guard drops. A `Ok(())` block is one this validator can
+/// prevote; an `Err` block must be prevoted nil.
+pub fn verify_block_on_checkpoint(
+    store: &StateStore,
+    work_dir: &Path,
+    block: &Block,
+) -> Result<(), EngineError> {
+    let workspace = ProposalWorkspace::create(store, work_dir)?;
+    let clone = workspace.store();
+    let base_fee = clone.meta_u64_or("baseFee", INITIAL_BASE_FEE);
+    apply_block(clone, block, base_fee, &block.header.validator)?;
+    let root = compute_state_root(clone);
+    if root != block.header.state_root {
+        let ours = &root[..16.min(root.len())];
+        let theirs = &block.header.state_root[..16.min(block.header.state_root.len())];
+        return Err(EngineError::Validation(format!(
+            "state root mismatch at #{} (ours {ours}, proposal {theirs}) — model set differs?",
+            block.header.index
+        )));
+    }
+    Ok(())
+    // `workspace` drops: handle closed, checkpoint directory removed.
+}

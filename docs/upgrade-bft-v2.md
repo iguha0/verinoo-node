@@ -122,9 +122,10 @@ advances only on a verified quorum certificate.
    `finalizedHash` (they must agree across nodes before proceeding).
 3. Stop **all** validators. Take and verify a stopped-service backup on every
    node. Retain the old binary.
-4. Set `VNN_CONSENSUS=bft-v2` on every validator, and the activation height
-   (`VNN_BFT_ACTIVATION_HEIGHT`, if the release uses it) to the next height
-   above the recorded head. Values must be identical on every node.
+4. Set `VNN_CONSENSUS=bft-v2` and `VNN_BFT_TIMERS=0` on every validator, and
+   the activation height (`VNN_BFT_ACTIVATION_HEIGHT`, if the release uses
+   it) to the next height above the recorded head. Values must be identical
+   on every node.
 5. Start all validators together. Confirm the same `chainId`,
    `validatorSetHash` and model set on every `/status`.
 6. Watch the first heights live before resuming client traffic.
@@ -144,7 +145,7 @@ advances only on a verified quorum certificate.
 - [ ] Commit-time state-root mismatch (if drilled) halts the node with an
       error rather than advancing an unverified head.
 
-**Known limitation during Phase B:** with timers not yet enabled, an offline
+**Known limitation during Phase B:** with `VNN_BFT_TIMERS=0`, an offline
 scheduled leader still stalls production, exactly as in v1. That is expected
 and is the reason Phase C exists. Restore the leader; do not treat this stall
 as a v2 failure and do not downgrade a node to `legacy` to "keep producing"
@@ -158,8 +159,9 @@ certificate, section 5.3 applies.
 ### Phase C — enable timers and view changes
 
 After Phase B has soaked cleanly (at least 24 hours), enable the
-view-change timers on all validators in one coordinated restart, using the
-timer controls named in the release notes. The schedule is ADR 004's:
+view-change timers on all validators in one coordinated restart by setting
+`VNN_BFT_TIMERS=1` (the default in `bft-v2`; Phase B ran with
+`VNN_BFT_TIMERS=0`). The schedule is ADR 004's:
 `timeout_propose = min(3s * 1.5^r, 15s)`,
 `timeout_prevote = min(2s * 1.5^r, 10s)`,
 `timeout_precommit = min(2s * 1.5^r, 10s)`, `R_MAX = 8` with capped timeouts
